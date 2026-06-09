@@ -1,0 +1,22 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Rust / Tauri build artifacts
+src-tauri/target/
+src-tauri/gen/
+
+# Environment files
+.env
+.env.*
+
+# macOS
+.DS_Store
+
+# Icon build intermediates
+src-tauri/icons/icon.iconset/
+
+# Legacy script
+check-updates.sh
