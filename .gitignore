@@ -18,5 +18,11 @@ src-tauri/gen/
 # Icon build intermediates
 src-tauri/icons/icon.iconset/
 
+# Claude Code instructions
+CLAUDE.md
+
 # Legacy script
 check-updates.sh
+
+# Brand assets (internal, not for distribution)
+BedWatch-Brand-Guidelines.pdf
