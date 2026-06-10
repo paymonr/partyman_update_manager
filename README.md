@@ -1,24 +1,30 @@
-# BedWatch Updater
+# PartyMAN Update Manager
 
-A cross-platform desktop app for checking available updates across system tools and package managers. Built with [Tauri](https://tauri.app) and [Svelte](https://svelte.dev).
+A macOS desktop app for checking and installing software updates across system tools, package managers, and apps. Built with [Tauri](https://tauri.app) and [Svelte](https://svelte.dev).
 
-**Report-only — it never installs or upgrades anything.** Each check tells you what's outdated and gives you the command to apply the fix yourself.
+## What it covers
 
-## What it checks
+| Section | What it manages | Tool required |
+|---|---|---|
+| OS System Updates | macOS software updates | `softwareupdate` |
+| App Store | Mac App Store apps | `mas` |
+| Homebrew Apps | GUI apps managed by Homebrew | `brew` |
+| Apps Without Auto-Updates | Apps not yet connected to an update manager | `brew` |
+| Dev → brew | Homebrew CLI formulae | `brew` |
+| Dev → npm | Global Node packages | `npm` |
+| Dev → pip | Python packages | `pip3` / `pip` |
+| Dev → rbenv | Ruby versions and gems via rbenv | `rbenv` |
+| Dev → rvm | Ruby versions and gems via rvm | `rvm` |
 
-| Section | Tool required |
-|---|---|
-| macOS System Updates | `softwareupdate` (macOS only) |
-| Homebrew Apps (Casks) | `brew` (macOS only) |
-| Mac App Store | `mas` (macOS only) |
-| Untracked Apps | macOS only |
-| Homebrew Formulae | `brew` (macOS only) |
-| npm Global Packages | `npm` |
-| pip (Python Packages) | `pip3` / `pip` |
-| Ruby via rvm | `rvm` |
-| Ruby via rbenv | `rbenv` |
+Sections missing their required tool are skipped automatically.
 
-Sections are shown or hidden automatically based on your platform. Missing tools are skipped gracefully.
+## Features
+
+- **Check** any section individually or all at once
+- **Select individual items** to update (OS updates, App Store, Homebrew Apps)
+- **Enable auto-updates** for unmanaged apps by connecting them to Homebrew
+- **Update history** — persistent log of every update run, searchable by app name or type, retained for 180 days
+- **Dev tools** grouped under a single tab with sub-sections
 
 ## Development
 
@@ -26,7 +32,6 @@ Sections are shown or hidden automatically based on your platform. Missing tools
 
 - [Rust](https://rustup.rs) (stable)
 - [Node.js](https://nodejs.org) 18+
-- On Linux: `libwebkit2gtk-4.1-dev`, `libappindicator3-dev`, `librsvg2-dev`, `patchelf`
 
 ### Run locally
 
@@ -42,14 +47,3 @@ npm run tauri build
 ```
 
 Outputs a platform-native installer in `src-tauri/target/release/bundle/`.
-
-## Releases
-
-Releases are built automatically via GitHub Actions when a version tag is pushed:
-
-```bash
-git tag v1.0.0
-git push origin v1.0.0
-```
-
-This triggers a build for macOS, Linux, and Windows and creates a draft GitHub Release with installers attached.
