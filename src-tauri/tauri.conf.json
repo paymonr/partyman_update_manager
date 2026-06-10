@@ -1,6 +1,6 @@
 {
-  "productName": "BedWatch Updater",
-  "version": "0.1.0",
+  "productName": "PartyMAN Update Manager",
+  "version": "0.1.1",
   "identifier": "com.bedwatch.updater",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -11,7 +11,7 @@
   "app": {
     "windows": [
       {
-        "title": "BedWatch Updater",
+        "title": "PartyMAN Update Manager",
         "width": 860,
         "height": 680,
         "minWidth": 600,
