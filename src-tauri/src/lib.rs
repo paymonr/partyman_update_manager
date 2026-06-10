@@ -1,4 +1,7 @@
+use std::fs;
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 use image::GenericImageView;
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -16,68 +19,248 @@ struct StatusPayload {
     status: String,
 }
 
+#[derive(Clone, serde::Serialize)]
+struct CaskCandidate {
+    token: String,
+    name: String,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct HistoryEntry {
+    ts: u64,
+    section: String,
+    label: String,
+    items: Vec<String>,
+    item_names: Vec<String>,
+    lines: Vec<String>,
+}
+
+fn section_label(section: &str) -> &'static str {
+    match section {
+        "macos_updates"  => "OS System Updates",
+        "app_store"      => "App Store",
+        "brew_casks"     => "Homebrew Apps",
+        "untracked_apps" => "Untracked Apps",
+        "brew_formulae"  => "brew",
+        "npm_globals"    => "npm",
+        "pip_packages"   => "pip",
+        "ruby_rbenv"     => "rbenv",
+        "ruby_rvm"       => "rvm",
+        _                => "Unknown",
+    }
+}
+
+fn log_path(app: &AppHandle) -> Option<std::path::PathBuf> {
+    app.path().app_data_dir().ok().map(|d| d.join("updates.log"))
+}
+
+fn append_upgrade_log(app: &AppHandle, entry: HistoryEntry) {
+    let path = match log_path(app) {
+        Some(p) => p,
+        None => return,
+    };
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let entry_str = match serde_json::to_string(&entry) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+
+    let existing = fs::read_to_string(&path).unwrap_or_default();
+    let cutoff = entry.ts.saturating_sub(180 * 24 * 3600);
+
+    let mut kept: Vec<String> = existing
+        .lines()
+        .filter(|l| !l.is_empty())
+        .filter(|l| {
+            serde_json::from_str::<serde_json::Value>(l)
+                .ok()
+                .and_then(|v| v["ts"].as_u64())
+                .map(|t| t >= cutoff)
+                .unwrap_or(false)
+        })
+        .map(|l| l.to_string())
+        .collect();
+
+    kept.push(entry_str);
+
+    // Hard cap at 50 MB — drop oldest first
+    const MAX_BYTES: usize = 50 * 1024 * 1024;
+    let mut total: usize = kept.iter().map(|l| l.len() + 1).sum();
+    while total > MAX_BYTES && kept.len() > 1 {
+        let removed = kept.remove(0);
+        total -= removed.len() + 1;
+    }
+
+    let _ = fs::write(&path, kept.join("\n") + "\n");
+}
+
+#[tauri::command]
+async fn search_cask(app_name: String) -> Vec<CaskCandidate> {
+    let normalized = app_name.to_lowercase()
+        .replace(' ', "-")
+        .chars()
+        .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '+')
+        .collect::<String>();
+
+    let safe_name = app_name.replace('\'', "");
+    let safe_norm = normalized.replace('\'', "");
+
+    // Try exact token match first (no network needed)
+    let exact_script = format!(
+        r#"export PATH="/usr/local/bin:/opt/homebrew/bin:$PATH"; brew info --cask --json=v2 '{safe_norm}' 2>/dev/null"#
+    );
+    if let Ok(out) = Command::new("bash").arg("-c").arg(&exact_script).output().await {
+        if out.status.success() && !out.stdout.is_empty() {
+            if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&out.stdout) {
+                let candidates: Vec<CaskCandidate> = json["casks"]
+                    .as_array()
+                    .unwrap_or(&vec![])
+                    .iter()
+                    .filter_map(|c| {
+                        let token = c["token"].as_str()?.to_string();
+                        let name = c["name"].as_array()
+                            .and_then(|a| a.first())
+                            .and_then(|v| v.as_str())
+                            .unwrap_or(&token)
+                            .to_string();
+                        Some(CaskCandidate { token, name })
+                    })
+                    .collect();
+                if !candidates.is_empty() {
+                    return candidates;
+                }
+            }
+        }
+    }
+
+    // Fall back to brew search (requires network)
+    let search_script = format!(
+        r#"export PATH="/usr/local/bin:/opt/homebrew/bin:$PATH"; brew search --casks '{safe_name}' 2>/dev/null"#
+    );
+    if let Ok(out) = Command::new("bash").arg("-c").arg(&search_script).output().await {
+        if out.status.success() {
+            let text = String::from_utf8_lossy(&out.stdout);
+            return text.lines()
+                .filter(|l| !l.is_empty() && !l.starts_with("==>") && !l.contains("No formulae or casks"))
+                .take(5)
+                .map(|t| CaskCandidate { token: t.trim().to_string(), name: t.trim().to_string() })
+                .collect();
+        }
+    }
+
+    vec![]
+}
+
+#[tauri::command]
+async fn track_app(app: AppHandle, cask_token: String) {
+    if !cask_token.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '@' || c == '.') {
+        emit_upgrade_line(&app, "untracked_apps", "Invalid cask token.").await;
+        emit_upgrade_status(&app, "untracked_apps", "error").await;
+        return;
+    }
+    let section = "untracked_apps";
+    let script = format!(
+        r#"CURRENT_USER=$(whoami)
+export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+TMPOUT=$(mktemp)
+brew install --cask --force {cask_token} 2>&1 | tee "$TMPOUT"
+BREW_EXIT=${{PIPESTATUS[0]}}
+if grep -q "Permission denied @ apply2files" "$TMPOUT"; then
+  APP_PATH=$(grep "Permission denied @ apply2files" "$TMPOUT" | head -1 | sed 's/.*@ apply2files - //' | sed 's|/Contents/.*||')
+  rm -f "$TMPOUT"
+  if [ -n "$APP_PATH" ]; then
+    echo "→  $(basename "$APP_PATH") is protected by macOS. Enter your password to let the update manager take over."
+    echo "→  Requesting administrator access…"
+    osascript -e "do shell script \"chown -R $CURRENT_USER '$APP_PATH'\" with administrator privileges" 2>&1
+    brew install --cask --force {cask_token} 2>&1
+    if [ $? -eq 0 ]; then
+      echo "→  Done! Run a check to see this app move to Homebrew Apps."
+    else
+      echo "✖  Setup failed."
+    fi
+  else
+    echo "✖  Setup failed."
+  fi
+elif [ "$BREW_EXIT" -eq 0 ]; then
+  rm -f "$TMPOUT"
+  echo "→  Done! Run a check to see this app move to Homebrew Apps."
+else
+  rm -f "$TMPOUT"
+  echo "✖  Setup failed."
+fi"#
+    );
+    let lines = run_upgrade_shell(&app, section, &script).await;
+    let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    append_upgrade_log(&app, HistoryEntry {
+        ts,
+        label: section_label(section).to_string(),
+        section: section.to_string(),
+        items: vec![cask_token.clone()],
+        item_names: vec![cask_token],
+        lines,
+    });
+}
+
+#[tauri::command]
+fn get_upgrade_history(app: AppHandle) -> Vec<HistoryEntry> {
+    let path = match log_path(&app) {
+        Some(p) => p,
+        None => return vec![],
+    };
+    if !path.exists() {
+        return vec![];
+    }
+    let content = fs::read_to_string(&path).unwrap_or_default();
+    let mut entries: Vec<HistoryEntry> = content
+        .lines()
+        .filter(|l| !l.is_empty())
+        .filter_map(|l| serde_json::from_str::<HistoryEntry>(l).ok())
+        .collect();
+    entries.reverse(); // newest first
+    entries
+}
+
 async fn emit_line(app: &AppHandle, section: &str, line: &str) {
     let _ = app.emit(
         "check-output",
-        OutputPayload {
-            section: section.to_string(),
-            line: line.to_string(),
-        },
+        OutputPayload { section: section.to_string(), line: line.to_string() },
     );
 }
 
 async fn emit_upgrade_line(app: &AppHandle, section: &str, line: &str) {
     let _ = app.emit(
         "upgrade-output",
-        OutputPayload {
-            section: section.to_string(),
-            line: line.to_string(),
-        },
+        OutputPayload { section: section.to_string(), line: line.to_string() },
     );
 }
 
 async fn emit_upgrade_status(app: &AppHandle, section: &str, status: &str) {
     let _ = app.emit(
         "upgrade-status",
-        StatusPayload {
-            section: section.to_string(),
-            status: status.to_string(),
-        },
+        StatusPayload { section: section.to_string(), status: status.to_string() },
     );
 }
 
 async fn emit_status(app: &AppHandle, section: &str, status: &str) {
     let _ = app.emit(
         "check-status",
-        StatusPayload {
-            section: section.to_string(),
-            status: status.to_string(),
-        },
+        StatusPayload { section: section.to_string(), status: status.to_string() },
     );
 }
 
 async fn run_shell(app: &AppHandle, section: &str, script: &str) {
-    let shell = if cfg!(target_os = "windows") {
-        "powershell"
-    } else {
-        "bash"
-    };
-    let flag = if cfg!(target_os = "windows") {
-        "-Command"
-    } else {
-        "-c"
-    };
+    let shell = if cfg!(target_os = "windows") { "powershell" } else { "bash" };
+    let flag  = if cfg!(target_os = "windows") { "-Command" } else { "-c" };
 
-    // Source rvm/rbenv/nvm so PATH is complete even in a non-login shell
     let preamble = if cfg!(target_os = "macos") || cfg!(target_os = "linux") {
         r#"
 export PATH="$HOME/.rvm/bin:$HOME/.rbenv/bin:$HOME/.nvm/versions/node/$(ls $HOME/.nvm/versions/node 2>/dev/null | tail -1)/bin:/usr/local/bin:/opt/homebrew/bin:$PATH"
 [ -s "$HOME/.rvm/scripts/rvm" ] && source "$HOME/.rvm/scripts/rvm"
 command -v rbenv &>/dev/null && eval "$(rbenv init -)"
 "#
-    } else {
-        ""
-    };
+    } else { "" };
 
     let full_script = format!("{}{}", preamble, script);
 
@@ -119,12 +302,76 @@ command -v rbenv &>/dev/null && eval "$(rbenv init -)"
 
     let _ = tokio::join!(t1, t2);
     let status = child.wait().await;
-
     let final_status = match status {
         Ok(s) if s.success() => "done",
-        _ => "done", // treat non-zero as done-with-warnings, not error
+        _ => "done",
     };
     emit_status(app, section, final_status).await;
+}
+
+// Returns collected output lines for logging.
+async fn run_upgrade_shell(app: &AppHandle, section: &str, script: &str) -> Vec<String> {
+    let shell = if cfg!(target_os = "windows") { "powershell" } else { "bash" };
+    let flag  = if cfg!(target_os = "windows") { "-Command" } else { "-c" };
+
+    let preamble = if cfg!(target_os = "macos") || cfg!(target_os = "linux") {
+        r#"
+export PATH="$HOME/.rvm/bin:$HOME/.rbenv/bin:$HOME/.nvm/versions/node/$(ls $HOME/.nvm/versions/node 2>/dev/null | tail -1)/bin:/usr/local/bin:/opt/homebrew/bin:$PATH"
+[ -s "$HOME/.rvm/scripts/rvm" ] && source "$HOME/.rvm/scripts/rvm"
+command -v rbenv &>/dev/null && eval "$(rbenv init -)"
+"#
+    } else { "" };
+
+    let full_script = format!("{}{}", preamble, script);
+
+    let mut child = match Command::new(shell)
+        .arg(flag)
+        .arg(&full_script)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            emit_upgrade_line(app, section, &format!("Failed to spawn: {e}")).await;
+            emit_upgrade_status(app, section, "error").await;
+            return vec![];
+        }
+    };
+
+    let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let collected = Arc::new(Mutex::new(Vec::<String>::new()));
+
+    let app1 = app.clone();
+    let sec1 = section.to_string();
+    let coll1 = Arc::clone(&collected);
+    let t1 = tokio::spawn(async move {
+        let mut reader = BufReader::new(stdout).lines();
+        while let Ok(Some(line)) = reader.next_line().await {
+            emit_upgrade_line(&app1, &sec1, &line).await;
+            if let Ok(mut v) = coll1.lock() { v.push(line); }
+        }
+    });
+
+    let app2 = app.clone();
+    let sec2 = section.to_string();
+    let coll2 = Arc::clone(&collected);
+    let t2 = tokio::spawn(async move {
+        let mut reader = BufReader::new(stderr).lines();
+        while let Ok(Some(line)) = reader.next_line().await {
+            emit_upgrade_line(&app2, &sec2, &line).await;
+            if let Ok(mut v) = coll2.lock() { v.push(line); }
+        }
+    });
+
+    let _ = tokio::join!(t1, t2);
+    let _ = child.wait().await;
+    emit_upgrade_status(app, section, "done").await;
+
+    Arc::try_unwrap(collected)
+        .map(|m| m.into_inner().unwrap_or_default())
+        .unwrap_or_default()
 }
 
 fn check_script(section: &str) -> Option<&'static str> {
@@ -383,65 +630,24 @@ fi
     }
 }
 
-async fn run_upgrade_shell(app: &AppHandle, section: &str, script: &str) {
-    let shell = if cfg!(target_os = "windows") { "powershell" } else { "bash" };
-    let flag  = if cfg!(target_os = "windows") { "-Command" } else { "-c" };
-
-    let preamble = if cfg!(target_os = "macos") || cfg!(target_os = "linux") {
-        r#"
-export PATH="$HOME/.rvm/bin:$HOME/.rbenv/bin:$HOME/.nvm/versions/node/$(ls $HOME/.nvm/versions/node 2>/dev/null | tail -1)/bin:/usr/local/bin:/opt/homebrew/bin:$PATH"
-[ -s "$HOME/.rvm/scripts/rvm" ] && source "$HOME/.rvm/scripts/rvm"
-command -v rbenv &>/dev/null && eval "$(rbenv init -)"
-"#
-    } else { "" };
-
-    let full_script = format!("{}{}", preamble, script);
-
-    let mut child = match Command::new(shell)
-        .arg(flag)
-        .arg(&full_script)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            emit_upgrade_line(app, section, &format!("Failed to spawn: {e}")).await;
-            emit_upgrade_status(app, section, "error").await;
-            return;
-        }
-    };
-
-    let stdout = child.stdout.take().unwrap();
-    let stderr = child.stderr.take().unwrap();
-
-    let app1 = app.clone();
-    let sec1 = section.to_string();
-    let t1 = tokio::spawn(async move {
-        let mut reader = BufReader::new(stdout).lines();
-        while let Ok(Some(line)) = reader.next_line().await {
-            emit_upgrade_line(&app1, &sec1, &line).await;
-        }
-    });
-
-    let app2 = app.clone();
-    let sec2 = section.to_string();
-    let t2 = tokio::spawn(async move {
-        let mut reader = BufReader::new(stderr).lines();
-        while let Ok(Some(line)) = reader.next_line().await {
-            emit_upgrade_line(&app2, &sec2, &line).await;
-        }
-    });
-
-    let _ = tokio::join!(t1, t2);
-    let _ = child.wait().await;
-    emit_upgrade_status(app, section, "done").await;
-}
-
 #[tauri::command]
 async fn run_upgrade(app: AppHandle, section: String) {
     match upgrade_script(&section) {
-        Some(script) => run_upgrade_shell(&app, &section, script).await,
+        Some(script) => {
+            let lines = run_upgrade_shell(&app, &section, script).await;
+            let ts = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            append_upgrade_log(&app, HistoryEntry {
+                ts,
+                label: section_label(&section).to_string(),
+                section: section.clone(),
+                items: vec![],
+                item_names: vec![],
+                lines,
+            });
+        }
         None => {
             emit_upgrade_line(&app, &section, &format!("No upgrade command for: {section}")).await;
             emit_upgrade_status(&app, &section, "error").await;
@@ -449,9 +655,8 @@ async fn run_upgrade(app: AppHandle, section: String) {
     }
 }
 
-
 #[tauri::command]
-async fn run_upgrade_items(app: AppHandle, section: String, items: Vec<String>) {
+async fn run_upgrade_items(app: AppHandle, section: String, items: Vec<String>, item_names: Vec<String>) {
     if items.is_empty() {
         emit_upgrade_line(&app, &section, "No items selected.").await;
         emit_upgrade_status(&app, &section, "done").await;
@@ -467,12 +672,7 @@ async fn run_upgrade_items(app: AppHandle, section: String, items: Vec<String>) 
             )
         }
         "app_store" => {
-            let names: Vec<String> = items.iter().cloned().collect();
-            let list = if names.is_empty() {
-                "your selected apps".to_string()
-            } else {
-                names.join(", ")
-            };
+            let list = if item_names.is_empty() { items.join(", ") } else { item_names.join(", ") };
             format!(
                 "echo '→  Opening App Store Updates for: {list}'\nopen 'macappstores://showUpdatesPage'\necho '✔  App Store opened — please click Update next to each app.'"
             )
@@ -491,7 +691,21 @@ async fn run_upgrade_items(app: AppHandle, section: String, items: Vec<String>) 
             return;
         }
     };
-    run_upgrade_shell(&app, &section, &script).await;
+
+    let lines = run_upgrade_shell(&app, &section, &script).await;
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let display_names = if item_names.is_empty() { items.clone() } else { item_names };
+    append_upgrade_log(&app, HistoryEntry {
+        ts,
+        label: section_label(&section).to_string(),
+        section: section.clone(),
+        items: items.clone(),
+        item_names: display_names,
+        lines,
+    });
 }
 
 #[tauri::command]
@@ -521,7 +735,10 @@ pub fn run() {
             }
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![run_check, run_upgrade, run_upgrade_items, get_platform])
+        .invoke_handler(tauri::generate_handler![
+            run_check, run_upgrade, run_upgrade_items, get_platform,
+            get_upgrade_history, search_cask, track_app
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

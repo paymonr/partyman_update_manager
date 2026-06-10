@@ -21,6 +21,25 @@
     name: string;
   }
 
+  interface CaskCandidate {
+    token: string;
+    name: string;
+  }
+
+  interface CaskSearchState {
+    status: "searching" | "found" | "none";
+    candidates: CaskCandidate[];
+  }
+
+  interface HistoryEntry {
+    ts: number;
+    section: string;
+    label: string;
+    items: string[];
+    item_names: string[];
+    lines: string[];
+  }
+
   const sections: Section[] = [
     {
       id: "macos_updates",
@@ -39,14 +58,14 @@
     {
       id: "brew_casks",
       label: "Homebrew Apps",
-      description: "GUI apps managed by Homebrew (Chrome, Slack, Docker…)",
+      description: "GUI apps managed by Homebrew",
       upgradeCmd: "brew upgrade --cask --greedy",
       platform: "mac",
     },
     {
       id: "untracked_apps",
-      label: "Untracked Apps",
-      description: "Apps in /Applications not managed by Homebrew or the App Store",
+      label: "Apps Without Auto-Updates",
+      description: "Apps on your Mac that aren't connected to an update manager yet. Enable auto-updates to keep them current.",
       platform: "mac",
     },
     {
@@ -90,7 +109,7 @@
   ];
 
   // Sections that support individual item selection
-  const itemSections = new Set(["macos_updates", "brew_casks", "app_store"]);
+  const itemSections = new Set(["macos_updates", "brew_casks", "app_store", "untracked_apps"]);
 
   let statuses: Record<string, Status> = {};
   let upgradeStatuses: Record<string, Status> = {};
@@ -105,6 +124,11 @@
   let activeTab = "";
   let activeDevTab = "";
   let appVersion = "";
+  let showHistory = false;
+  let historyEntries: HistoryEntry[] = [];
+  let historySearch = "";
+  let expandedHistoryEntry: number | null = null;
+  let caskSearch: Record<string, CaskSearchState> = {};
 
   sections.forEach((s) => {
     statuses[s.id] = "idle";
@@ -177,6 +201,17 @@
       }
       return items;
     }
+    if (section === "untracked_apps") {
+      const items: CheckItem[] = [];
+      for (const line of lines) {
+        const m = line.match(/⚠\s+(.+)/);
+        if (m) {
+          const name = m[1].trim();
+          items.push({ id: name, name });
+        }
+      }
+      return items;
+    }
     return [];
   }
 
@@ -232,6 +267,39 @@
     });
   });
 
+  async function findCask(itemId: string) {
+    caskSearch[itemId] = { status: "searching", candidates: [] };
+    caskSearch = caskSearch;
+    try {
+      const results = await invoke<CaskCandidate[]>("search_cask", { appName: itemId });
+      caskSearch[itemId] = { status: results.length > 0 ? "found" : "none", candidates: results };
+    } catch {
+      caskSearch[itemId] = { status: "none", candidates: [] };
+    }
+    caskSearch = caskSearch;
+  }
+
+  async function findAllCasks() {
+    await Promise.all(activeParsedItems.map(item => findCask(item.id)));
+  }
+
+  async function trackApp(caskToken: string) {
+    upgradeLogs["untracked_apps"] = [];
+    upgradeLogs = upgradeLogs;
+    viewMode["untracked_apps"] = "upgrade";
+    viewMode = viewMode;
+    upgradeStatuses["untracked_apps"] = "running";
+    upgradeStatuses = upgradeStatuses;
+    try {
+      await invoke("track_app", { caskToken });
+    } catch (e) {
+      upgradeLogs["untracked_apps"] = [...(upgradeLogs["untracked_apps"] ?? []), `Error: ${e}`];
+      upgradeLogs = upgradeLogs;
+      upgradeStatuses["untracked_apps"] = "error";
+      upgradeStatuses = upgradeStatuses;
+    }
+  }
+
   async function runSection(id: string) {
     outputs[id] = [];
     outputs = outputs;
@@ -241,6 +309,7 @@
     selectedItems = selectedItems;
     viewMode[id] = "readonly";
     viewMode = viewMode;
+    if (id === "untracked_apps") { caskSearch = {}; }
     statuses[id] = "running";
     statuses = statuses;
     try {
@@ -283,7 +352,14 @@
     }
   }
 
+  async function loadHistory() {
+    historyEntries = await invoke<HistoryEntry[]>("get_upgrade_history");
+  }
+
   async function runUpgradeItems(id: string, items: string[]) {
+    const itemNames = (parsedItems[id] ?? [])
+      .filter(i => items.includes(i.id))
+      .map(i => i.name);
     upgradeLogs[id] = [];
     upgradeLogs = upgradeLogs;
     viewMode[id] = "upgrade";
@@ -291,7 +367,7 @@
     upgradeStatuses[id] = "running";
     upgradeStatuses = upgradeStatuses;
     try {
-      await invoke("run_upgrade_items", { section: id, items });
+      await invoke("run_upgrade_items", { section: id, items, itemNames });
     } catch (e) {
       outputs[id] = [...outputs[id], `Error: ${e}`];
       outputs = outputs;
@@ -374,11 +450,69 @@
   $: activeUpgradeLines = activeSectionId ? (upgradeLogs[activeSectionId] ?? []) : [] as string[];
   $: showSelectView = activeHasItemSelection && activeStatus === "done" && activeParsedItems.length > 0 && activeViewMode === "select";
 
+  $: filteredHistory = historySearch.trim()
+    ? historyEntries.filter(e => {
+        const q = historySearch.toLowerCase();
+        return e.label.toLowerCase().includes(q)
+          || e.item_names.some(n => n.toLowerCase().includes(q))
+          || e.lines.some(l => l.toLowerCase().includes(q));
+      })
+    : historyEntries;
+
   let outputEl: HTMLElement | null = null;
 
   afterUpdate(() => {
     if (outputEl) outputEl.scrollTop = outputEl.scrollHeight;
   });
+
+  const skipPatterns = [
+    /taps are not trusted/,
+    /HOMEBREW_REQUIRE_TAP_TRUST/,
+    /HOMEBREW_NO_REQUIRE_TAP_TRUST/,
+    /Homebrew will ignore/,
+    /This will become the default/,
+    /Enable trust checks now/,
+    /Trust specific formulae/,
+    /or trust installed formulae/,
+    /You can trust all/,
+    /brew trust /,
+    /brew untap /,
+    /Prefer trusting/,
+    /Untap them with/,
+    /To keep allowing/,
+    /trust --formula/,
+    /trust --cask/,
+    /trust --command/,
+    /aws\/tap|hashicorp\/tap|romkatv\/|weaveworks\/tap/,
+    /✔︎ JSON API/,
+    /✔︎ API Source/,
+    /✔︎ Cask .+\(.+\)/,
+    /^==> Purging files/,
+    /whichever comes first/,
+    /not recommended and will be removed/,
+  ];
+
+  function simplifyUntrackedLog(lines: string[]): string[] {
+    return lines
+      .filter(l => !skipPatterns.some(p => p.test(l)))
+      .map((l): string | null => {
+        if (/^==> Fetching downloads for:/.test(l))
+          return `Downloading ${l.replace(/^==> Fetching downloads for:\s*/, "")}…`;
+        if (/^==> Downloading /.test(l)) return "Downloading…";
+        if (/^Already downloaded:/.test(l) || /^#{3,}/.test(l)) return null;
+        if (/^==> Installing Cask /.test(l))
+          return `Installing ${l.replace(/^==> Installing Cask /, "")}…`;
+        if (/^Error: It seems there is already an App/.test(l))
+          return "✖  Setup failed — close the app and try again.";
+        if (/^Warning: It seems there is already an App/.test(l))
+          return "Replacing existing app…";
+        if (/^==> Removing App/.test(l)) return "Removing old version…";
+        if (/^==> Moving App/.test(l) || l.startsWith("🍺")) return null;
+        if (/^==> Using sudo/.test(l) || /^sudo:/.test(l) || /^Error: Permission denied/.test(l)) return null;
+        return l;
+      })
+      .filter((l): l is string => l !== null && l.trim() !== "");
+  }
 
   function formatTime(d: Date): string {
     return d.toLocaleString([], {
@@ -398,10 +532,66 @@
       {/if}
     </div>
     <p class="subtitle">Check for updates and apply them with one click</p>
-    <button class="run-all" onclick={runAll} disabled={runningAll}>
-      {runningAll ? "Checking…" : "Check All"}
-    </button>
+    <div class="header-actions">
+      <button class="run-all" onclick={runAll} disabled={runningAll}>
+        {runningAll ? "Checking…" : "Check All"}
+      </button>
+      <button class="history-btn" onclick={() => { showHistory = !showHistory; if (showHistory) loadHistory(); }}>
+        <svg width="14" height="14" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <circle cx="8" cy="8" r="6.25" stroke="currentColor" stroke-width="1.5"/>
+          <path d="M8 4.5V8.5L10.5 10" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+        History
+      </button>
+    </div>
   </header>
+
+  {#if showHistory}
+    <div class="history-panel">
+      <div class="history-header">
+        <h2>Update History <span class="history-sub">last 180 days</span></h2>
+        <input
+          class="history-search"
+          type="search"
+          placeholder="Search by app, type, or keyword…"
+          bind:value={historySearch}
+        />
+      </div>
+      <div class="history-list">
+        {#if filteredHistory.length === 0}
+          <p class="empty">{historyEntries.length === 0 ? "No update history yet." : "No results for that search."}</p>
+        {:else}
+          {#each filteredHistory as entry, i}
+            <div class="history-entry">
+              <button class="history-entry-header" onclick={() => expandedHistoryEntry = expandedHistoryEntry === i ? null : i}>
+                <div class="history-meta">
+                  <span class="history-label">{entry.label}</span>
+                  <span class="history-time">{formatTime(new Date(entry.ts * 1000))}</span>
+                </div>
+                <div class="history-items">
+                  {#if entry.item_names.length > 0}
+                    {#each entry.item_names as name}
+                      <span class="history-item-chip">{name}</span>
+                    {/each}
+                  {:else}
+                    <span class="history-item-chip history-item-bulk">bulk upgrade</span>
+                  {/if}
+                </div>
+                <span class="history-expand">{expandedHistoryEntry === i ? "▲" : "▼"}</span>
+              </button>
+              {#if expandedHistoryEntry === i}
+                <div class="history-output">
+                  {#each entry.lines as line}
+                    <div class="line">{line}</div>
+                  {/each}
+                </div>
+              {/if}
+            </div>
+          {/each}
+        {/if}
+      </div>
+    </div>
+  {:else}
 
   <div class="tab-bar">
     {#each tabItems as item (item.id)}
@@ -479,7 +669,7 @@
           {/if}
         </div>
         <div class="panel-actions">
-          {#if activeHasItemSelection && activeStatus === "done" && activeParsedItems.length > 0}
+          {#if activeHasItemSelection && activeSectionId !== "untracked_apps" && activeStatus === "done" && activeParsedItems.length > 0}
             <button
               class="update-btn"
               onclick={() => runUpgradeItems(activeSectionId, activeSelectedItems)}
@@ -515,33 +705,67 @@
 
       {#if showSelectView}
         <div class="items-list">
-          <div class="items-bar">
-            <span class="items-count">{activeParsedItems.length} outdated</span>
-            <button class="items-sel-btn" onclick={() => selectAll(activeSectionId)}>Select All</button>
-            <button class="items-sel-btn" onclick={() => selectNone(activeSectionId)}>Clear</button>
-          </div>
-          {#each activeParsedItems as item}
-            <label class="item-row">
-              <input
-                type="checkbox"
-                checked={activeSelectedItems.includes(item.id)}
-                onchange={(e) => toggleItem(activeSectionId, item.id, (e.target as HTMLInputElement).checked)}
-              />
-              <span class="item-name">{item.name}</span>
-            </label>
-          {/each}
+          {#if activeSectionId === "untracked_apps"}
+            <div class="items-bar">
+              <span class="items-count">{activeParsedItems.length} app{activeParsedItems.length === 1 ? "" : "s"} found</span>
+              <button class="items-sel-btn" onclick={findAllCasks}>Check All</button>
+            </div>
+            {#each activeParsedItems as item}
+              <div class="item-row untracked-row">
+                <span class="item-name">{item.name}</span>
+                <div class="cask-search-state">
+                  {#if !caskSearch[item.id]}
+                    <button class="find-cask-btn" onclick={() => findCask(item.id)}>Check</button>
+                  {:else if caskSearch[item.id].status === "searching"}
+                    <span class="cask-status-text">Checking…</span>
+                  {:else if caskSearch[item.id].status === "none"}
+                    <span class="cask-status-text cask-none">Can't be auto-updated</span>
+                  {:else if caskSearch[item.id].status === "found"}
+                    <span class="cask-match">✓ Match found</span>
+                    <button
+                      class="track-btn"
+                      onclick={() => trackApp(caskSearch[item.id].candidates[0].token)}
+                      disabled={activeUpgradeStatus === "running"}
+                    >Enable Auto-Updates</button>
+                  {/if}
+                </div>
+              </div>
+            {/each}
+          {:else}
+            <div class="items-bar">
+              <span class="items-count">{activeParsedItems.length} outdated</span>
+              <button class="items-sel-btn" onclick={() => selectAll(activeSectionId)}>Select All</button>
+              <button class="items-sel-btn" onclick={() => selectNone(activeSectionId)}>Clear</button>
+            </div>
+            {#each activeParsedItems as item}
+              <label class="item-row">
+                <input
+                  type="checkbox"
+                  checked={activeSelectedItems.includes(item.id)}
+                  onchange={(e) => toggleItem(activeSectionId, item.id, (e.target as HTMLInputElement).checked)}
+                />
+                <span class="item-name">{item.name}</span>
+              </label>
+            {/each}
+          {/if}
         </div>
       {:else if activeViewMode === "upgrade"}
         <div class="output" bind:this={outputEl}>
           {#if activeUpgradeLines.length === 0}
             <p class="empty">No updates have been run yet.</p>
           {:else}
-            {#each activeUpgradeLines as line}
+            {@const displayLines = activeSectionId === "untracked_apps" ? simplifyUntrackedLog(activeUpgradeLines) : activeUpgradeLines}
+            {#each displayLines as line}
               <div class="line">{line}</div>
             {/each}
           {/if}
         </div>
       {:else}
+        {#if activeHasItemSelection && activeStatus === "done" && activeParsedItems.length > 0}
+          <div class="updates-hint">
+            Updates available — switch to <button class="hint-link" onclick={() => { viewMode[activeSectionId] = "select"; viewMode = viewMode; }}>Updates</button> to choose which ones to install.
+          </div>
+        {/if}
         <div class="output" bind:this={outputEl}>
           {#if activeLines.length === 0}
             <p class="empty">Press "Run Check" to check for updates.</p>
@@ -553,6 +777,7 @@
         </div>
       {/if}
     </div>
+  {/if}
   {/if}
 </main>
 
@@ -608,7 +833,6 @@
     font-weight: 600;
     cursor: pointer;
     transition: background 0.15s;
-    flex-shrink: 0;
   }
   .run-all:hover:not(:disabled) { background: #0076b3; }
   .run-all:disabled { opacity: 0.5; cursor: not-allowed; }
@@ -829,6 +1053,27 @@
   }
   .item-row:hover .item-name { color: #c8dae6; }
 
+  /* ── Updates hint bar ── */
+  .updates-hint {
+    padding: 0.45rem 1.25rem;
+    background: #0f1a26;
+    border-bottom: 1px solid #1a2d40;
+    font-size: 0.78rem;
+    color: #4a6070;
+  }
+  .hint-link {
+    background: none;
+    border: none;
+    color: #00659A;
+    font-size: inherit;
+    font-weight: 600;
+    cursor: pointer;
+    padding: 0;
+    text-decoration: underline;
+    text-underline-offset: 2px;
+  }
+  .hint-link:hover { color: #5ab8e8; }
+
   /* ── Output ── */
   .output {
     flex: 1;
@@ -843,6 +1088,194 @@
   .last-checked { font-size: 0.72rem; color: #3d5166; margin-top: 0.25rem; }
   .empty { color: #3d5166; font-style: italic; font-family: inherit; font-size: 0.85rem; }
   .line { white-space: pre-wrap; word-break: break-all; color: #8aa4b8; }
+
+  /* ── Header actions ── */
+  .header-actions { display: flex; align-items: center; gap: 0.5rem; flex-shrink: 0; }
+
+  .history-btn {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    background: transparent;
+    color: #4a6070;
+    border: 1px solid #2a3848;
+    border-radius: 8px;
+    padding: 0.45rem 0.9rem;
+    font-size: 0.82rem;
+    font-weight: 500;
+    cursor: pointer;
+    transition: color 0.15s, border-color 0.15s, background 0.15s;
+  }
+  .history-btn:hover { color: #a8bfcc; border-color: #3a4858; background: #1a2230; }
+
+  /* ── History panel ── */
+  .history-panel {
+    background: #1E2733;
+    border: 1px solid #2a3848;
+    border-radius: 0 0 12px 12px;
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    min-height: 0;
+    overflow: hidden;
+  }
+
+  .history-header {
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+    padding: 0.9rem 1.25rem;
+    border-bottom: 1px solid #2a3848;
+    background: #1a2230;
+    flex-wrap: wrap;
+  }
+  .history-header h2 { font-size: 0.95rem; font-weight: 600; color: #f1f5f9; flex-shrink: 0; }
+  .history-sub { font-size: 0.72rem; color: #3d5166; font-weight: 400; margin-left: 0.4rem; }
+
+  .history-search {
+    flex: 1;
+    min-width: 180px;
+    background: #0d1219;
+    border: 1px solid #2a3848;
+    border-radius: 6px;
+    color: #e2e8f0;
+    font-size: 0.82rem;
+    padding: 0.3rem 0.65rem;
+    outline: none;
+    transition: border-color 0.15s;
+  }
+  .history-search:focus { border-color: #00659A; }
+  .history-search::placeholder { color: #3d5166; }
+
+  .history-list {
+    flex: 1;
+    overflow-y: auto;
+    padding: 0.5rem 0;
+  }
+
+  .history-entry {
+    border-bottom: 1px solid #1a2230;
+  }
+
+  .history-entry-header {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.75rem;
+    padding: 0.65rem 1.25rem;
+    cursor: pointer;
+    transition: background 0.1s;
+    background: transparent;
+    border: none;
+    width: 100%;
+    text-align: left;
+    color: inherit;
+  }
+  .history-entry-header:hover { background: #1a2230; }
+
+  .history-meta {
+    display: flex;
+    flex-direction: column;
+    gap: 0.15rem;
+    min-width: 130px;
+    flex-shrink: 0;
+  }
+  .history-label {
+    font-size: 0.78rem;
+    font-weight: 600;
+    color: #F58026;
+  }
+  .history-time {
+    font-size: 0.68rem;
+    color: #3d5166;
+  }
+
+  .history-items {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.3rem;
+    flex: 1;
+    align-items: center;
+  }
+
+  .history-item-chip {
+    background: #0d1219;
+    border: 1px solid #2a3848;
+    border-radius: 4px;
+    padding: 0.1rem 0.45rem;
+    font-size: 0.72rem;
+    font-family: "SF Mono", "Fira Code", monospace;
+    color: #8aa4b8;
+  }
+  .history-item-bulk {
+    color: #3d5166;
+    font-style: italic;
+    font-family: inherit;
+  }
+
+  .history-expand {
+    font-size: 0.6rem;
+    color: #3d5166;
+    flex-shrink: 0;
+    align-self: center;
+  }
+
+  .history-output {
+    padding: 0.5rem 1.25rem 0.75rem 2.5rem;
+    background: #0d1219;
+    font-family: "SF Mono", "Fira Code", monospace;
+    font-size: 0.75rem;
+    line-height: 1.7;
+    border-top: 1px solid #1a2230;
+  }
+
+  /* ── Untracked apps find/track row ── */
+  .untracked-row { justify-content: space-between; }
+
+  .cask-search-state {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+    flex-shrink: 0;
+  }
+
+  .find-cask-btn {
+    background: transparent;
+    border: 1px solid #2a3848;
+    border-radius: 4px;
+    color: #4a6070;
+    font-size: 0.68rem;
+    padding: 0.1rem 0.5rem;
+    cursor: pointer;
+    transition: color 0.1s, border-color 0.1s;
+  }
+  .find-cask-btn:hover { color: #8aa4b8; border-color: #3a4858; }
+
+  .cask-status-text {
+    font-size: 0.7rem;
+    color: #3d5166;
+    font-style: italic;
+  }
+  .cask-none { color: #4a3030; }
+
+  .cask-match {
+    font-size: 0.7rem;
+    color: #22c55e;
+    font-weight: 500;
+  }
+
+  .track-btn {
+    background: #F58026;
+    color: #111822;
+    border: none;
+    border-radius: 4px;
+    padding: 0.12rem 0.55rem;
+    font-size: 0.68rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background 0.12s;
+  }
+  .track-btn:hover:not(:disabled) { background: #d96e1a; }
+  .track-btn:disabled { opacity: 0.5; cursor: not-allowed; }
 
   /* ── Panel info column ── */
   .panel-info { display: flex; flex-direction: column; flex: 1; min-width: 0; }
