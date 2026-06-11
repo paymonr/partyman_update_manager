@@ -35,6 +35,68 @@ struct HistoryEntry {
     lines: Vec<String>,
 }
 
+// Returns a bash function definition for upgrading a single cask.
+// Handles three cases in order:
+//   1. App lives in /Applications (normal)
+//   2. App lives in ~/Applications ("App source not there" → retry with --appdir)
+//   3. App is system-owned ("Permission denied @ apply2files" → chown via osascript, retry)
+fn brew_cask_upgrade_fn() -> &'static str {
+    r#"brew_upgrade_cask() {
+  local token="$1"
+  local CURRENT_USER
+  CURRENT_USER=$(whoami)
+  local TMPOUT
+  TMPOUT=$(mktemp)
+  local APPDIR_FLAG=""
+
+  brew upgrade --cask "$token" 2>&1 | tee "$TMPOUT"
+  local BREW_EXIT="${PIPESTATUS[0]}"
+
+  if grep -q "App source.*is not there" "$TMPOUT"; then
+    EXPECTED_PATH=$(grep "App source.*is not there" "$TMPOUT" | head -1 \
+      | sed "s/.*App source '//;s/' is not there.*//")
+    APP_NAME=$(basename "$EXPECTED_PATH")
+    rm -f "$TMPOUT"
+    TMPOUT=$(mktemp)
+    if [ -n "$APP_NAME" ] && [ -d "$HOME/Applications/$APP_NAME" ]; then
+      APPDIR_FLAG="--appdir $HOME/Applications"
+      echo "→  App is in ~/Applications — reinstalling there…"
+    else
+      APPDIR_FLAG=""
+      echo "→  App not found — reinstalling to /Applications…"
+    fi
+    brew install --cask --force $APPDIR_FLAG "$token" 2>&1 | tee "$TMPOUT"
+    BREW_EXIT="${PIPESTATUS[0]}"
+  fi
+
+  if grep -q "Permission denied @ apply2files" "$TMPOUT"; then
+    local APP_PATH
+    APP_PATH=$(grep "Permission denied @ apply2files" "$TMPOUT" | head -1 \
+      | sed 's/.*@ apply2files - //' | sed 's|/Contents/.*||')
+    rm -f "$TMPOUT"
+    if [ -n "$APP_PATH" ]; then
+      echo "→  $(basename "$APP_PATH") is protected by macOS. Enter your password to allow the update."
+      echo "→  Requesting administrator access…"
+      osascript -e "do shell script \"chown -R $CURRENT_USER '$APP_PATH'\" with administrator privileges" 2>&1
+      brew upgrade --cask $APPDIR_FLAG "$token" 2>&1
+      BREW_EXIT=$?
+    else
+      BREW_EXIT=1
+      echo "✖  Could not determine app path."
+    fi
+  else
+    rm -f "$TMPOUT"
+  fi
+
+  if [ "$BREW_EXIT" -eq 0 ]; then
+    echo "→  Done."
+  else
+    echo "✖  Update failed for $token."
+  fi
+}
+"#
+}
+
 fn section_label(section: &str) -> &'static str {
     match section {
         "macos_updates"  => "OS System Updates",
@@ -154,18 +216,23 @@ async fn search_cask(app_name: String) -> Vec<CaskCandidate> {
 }
 
 #[tauri::command]
-async fn track_app(app: AppHandle, cask_token: String) {
+async fn track_app(app: AppHandle, cask_token: String, appdir: Option<String>) {
     if !cask_token.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '@' || c == '.') {
         emit_upgrade_line(&app, "untracked_apps", "Invalid cask token.").await;
         emit_upgrade_status(&app, "untracked_apps", "error").await;
         return;
     }
+    // Only allow the known user-Applications path; reject anything else
+    let appdir_flag = match appdir.as_deref() {
+        Some("~/Applications") => "--appdir \"$HOME/Applications\"",
+        _ => "",
+    };
     let section = "untracked_apps";
     let script = format!(
         r#"CURRENT_USER=$(whoami)
 export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
 TMPOUT=$(mktemp)
-brew install --cask --force {cask_token} 2>&1 | tee "$TMPOUT"
+brew install --cask --force {appdir_flag} {cask_token} 2>&1 | tee "$TMPOUT"
 BREW_EXIT=${{PIPESTATUS[0]}}
 if grep -q "Permission denied @ apply2files" "$TMPOUT"; then
   APP_PATH=$(grep "Permission denied @ apply2files" "$TMPOUT" | head -1 | sed 's/.*@ apply2files - //' | sed 's|/Contents/.*||')
@@ -174,7 +241,7 @@ if grep -q "Permission denied @ apply2files" "$TMPOUT"; then
     echo "→  $(basename "$APP_PATH") is protected by macOS. Enter your password to let the update manager take over."
     echo "→  Requesting administrator access…"
     osascript -e "do shell script \"chown -R $CURRENT_USER '$APP_PATH'\" with administrator privileges" 2>&1
-    brew install --cask --force {cask_token} 2>&1
+    brew install --cask --force {appdir_flag} {cask_token} 2>&1
     if [ $? -eq 0 ]; then
       echo "→  Done! Run a check to see this app move to Homebrew Apps."
     else
@@ -418,7 +485,6 @@ else
 fi
 "#),
         "untracked_apps" => Some(r#"
-APP_DIR="/Applications"
 cask_tokens=""
 cask_apps=""
 if command -v brew &>/dev/null; then
@@ -428,25 +494,49 @@ if command -v brew &>/dev/null; then
       | jq -r '.casks[].artifacts[]?.app[]? | select(type=="string")' 2>/dev/null)
   fi
 fi
-untracked=0
-for app in "$APP_DIR"/*.app; do
-  [ -e "$app" ] || continue
+
+is_tracked() {
+  local app="$1"
+  local base
   base=$(basename "$app")
-  name=${base%.app}
-  codesign -dvv "$app" 2>&1 | grep -q "Authority=Software Signing" && continue
-  [ -e "$app/Contents/_MASReceipt/receipt" ] && continue
-  [ -n "$cask_apps" ] && echo "$cask_apps" | grep -qxF "$base" && continue
-  norm=$(echo "$name" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9')
-  hit=0
+  codesign -dvv "$app" 2>&1 | grep -q "Authority=Software Signing" && return 0
+  [ -e "$app/Contents/_MASReceipt/receipt" ] && return 0
+  [ -n "$cask_apps" ] && echo "$cask_apps" | grep -qxF "$base" && return 0
+  local norm
+  norm=$(echo "${base%.app}" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9')
+  local tok
   while IFS= read -r tok; do
     [ -z "$tok" ] && continue
-    [ "$(echo "$tok" | tr -cd 'a-z0-9')" = "$norm" ] && { hit=1; break; }
+    [ "$(echo "$tok" | tr -cd 'a-z0-9')" = "$norm" ] && return 0
   done <<< "$cask_tokens"
-  [ "$hit" -eq 1 ] && continue
+  return 1
+}
+
+untracked=0
+SEEN=$(mktemp)
+
+for app in "/Applications"/*.app; do
+  [ -e "$app" ] || continue
+  name="$(basename "$app" .app)"
+  is_tracked "$app" && continue
   echo "⚠  $name"
+  echo "$name" >> "$SEEN"
   untracked=1
 done
-[ "$untracked" -eq 0 ] && echo "✔  No untracked apps found in $APP_DIR."
+
+if [ -d "$HOME/Applications" ]; then
+  for app in "$HOME/Applications"/*.app; do
+    [ -e "$app" ] || continue
+    name="$(basename "$app" .app)"
+    grep -qxF "$name" "$SEEN" 2>/dev/null && continue
+    is_tracked "$app" && continue
+    echo "⚠  $name [~/Applications]"
+    untracked=1
+  done
+fi
+
+rm -f "$SEEN"
+[ "$untracked" -eq 0 ] && echo "✔  No untracked apps found."
 "#),
         "brew_formulae" => Some(r#"
 if command -v brew &>/dev/null; then
@@ -558,25 +648,35 @@ async fn run_check(app: AppHandle, section: String) {
     }
 }
 
-fn upgrade_script(section: &str) -> Option<&'static str> {
+fn upgrade_script(section: &str) -> Option<String> {
     match section {
         "macos_updates" => Some(r#"
 osascript -e 'do shell script "softwareupdate -ia --verbose" with administrator privileges' 2>&1
 echo "→  macOS update complete."
-"#),
-        "brew_casks" => Some(r#"
+"#.to_string()),
+        "brew_casks" => Some(format!(r#"
+export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
 if command -v brew &>/dev/null; then
-  brew upgrade --cask --greedy 2>&1
+  {fn_def}
+  TMPOUT=$(mktemp)
+  brew upgrade --cask --greedy 2>&1 | tee "$TMPOUT"
+  grep "It seems the App source" "$TMPOUT" 2>/dev/null \
+    | sed 's/Error: //;s/:.*//' | tr -d ' ' | while IFS= read -r tok; do
+    [ -z "$tok" ] && continue
+    echo "→  Retrying $tok in ~/Applications…"
+    brew upgrade --cask --appdir "$HOME/Applications" "$tok" 2>&1
+  done
+  rm -f "$TMPOUT"
   echo "→  Homebrew cask upgrade complete."
 else
   echo "✖  brew not found"
 fi
-"#),
+"#, fn_def = brew_cask_upgrade_fn())),
         "app_store" => Some(r#"
 echo "→  Opening App Store Updates…"
 open "macappstores://showUpdatesPage"
 echo "✔  App Store opened — please click Update next to each app."
-"#),
+"#.to_string()),
         "brew_formulae" => Some(r#"
 if command -v brew &>/dev/null; then
   brew upgrade 2>&1
@@ -584,7 +684,7 @@ if command -v brew &>/dev/null; then
 else
   echo "✖  brew not found"
 fi
-"#),
+"#.to_string()),
         "npm_globals" => Some(r#"
 if command -v npm &>/dev/null; then
   npm update -g 2>&1
@@ -592,7 +692,7 @@ if command -v npm &>/dev/null; then
 else
   echo "✖  npm not found"
 fi
-"#),
+"#.to_string()),
         "pip_packages" => Some(r#"
 PIP_CMD=""
 command -v pip3 &>/dev/null && PIP_CMD="pip3"
@@ -608,7 +708,7 @@ if [ -n "$PIP_CMD" ]; then
 else
   echo "✖  pip / pip3 not found"
 fi
-"#),
+"#.to_string()),
         "ruby_rvm" => Some(r#"
 [ -s "$HOME/.rvm/scripts/rvm" ] && source "$HOME/.rvm/scripts/rvm"
 if command -v gem &>/dev/null; then
@@ -617,7 +717,7 @@ if command -v gem &>/dev/null; then
 else
   echo "✖  gem not found"
 fi
-"#),
+"#.to_string()),
         "ruby_rbenv" => Some(r#"
 if command -v gem &>/dev/null; then
   gem update 2>&1
@@ -625,7 +725,7 @@ if command -v gem &>/dev/null; then
 else
   echo "✖  gem not found"
 fi
-"#),
+"#.to_string()),
         _ => None,
     }
 }
@@ -634,7 +734,7 @@ fi
 async fn run_upgrade(app: AppHandle, section: String) {
     match upgrade_script(&section) {
         Some(script) => {
-            let lines = run_upgrade_shell(&app, &section, script).await;
+            let lines = run_upgrade_shell(&app, &section, &script).await;
             let ts = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
@@ -664,11 +764,17 @@ async fn run_upgrade_items(app: AppHandle, section: String, items: Vec<String>, 
     }
     let script: String = match section.as_str() {
         "brew_casks" => {
-            let names = items.iter()
+            let safe_tokens: Vec<String> = items.iter()
                 .filter(|n| n.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '@' || c == '.'))
-                .cloned().collect::<Vec<_>>().join(" ");
+                .cloned().collect();
+            let calls = safe_tokens.iter()
+                .map(|t| format!("brew_upgrade_cask '{t}'"))
+                .collect::<Vec<_>>()
+                .join("\n");
             format!(
-                "if command -v brew &>/dev/null; then\n  brew upgrade --cask {names} 2>&1\n  echo '→  Done.'\nelse\n  echo '✖  brew not found'\nfi"
+                "export PATH=\"/opt/homebrew/bin:/usr/local/bin:$PATH\"\nif command -v brew &>/dev/null; then\n{fn_def}\n{calls}\nelse\n  echo '✖  brew not found'\nfi",
+                fn_def = brew_cask_upgrade_fn(),
+                calls = calls
             )
         }
         "app_store" => {
