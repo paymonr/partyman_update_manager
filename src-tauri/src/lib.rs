@@ -814,6 +814,65 @@ async fn run_upgrade_items(app: AppHandle, section: String, items: Vec<String>, 
     });
 }
 
+#[derive(Clone, serde::Serialize)]
+struct AppUpdateInfo {
+    available: bool,
+    version: String,
+    url: String,
+    notes: String,
+}
+
+fn version_newer(candidate: &str, current: &str) -> bool {
+    let parse = |s: &str| -> (u32, u32, u32) {
+        let mut it = s.split('.');
+        let a = it.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+        let b = it.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+        let c = it.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+        (a, b, c)
+    };
+    parse(candidate) > parse(current)
+}
+
+#[tauri::command]
+async fn check_app_update(current_version: String) -> AppUpdateInfo {
+    let blank = AppUpdateInfo { available: false, version: String::new(), url: String::new(), notes: String::new() };
+    let out = Command::new("curl")
+        .args([
+            "-sf", "--max-time", "8",
+            "-H", "Accept: application/vnd.github+json",
+            "-H", "User-Agent: PartyMAN-Update-Manager",
+            "https://api.github.com/repos/paymonr/partyman_update_manager/releases/latest",
+        ])
+        .output()
+        .await;
+    match out {
+        Ok(o) if o.status.success() => {
+            let text = String::from_utf8_lossy(&o.stdout);
+            match serde_json::from_str::<serde_json::Value>(&text) {
+                Ok(json) => {
+                    let tag = json["tag_name"].as_str().unwrap_or("").trim_start_matches('v').to_string();
+                    let url = json["html_url"].as_str().unwrap_or("").to_string();
+                    let notes = json["body"].as_str().unwrap_or("").to_string();
+                    if !tag.is_empty() && version_newer(&tag, &current_version) {
+                        AppUpdateInfo { available: true, version: tag, url, notes }
+                    } else {
+                        blank
+                    }
+                }
+                Err(_) => blank,
+            }
+        }
+        _ => blank,
+    }
+}
+
+#[tauri::command]
+fn open_release_url(url: String) {
+    if url.starts_with("https://github.com/paymonr/partyman_update_manager") {
+        let _ = std::process::Command::new("open").arg(&url).spawn();
+    }
+}
+
 #[tauri::command]
 fn get_platform() -> String {
     if cfg!(target_os = "macos") {
@@ -831,6 +890,8 @@ fn get_platform() -> String {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .setup(|app| {
             if let Some(window) = app.get_webview_window("main") {
                 let png = include_bytes!("../icons/128x128@2x.png");
@@ -843,7 +904,8 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             run_check, run_upgrade, run_upgrade_items, get_platform,
-            get_upgrade_history, search_cask, track_app
+            get_upgrade_history, search_cask, track_app,
+            check_app_update, open_release_url
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

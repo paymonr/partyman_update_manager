@@ -1,6 +1,6 @@
 {
   "productName": "PartyMAN Update Manager",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "identifier": "com.partyman.updater",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -21,6 +21,14 @@
     ],
     "security": {
       "csp": null
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEI0MjA0QTUwODkzRjhFQTYKUldTbWpqK0pVRW9ndEdycTNrUkw4dWdrZTd0eDVqTnU0cWdJdU1jekE1VmNMak9VSktVTUo3K1oK",
+      "endpoints": [
+        "https://github.com/paymonr/partyman_update_manager/releases/latest/download/latest.json"
+      ]
     }
   },
   "bundle": {

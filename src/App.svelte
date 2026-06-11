@@ -2,6 +2,8 @@
   import { invoke } from "@tauri-apps/api/core";
   import { listen } from "@tauri-apps/api/event";
   import { getVersion } from "@tauri-apps/api/app";
+  import { check as checkUpdate } from "@tauri-apps/plugin-updater";
+  import { relaunch } from "@tauri-apps/plugin-process";
   import { onMount, afterUpdate } from "svelte";
   import iconUrl from "./assets/icon.png";
 
@@ -130,6 +132,9 @@
   let historySearch = "";
   let expandedHistoryEntry: number | null = null;
   let caskSearch: Record<string, CaskSearchState> = {};
+  let showMenu = false;
+  let showSettings = false;
+  let showAbout = false;
 
   sections.forEach((s) => {
     statuses[s.id] = "idle";
@@ -221,7 +226,17 @@
     currentPlatform = await invoke<string>("get_platform");
     appVersion = await getVersion();
 
+    const savedAutoCheck = localStorage.getItem("autoCheckUpdates");
+    autoCheckUpdates = savedAutoCheck === null ? true : savedAutoCheck === "true";
+
     loadLastChecked();
+
+    if (autoCheckUpdates) {
+      const lastCheck = parseInt(localStorage.getItem("lastUpdateCheck") ?? "0", 10);
+      if (Date.now() - lastCheck > 24 * 60 * 60 * 1000) {
+        checkAppUpdate();
+      }
+    }
 
     const visible = sections.filter(platformVisible);
     if (visible.length > 0) activeTab = visible[0].id;
@@ -461,6 +476,43 @@
       })
     : historyEntries;
 
+  type AppUpdateStatus = "idle" | "checking" | "up-to-date" | "available" | "error";
+  interface AppUpdateInfo { version: string; url: string; notes: string; }
+  let appUpdateStatus: AppUpdateStatus = "idle";
+  let appUpdateInfo: AppUpdateInfo | null = null;
+  let autoCheckUpdates = true;
+
+  let pendingUpdate: Awaited<ReturnType<typeof checkUpdate>> = null;
+
+  async function checkAppUpdate() {
+    if (appUpdateStatus === "checking") return;
+    appUpdateStatus = "checking";
+    try {
+      const update = await checkUpdate();
+      if (update) {
+        appUpdateStatus = "available";
+        appUpdateInfo = { version: update.version, url: "", notes: update.body ?? "" };
+        pendingUpdate = update;
+      } else {
+        appUpdateStatus = "up-to-date";
+      }
+      localStorage.setItem("lastUpdateCheck", Date.now().toString());
+    } catch {
+      appUpdateStatus = "error";
+    }
+  }
+
+  async function installAppUpdate() {
+    if (!pendingUpdate) return;
+    appUpdateStatus = "checking";
+    await pendingUpdate.downloadAndInstall();
+    await relaunch();
+  }
+
+  function openReleaseUrl(url: string) {
+    invoke("open_release_url", { url });
+  }
+
   let outputEl: HTMLElement | null = null;
 
   afterUpdate(() => {
@@ -534,21 +586,117 @@
       {/if}
     </div>
     <p class="subtitle">Check for updates and apply them with one click</p>
-    <div class="header-actions">
-      <button class="run-all" onclick={runAll} disabled={runningAll}>
-        {runningAll ? "Checking…" : "Check All"}
-      </button>
-      <button class="history-btn" onclick={() => { showHistory = !showHistory; if (showHistory) loadHistory(); }}>
-        <svg width="14" height="14" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
-          <circle cx="8" cy="8" r="6.25" stroke="currentColor" stroke-width="1.5"/>
-          <path d="M8 4.5V8.5L10.5 10" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+    <div class="view-switcher">
+      <button class:active={!showHistory && !showSettings && !showAbout} onclick={() => { showHistory = false; showSettings = false; showAbout = false; }}>Updates</button>
+      <button class:active={showHistory} onclick={() => { showHistory = true; showSettings = false; showAbout = false; loadHistory(); }}>History</button>
+    </div>
+    <div class="menu-wrap">
+      <button class="hamburger" onclick={() => { showMenu = !showMenu; }}
+        class:active={showMenu} aria-label="Menu">
+        <svg width="16" height="14" viewBox="0 0 16 14" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <path d="M1 1h14M1 7h14M1 13h14" stroke="currentColor" stroke-width="1.75" stroke-linecap="round"/>
         </svg>
-        History
       </button>
+      {#if showMenu}
+        <div class="menu-backdrop" onclick={() => { showMenu = false; }}></div>
+        <div class="dropdown">
+
+          <button class="menu-item menu-item-primary" onclick={() => { runAll(); showMenu = false; }} disabled={runningAll}>
+            <span class="menu-item-label">{runningAll ? "Checking…" : "Check All"}</span>
+          </button>
+
+          <div class="menu-sep"></div>
+
+          <button class="menu-item" onclick={() => { showSettings = true; showHistory = false; showAbout = false; showMenu = false; }}>
+            <span class="menu-item-label">Settings</span>
+          </button>
+
+          <button class="menu-item" onclick={() => { showHistory = true; showSettings = false; showAbout = false; showMenu = false; loadHistory(); }}>
+            <span class="menu-item-label">History</span>
+          </button>
+
+          <div class="menu-sep"></div>
+
+          <button class="menu-item" onclick={() => { showAbout = true; showHistory = false; showSettings = false; showMenu = false; }}>
+            <span class="menu-item-label">About</span>
+          </button>
+
+        </div>
+      {/if}
     </div>
   </header>
 
-  {#if showHistory}
+  {#if appUpdateStatus === "available" && appUpdateInfo}
+    <div class="app-update-banner">
+      <svg width="14" height="14" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg" style="flex-shrink:0">
+        <circle cx="8" cy="8" r="6.25" stroke="currentColor" stroke-width="1.5"/>
+        <path d="M8 5v3.5M8 11v.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+      </svg>
+      <span>PartyMAN v{appUpdateInfo.version} is available</span>
+      <button class="banner-dl-btn" onclick={installAppUpdate}>Install Update</button>
+      <button class="banner-dismiss" onclick={() => { appUpdateStatus = "idle"; appUpdateInfo = null; }}>✕</button>
+    </div>
+  {/if}
+
+  {#if showSettings}
+    <div class="settings-panel">
+      <div class="page-header">
+        <h2>Settings</h2>
+        <button class="page-close" onclick={() => { showSettings = false; }}>✕</button>
+      </div>
+      <div class="settings-body">
+        <div class="settings-section">
+          <h3 class="settings-section-title">App Updates</h3>
+          <div class="settings-row">
+            <div class="settings-row-info">
+              <span class="settings-row-label">Check for Updates</span>
+              <span class="settings-row-desc">Check GitHub for a newer version of PartyMAN Update Manager</span>
+            </div>
+            <button class="settings-check-btn"
+              onclick={() => { if (appUpdateStatus === "available") { installAppUpdate(); } else { checkAppUpdate(); } }}
+              disabled={appUpdateStatus === "checking"}>
+              {#if appUpdateStatus === "checking"}Checking…
+              {:else if appUpdateStatus === "up-to-date"}✔ Up to date
+              {:else if appUpdateStatus === "available" && appUpdateInfo}v{appUpdateInfo.version} — Install
+              {:else}Check Now{/if}
+            </button>
+          </div>
+          <label class="settings-row">
+            <div class="settings-row-info">
+              <span class="settings-row-label">Auto-check on startup</span>
+              <span class="settings-row-desc">Automatically check once per day when the app opens</span>
+            </div>
+            <input type="checkbox" bind:checked={autoCheckUpdates}
+              onchange={() => localStorage.setItem("autoCheckUpdates", String(autoCheckUpdates))} />
+          </label>
+        </div>
+      </div>
+    </div>
+
+  {:else if showAbout}
+    <div class="about-panel">
+      <div class="page-header">
+        <h2>About</h2>
+        <button class="page-close" onclick={() => { showAbout = false; }}>✕</button>
+      </div>
+      <div class="about-body">
+        <img src={iconUrl} alt="" class="about-icon" />
+        <h2 class="about-app-name"><span class="brand-bed">PartyMAN</span> Update Manager</h2>
+        <p class="about-app-version">Version {appVersion}</p>
+        <p class="about-app-desc">A macOS update manager that checks for and applies updates across system tools, App Store apps, Homebrew, and more — all in one place.</p>
+        <div class="about-actions">
+          <button class="about-action-btn" onclick={() => openReleaseUrl("https://github.com/paymonr/partyman_update_manager/releases")}>
+            View Releases
+          </button>
+          <button class="about-action-btn" onclick={() => openReleaseUrl("https://github.com/paymonr/partyman_update_manager")}>
+            GitHub
+          </button>
+        </div>
+        <p class="about-license">Licensed under the Apache License 2.0</p>
+      </div>
+    </div>
+
+  {:else if showHistory}
     <div class="history-panel">
       <div class="history-header">
         <h2>Update History <span class="history-sub">last 180 days</span></h2>
@@ -679,7 +827,7 @@
             >
               {activeUpgradeStatus === "running" ? "Updating…" : `Update Selected (${activeSelectedItems.length})`}
             </button>
-          {:else if activeSection.upgradeCmd && activeStatus === "done" && activeHasOutdated && !activeHasItemSelection}
+          {:else if activeSection.upgradeCmd && activeStatus === "done" && activeHasOutdated && !activeHasItemSelection && !activeSection.dev}
             <button
               class="update-btn"
               onclick={() => runUpgrade(activeSectionId)}
@@ -800,10 +948,11 @@
   header {
     display: flex;
     align-items: center;
-    gap: 1rem;
-    margin-bottom: 1.5rem;
+    column-gap: 0.75rem;
+    row-gap: 0.35rem;
+    margin-bottom: 1rem;
     flex-wrap: wrap;
-    padding-bottom: 1.25rem;
+    padding-bottom: 0.9rem;
     border-bottom: 1px solid #2a3848;
     position: relative;
   }
@@ -823,7 +972,7 @@
   h1 { font-size: 1.4rem; font-weight: 700; color: #f8fafc; letter-spacing: -0.01em; }
   .brand-bed { color: #F58026; }
   .version { font-size: 0.75rem; color: #3d5166; font-weight: 500; }
-  .subtitle { font-size: 0.78rem; color: #3d5166; width: 100%; margin-top: -0.85rem; }
+  .subtitle { font-size: 0.78rem; color: #3d5166; width: 100%; margin-top: -0.5rem; }
 
   .run-all {
     background: #00659A;
@@ -1091,24 +1240,244 @@
   .empty { color: #3d5166; font-style: italic; font-family: inherit; font-size: 0.85rem; }
   .line { white-space: pre-wrap; word-break: break-all; color: #8aa4b8; }
 
-  /* ── Header actions ── */
-  .header-actions { display: flex; align-items: center; gap: 0.5rem; flex-shrink: 0; }
-
-  .history-btn {
+  /* ── App update banner ── */
+  .app-update-banner {
     display: flex;
     align-items: center;
-    gap: 0.4rem;
+    gap: 0.6rem;
+    padding: 0.5rem 1rem;
+    background: #1a2d1a;
+    border: 1px solid #22c55e44;
+    border-radius: 8px;
+    font-size: 0.82rem;
+    color: #22c55e;
+    margin-bottom: 0.5rem;
+  }
+  .banner-dl-btn {
+    background: #22c55e;
+    color: #0d1a0d;
+    border: none;
+    border-radius: 5px;
+    padding: 0.22rem 0.7rem;
+    font-size: 0.78rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background 0.12s;
+  }
+  .banner-dl-btn:hover { background: #16a34a; }
+  .banner-dismiss {
     background: transparent;
-    color: #4a6070;
+    border: none;
+    color: #22c55e88;
+    font-size: 0.75rem;
+    cursor: pointer;
+    margin-left: auto;
+    padding: 0.1rem 0.25rem;
+    transition: color 0.1s;
+  }
+  .banner-dismiss:hover { color: #22c55e; }
+
+  /* ── Hamburger + dropdown ── */
+  .menu-wrap {
+    position: absolute;
+    top: 0;
+    right: 0;
+    z-index: 30;
+  }
+
+  .hamburger {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: transparent;
     border: 1px solid #2a3848;
     border-radius: 8px;
-    padding: 0.45rem 0.9rem;
-    font-size: 0.82rem;
+    color: #4a6070;
+    width: 36px;
+    height: 36px;
+    cursor: pointer;
+    transition: color 0.12s, border-color 0.12s, background 0.12s;
+  }
+  .hamburger:hover, .hamburger.active { color: #f1f5f9; border-color: #3a4858; background: #1a2230; }
+
+  .menu-backdrop { position: fixed; inset: 0; z-index: 10; }
+
+  .dropdown {
+    position: absolute;
+    top: calc(100% + 2px);
+    right: 0;
+    z-index: 20;
+    background: #1a2230;
+    border: 1px solid #2a3848;
+    border-radius: 10px;
+    min-width: 210px;
+    padding: 0.35rem 0;
+    box-shadow: 0 8px 24px #00000055;
+  }
+
+  .menu-item {
+    display: flex;
+    align-items: center;
+    width: 100%;
+    padding: 0.5rem 1rem;
+    background: transparent;
+    border: none;
+    color: #c8dae6;
+    font-size: 0.84rem;
     font-weight: 500;
     cursor: pointer;
-    transition: color 0.15s, border-color 0.15s, background 0.15s;
+    text-align: left;
+    gap: 0.5rem;
+    transition: background 0.1s;
   }
-  .history-btn:hover { color: #a8bfcc; border-color: #3a4858; background: #1a2230; }
+  .menu-item:hover:not(:disabled) { background: #212e3f; }
+  .menu-item:disabled { opacity: 0.5; cursor: not-allowed; }
+  .menu-item-primary { color: #f1f5f9; font-weight: 600; }
+  .menu-item-primary:hover:not(:disabled) { background: #00659A22; }
+  .menu-item-label { flex: 1; }
+  .menu-item-meta { font-size: 0.72rem; color: #3d5166; }
+  .menu-item-meta.ok { color: #22c55e; }
+  .menu-item-meta.new { color: #F58026; font-weight: 600; }
+  .menu-sep { height: 1px; background: #2a3848; margin: 0.25rem 0; }
+
+  /* ── Shared page header (Settings, About) ── */
+  .page-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0.9rem 1.25rem;
+    border-bottom: 1px solid #2a3848;
+    background: #1a2230;
+  }
+  .page-header h2 { font-size: 0.95rem; font-weight: 600; color: #f1f5f9; }
+  .page-close {
+    background: transparent;
+    border: none;
+    color: #3d5166;
+    font-size: 0.85rem;
+    cursor: pointer;
+    padding: 0.2rem 0.4rem;
+    border-radius: 4px;
+    transition: color 0.1s, background 0.1s;
+  }
+  .page-close:hover { color: #f1f5f9; background: #2a3848; }
+
+  /* ── Settings page ── */
+  .settings-panel {
+    background: #1E2733;
+    border: 1px solid #2a3848;
+    border-top: none;
+    border-radius: 0 0 12px 12px;
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    min-height: 0;
+    overflow: hidden;
+  }
+  .settings-body { padding: 1.25rem; overflow-y: auto; flex: 1; }
+  .settings-section { margin-bottom: 1.5rem; }
+  .settings-section-title {
+    font-size: 0.7rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.07em;
+    color: #3d5166;
+    margin-bottom: 0.75rem;
+  }
+  .settings-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1.5rem;
+    padding: 0.75rem 1rem;
+    background: #1a2230;
+    border: 1px solid #2a3848;
+    border-radius: 8px;
+    cursor: pointer;
+  }
+  .settings-row-info { display: flex; flex-direction: column; gap: 0.15rem; }
+  .settings-row-label { font-size: 0.84rem; color: #e2e8f0; font-weight: 500; }
+  .settings-row-desc { font-size: 0.72rem; color: #3d5166; }
+  .settings-row input[type="checkbox"] { accent-color: #F58026; cursor: pointer; width: 16px; height: 16px; flex-shrink: 0; }
+
+  .settings-check-btn {
+    background: #00659A;
+    color: white;
+    border: none;
+    border-radius: 6px;
+    padding: 0.35rem 0.85rem;
+    font-size: 0.78rem;
+    font-weight: 600;
+    cursor: pointer;
+    white-space: nowrap;
+    flex-shrink: 0;
+    transition: background 0.15s;
+  }
+  .settings-check-btn:hover:not(:disabled) { background: #0076b3; }
+  .settings-check-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+  /* ── About page ── */
+  .about-panel {
+    background: #1E2733;
+    border: 1px solid #2a3848;
+    border-top: none;
+    border-radius: 0 0 12px 12px;
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    min-height: 0;
+    overflow: hidden;
+  }
+  .about-body {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 0.5rem;
+    flex: 1;
+    padding: 2rem 1.5rem;
+    text-align: center;
+  }
+  .about-icon { width: 72px; height: 72px; border-radius: 16px; margin-bottom: 0.5rem; }
+  .about-app-name { font-size: 1.25rem; font-weight: 700; color: #f8fafc; }
+  .about-app-version { font-size: 0.78rem; color: #3d5166; }
+  .about-app-desc { font-size: 0.82rem; color: #4a6070; max-width: 360px; line-height: 1.6; margin: 0.5rem 0; }
+  .about-actions { display: flex; gap: 0.5rem; margin-top: 0.5rem; }
+  .about-action-btn {
+    background: transparent;
+    border: 1px solid #2a3848;
+    border-radius: 7px;
+    color: #8aa4b8;
+    font-size: 0.82rem;
+    font-weight: 500;
+    padding: 0.4rem 1rem;
+    cursor: pointer;
+    transition: color 0.12s, border-color 0.12s, background 0.12s;
+  }
+  .about-action-btn:hover { color: #f1f5f9; border-color: #3a4858; background: #1a2230; }
+  .about-license { font-size: 0.68rem; color: #2a3848; margin-top: 1rem; }
+
+  /* ── View switcher (Updates / History toggle) ── */
+  .view-switcher {
+    display: flex;
+    border: 1px solid #2a3848;
+    border-radius: 8px;
+    overflow: hidden;
+    flex-shrink: 0;
+  }
+  .view-switcher button {
+    background: transparent;
+    border: none;
+    color: #4a6070;
+    font-size: 0.82rem;
+    font-weight: 500;
+    padding: 0.4rem 1rem;
+    cursor: pointer;
+    transition: background 0.12s, color 0.12s;
+  }
+  .view-switcher button:hover { color: #a8bfcc; }
+  .view-switcher button.active { background: #2a3848; color: #f1f5f9; }
+
 
   /* ── History panel ── */
   .history-panel {
