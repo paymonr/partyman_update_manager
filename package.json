@@ -1,6 +1,6 @@
 {
-  "name": "bedwatch-updater",
-  "version": "0.1.5",
+  "name": "partyman-update-manager",
+  "version": "0.1.6",
   "type": "module",
   "scripts": {
     "dev": "vite",

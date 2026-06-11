@@ -1,7 +1,7 @@
 {
   "productName": "PartyMAN Update Manager",
-  "version": "0.1.5",
-  "identifier": "com.bedwatch.updater",
+  "version": "0.1.6",
+  "identifier": "com.partyman.updater",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",

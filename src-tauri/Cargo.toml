@@ -1,10 +1,10 @@
 [package]
-name = "bedwatch-updater"
-version = "0.1.5"
+name = "partyman-update-manager"
+version = "0.1.6"
 edition = "2021"
 
 [lib]
-name = "bedwatch_updater_lib"
+name = "partyman_updater_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]

@@ -2,5 +2,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    bedwatch_updater_lib::run()
+    partyman_updater_lib::run()
 }
