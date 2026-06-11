@@ -598,7 +598,7 @@
         </svg>
       </button>
       {#if showMenu}
-        <div class="menu-backdrop" onclick={() => { showMenu = false; }}></div>
+        <div class="menu-backdrop" onclick={() => { showMenu = false; }} role="presentation"></div>
         <div class="dropdown">
 
           <button class="menu-item menu-item-primary" onclick={() => { runAll(); showMenu = false; }} disabled={runningAll}>
@@ -974,19 +974,6 @@
   .version { font-size: 0.75rem; color: #3d5166; font-weight: 500; }
   .subtitle { font-size: 0.78rem; color: #3d5166; width: 100%; margin-top: -0.5rem; }
 
-  .run-all {
-    background: #00659A;
-    color: white;
-    border: none;
-    border-radius: 8px;
-    padding: 0.45rem 1.1rem;
-    font-size: 0.88rem;
-    font-weight: 600;
-    cursor: pointer;
-    transition: background 0.15s;
-  }
-  .run-all:hover:not(:disabled) { background: #0076b3; }
-  .run-all:disabled { opacity: 0.5; cursor: not-allowed; }
 
   /* ── Main tab bar ── */
   .tab-bar {
@@ -1335,9 +1322,6 @@
   .menu-item-primary { color: #f1f5f9; font-weight: 600; }
   .menu-item-primary:hover:not(:disabled) { background: #00659A22; }
   .menu-item-label { flex: 1; }
-  .menu-item-meta { font-size: 0.72rem; color: #3d5166; }
-  .menu-item-meta.ok { color: #22c55e; }
-  .menu-item-meta.new { color: #F58026; font-weight: 600; }
   .menu-sep { height: 1px; background: #2a3848; margin: 0.25rem 0; }
 
   /* ── Shared page header (Settings, About) ── */
