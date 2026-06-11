@@ -19,6 +19,7 @@
   interface CheckItem {
     id: string;
     name: string;
+    appDir?: string;
   }
 
   interface CaskCandidate {
@@ -204,10 +205,11 @@
     if (section === "untracked_apps") {
       const items: CheckItem[] = [];
       for (const line of lines) {
-        const m = line.match(/⚠\s+(.+)/);
+        const m = line.match(/⚠\s+(.+?)(\s+\[~\/Applications\])?$/);
         if (m) {
           const name = m[1].trim();
-          items.push({ id: name, name });
+          const appDir = m[2] ? "~/Applications" : undefined;
+          items.push({ id: name, name, appDir });
         }
       }
       return items;
@@ -283,7 +285,7 @@
     await Promise.all(activeParsedItems.map(item => findCask(item.id)));
   }
 
-  async function trackApp(caskToken: string) {
+  async function trackApp(caskToken: string, appDir?: string) {
     upgradeLogs["untracked_apps"] = [];
     upgradeLogs = upgradeLogs;
     viewMode["untracked_apps"] = "upgrade";
@@ -291,7 +293,7 @@
     upgradeStatuses["untracked_apps"] = "running";
     upgradeStatuses = upgradeStatuses;
     try {
-      await invoke("track_app", { caskToken });
+      await invoke("track_app", { caskToken, appdir: appDir ?? null });
     } catch (e) {
       upgradeLogs["untracked_apps"] = [...(upgradeLogs["untracked_apps"] ?? []), `Error: ${e}`];
       upgradeLogs = upgradeLogs;
@@ -724,7 +726,7 @@
                     <span class="cask-match">✓ Match found</span>
                     <button
                       class="track-btn"
-                      onclick={() => trackApp(caskSearch[item.id].candidates[0].token)}
+                      onclick={() => trackApp(caskSearch[item.id].candidates[0].token, item.appDir)}
                       disabled={activeUpgradeStatus === "running"}
                     >Enable Auto-Updates</button>
                   {/if}
