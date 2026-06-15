@@ -1,5 +1,5 @@
 {
-  "productName": "PartyMAN Update Manager",
+  "productName": "PartyMAN-Update-Manager",
   "version": "0.1.7",
   "identifier": "com.partyman.updater",
   "build": {
