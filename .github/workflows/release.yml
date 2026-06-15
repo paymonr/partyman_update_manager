@@ -55,16 +55,12 @@ jobs:
 
           SIG=$(cat "${SIG_FILE}")
           PUB_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-          printf '{
-  "version": "%s",
-  "notes": "",
-  "pub_date": "%s",
-  "platforms": {
-    "darwin-aarch64": {
-      "signature": "%s",
-      "url": "%s"
-    }
-  }
-}\n' "${VERSION}" "${PUB_DATE}" "${SIG}" "${TAR_URL}" > latest.json
+          jq -n \
+            --arg version "${VERSION}" \
+            --arg pub_date "${PUB_DATE}" \
+            --arg sig "${SIG}" \
+            --arg url "${TAR_URL}" \
+            '{version:$version,notes:"",pub_date:$pub_date,platforms:{"darwin-aarch64":{signature:$sig,url:$url}}}' \
+            > latest.json
 
           gh release upload "v${VERSION}" latest.json --clobber
