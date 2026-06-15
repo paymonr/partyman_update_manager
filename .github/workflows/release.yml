@@ -38,23 +38,26 @@ jobs:
           releaseDraft: true
           prerelease: false
 
-      - name: Upload sig and generate latest.json
+      - name: Sign artifact and generate latest.json
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
           VERSION=$(node -p "require('./src-tauri/tauri.conf.json').version")
-          BUNDLE_DIR="src-tauri/target/release/bundle/macos"
-          SIG_FILE="${BUNDLE_DIR}/PartyMAN-Update-Manager.app.tar.gz.sig"
 
-          # Upload the .sig file to the release
-          gh release upload "v${VERSION}" "${SIG_FILE}" --clobber
-
-          # Find the URL of the .app.tar.gz asset that tauri-action uploaded
+          # Find the .app.tar.gz that tauri-action uploaded to the release
           TAR_URL=$(gh release view "v${VERSION}" --json assets \
             --jq '.assets[] | select(.name | endswith(".app.tar.gz")) | .browserDownloadUrl')
+          TAR_NAME=$(basename "${TAR_URL}")
 
-          SIG=$(cat "${SIG_FILE}")
+          # Download it and sign it (tauri CLI reads TAURI_SIGNING_PRIVATE_KEY from env)
+          curl -fsSL -o "${TAR_NAME}" "${TAR_URL}"
+          npx tauri signer sign "${TAR_NAME}"
+
+          SIG=$(cat "${TAR_NAME}.sig")
           PUB_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
           jq -n \
             --arg version "${VERSION}" \
             --arg pub_date "${PUB_DATE}" \
@@ -63,4 +66,5 @@ jobs:
             '{version:$version,notes:"",pub_date:$pub_date,platforms:{"darwin-aarch64":{signature:$sig,url:$url}}}' \
             > latest.json
 
+          gh release upload "v${VERSION}" "${TAR_NAME}.sig" --clobber
           gh release upload "v${VERSION}" latest.json --clobber
