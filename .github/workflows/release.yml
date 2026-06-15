@@ -37,3 +37,34 @@ jobs:
           releaseName: PartyMAN Update Manager v__VERSION__
           releaseDraft: true
           prerelease: false
+
+      - name: Upload sig and generate latest.json
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          BUNDLE_DIR="src-tauri/target/release/bundle/macos"
+          SIG_FILE="${BUNDLE_DIR}/PartyMAN-Update-Manager.app.tar.gz.sig"
+
+          # Upload the .sig file to the release
+          gh release upload "v${VERSION}" "${SIG_FILE}" --clobber
+
+          # Find the URL of the .app.tar.gz asset that tauri-action uploaded
+          TAR_URL=$(gh release view "v${VERSION}" --json assets \
+            --jq '.assets[] | select(.name | endswith(".app.tar.gz")) | .browserDownloadUrl')
+
+          SIG=$(cat "${SIG_FILE}")
+          PUB_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          printf '{
+  "version": "%s",
+  "notes": "",
+  "pub_date": "%s",
+  "platforms": {
+    "darwin-aarch64": {
+      "signature": "%s",
+      "url": "%s"
+    }
+  }
+}\n' "${VERSION}" "${PUB_DATE}" "${SIG}" "${TAR_URL}" > latest.json
+
+          gh release upload "v${VERSION}" latest.json --clobber
