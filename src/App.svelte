@@ -4,6 +4,7 @@
   import { getVersion } from "@tauri-apps/api/app";
   import { check as checkUpdate } from "@tauri-apps/plugin-updater";
   import { relaunch } from "@tauri-apps/plugin-process";
+  import { enable as enableAutostart, disable as disableAutostart, isEnabled as isAutostartEnabled } from "@tauri-apps/plugin-autostart";
   import { onMount, afterUpdate } from "svelte";
   import iconUrl from "./assets/icon.png";
 
@@ -229,6 +230,8 @@
     const savedAutoCheck = localStorage.getItem("autoCheckUpdates");
     autoCheckUpdates = savedAutoCheck === null ? true : savedAutoCheck === "true";
 
+    try { startOnLogin = await isAutostartEnabled(); } catch (e) { console.error("Failed to read start-on-login state:", e); }
+
     loadLastChecked();
 
     if (autoCheckUpdates) {
@@ -309,6 +312,31 @@
     upgradeStatuses = upgradeStatuses;
     try {
       await invoke("track_app", { caskToken, appdir: appDir ?? null });
+    } catch (e) {
+      upgradeLogs["untracked_apps"] = [...(upgradeLogs["untracked_apps"] ?? []), `Error: ${e}`];
+      upgradeLogs = upgradeLogs;
+      upgradeStatuses["untracked_apps"] = "error";
+      upgradeStatuses = upgradeStatuses;
+    }
+  }
+
+  async function trackAllApps() {
+    const items = activeParsedItems
+      .filter(it => caskSearch[it.id]?.status === "found" && (caskSearch[it.id].candidates?.length ?? 0) > 0)
+      .map(it => ({
+        token: caskSearch[it.id].candidates[0].token,
+        name: it.name,
+        appdir: it.appDir ?? null,
+      }));
+    if (items.length === 0) return;
+    upgradeLogs["untracked_apps"] = [];
+    upgradeLogs = upgradeLogs;
+    viewMode["untracked_apps"] = "upgrade";
+    viewMode = viewMode;
+    upgradeStatuses["untracked_apps"] = "running";
+    upgradeStatuses = upgradeStatuses;
+    try {
+      await invoke("track_apps", { items });
     } catch (e) {
       upgradeLogs["untracked_apps"] = [...(upgradeLogs["untracked_apps"] ?? []), `Error: ${e}`];
       upgradeLogs = upgradeLogs;
@@ -465,6 +493,9 @@
   $: activeHasItemSelection = !!activeSectionId && itemSections.has(activeSectionId);
   $: activeViewMode = activeSectionId ? (viewMode[activeSectionId] ?? "readonly") : "readonly";
   $: activeUpgradeLines = activeSectionId ? (upgradeLogs[activeSectionId] ?? []) : [] as string[];
+  $: activeFoundCount = activeSectionId === "untracked_apps"
+    ? activeParsedItems.filter(it => caskSearch[it.id]?.status === "found").length
+    : 0;
   $: showSelectView = activeHasItemSelection && activeStatus === "done" && activeParsedItems.length > 0 && activeViewMode === "select";
 
   $: filteredHistory = historySearch.trim()
@@ -481,12 +512,27 @@
   let appUpdateStatus: AppUpdateStatus = "idle";
   let appUpdateInfo: AppUpdateInfo | null = null;
   let autoCheckUpdates = true;
+  let startOnLogin = false;
+
+  async function toggleStartOnLogin() {
+    // bind:checked has already flipped startOnLogin to the desired value.
+    try {
+      if (startOnLogin) { await enableAutostart(); } else { await disableAutostart(); }
+    } catch (e) {
+      console.error("Failed to update start-on-login:", e);
+      // Revert the toggle to whatever the OS actually reports.
+      try { startOnLogin = await isAutostartEnabled(); } catch {}
+    }
+  }
 
   let pendingUpdate: Awaited<ReturnType<typeof checkUpdate>> = null;
+
+  let appUpdateError = "";
 
   async function checkAppUpdate() {
     if (appUpdateStatus === "checking") return;
     appUpdateStatus = "checking";
+    appUpdateError = "";
     try {
       const update = await checkUpdate();
       if (update) {
@@ -497,8 +543,10 @@
         appUpdateStatus = "up-to-date";
       }
       localStorage.setItem("lastUpdateCheck", Date.now().toString());
-    } catch {
+    } catch (e: unknown) {
       appUpdateStatus = "error";
+      appUpdateError = e instanceof Error ? e.message : JSON.stringify(e) ?? String(e) ?? "Unknown error";
+      console.error("Update check failed:", e);
     }
   }
 
@@ -646,11 +694,23 @@
       </div>
       <div class="settings-body">
         <div class="settings-section">
+          <h3 class="settings-section-title">General</h3>
+          <label class="settings-row">
+            <div class="settings-row-info">
+              <span class="settings-row-label">Start on login</span>
+              <span class="settings-row-desc">Launch PartyMAN Update Manager automatically when you log in</span>
+            </div>
+            <input type="checkbox" bind:checked={startOnLogin} onchange={toggleStartOnLogin} />
+          </label>
+        </div>
+        <div class="settings-section">
           <h3 class="settings-section-title">App Updates</h3>
           <div class="settings-row">
             <div class="settings-row-info">
               <span class="settings-row-label">Check for Updates</span>
-              <span class="settings-row-desc">Check GitHub for a newer version of PartyMAN Update Manager</span>
+              <span class="settings-row-desc">
+              {#if appUpdateStatus === "error" && appUpdateError}Error: {appUpdateError}{:else}Check GitHub for a newer version of PartyMAN Update Manager{/if}
+            </span>
             </div>
             <button class="settings-check-btn"
               onclick={() => { if (appUpdateStatus === "available") { installAppUpdate(); } else { checkAppUpdate(); } }}
@@ -658,6 +718,7 @@
               {#if appUpdateStatus === "checking"}Checking…
               {:else if appUpdateStatus === "up-to-date"}✔ Up to date
               {:else if appUpdateStatus === "available" && appUpdateInfo}v{appUpdateInfo.version} — Install
+              {:else if appUpdateStatus === "error"}Retry
               {:else}Check Now{/if}
             </button>
           </div>
@@ -859,6 +920,11 @@
             <div class="items-bar">
               <span class="items-count">{activeParsedItems.length} app{activeParsedItems.length === 1 ? "" : "s"} found</span>
               <button class="items-sel-btn" onclick={findAllCasks}>Check All</button>
+              {#if activeFoundCount > 0}
+                <button class="items-sel-btn" onclick={trackAllApps} disabled={activeUpgradeStatus === "running"}>
+                  {activeUpgradeStatus === "running" ? "Enabling…" : `Enable All (${activeFoundCount})`}
+                </button>
+              {/if}
             </div>
             {#each activeParsedItems as item}
               <div class="item-row untracked-row">
