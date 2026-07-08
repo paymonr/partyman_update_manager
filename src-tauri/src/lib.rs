@@ -738,12 +738,29 @@ async fn run_check(app: AppHandle, section: String) {
     }
 }
 
+// Printed after authorization so the user isn't left staring at a spinner: the
+// native `do shell script … with administrator privileges` mechanism buffers all
+// output and returns nothing until softwareupdate finishes, so there is no live
+// progress during the (often multi-minute) install.
+const MACOS_INSTALLING_NOTE: &str = "echo '→  Installing… macOS runs this with no live progress, so this window may look idle for several minutes. Please wait for the completion message.'";
+
+// Branded heads-up shown before the native softwareupdate auth prompt. The system
+// password dialog itself is drawn by macOS and shows "osascript"; this dialog makes
+// clear PartyMAN triggered it and previews that name so it isn't a surprise. Returns
+// a bash line that aborts the whole script cleanly if the user clicks Cancel.
+fn macos_heads_up(what: &str) -> String {
+    let template = r#"osascript -e 'display dialog "PartyMAN Update Manager is about to install __WHAT__.\n\nmacOS will now ask for your administrator password. Its prompt is shown by the system and may appear as \"osascript\"." with title "PartyMAN Update Manager" with icon note buttons {"Cancel", "Continue"} default button "Continue"' >/dev/null 2>&1 || { echo "✖  Update cancelled."; exit 0; }"#;
+    template.replace("__WHAT__", what)
+}
+
 fn upgrade_script(section: &str) -> Option<String> {
     match section {
-        "macos_updates" => Some(r#"
-osascript -e 'do shell script "softwareupdate -ia --verbose" with administrator privileges' 2>&1
-echo "→  macOS update complete."
-"#.to_string()),
+        "macos_updates" => {
+            let heads_up = macos_heads_up("your available macOS system updates");
+            Some(format!(
+                "{heads_up}\n{MACOS_INSTALLING_NOTE}\nosascript -e 'do shell script \"softwareupdate -ia --verbose\" with administrator privileges' 2>&1\necho '→  macOS update complete.'"
+            ))
+        }
         "brew_casks" => Some(format!(r#"
 export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
 if command -v brew &>/dev/null; then
@@ -929,8 +946,13 @@ async fn run_upgrade_items(app: AppHandle, section: String, items: Vec<String>, 
             let labels = items.iter()
                 .map(|l| format!("\\\"{}\\\"", l.replace('"', "\\\"")))
                 .collect::<Vec<_>>().join(" ");
+            let names_src: Vec<String> = if item_names.is_empty() { items.clone() } else { item_names.clone() };
+            let list = names_src.iter()
+                .map(|n| n.replace(['\\', '"'], ""))
+                .collect::<Vec<_>>().join(", ");
+            let heads_up = macos_heads_up(&list);
             format!(
-                "osascript -e 'do shell script \"softwareupdate -i {labels}\" with administrator privileges' 2>&1\necho '→  macOS update complete.'"
+                "{heads_up}\n{MACOS_INSTALLING_NOTE}\nosascript -e 'do shell script \"softwareupdate -i {labels}\" with administrator privileges' 2>&1\necho '→  macOS update complete.'"
             )
         }
         _ => {
