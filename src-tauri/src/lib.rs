@@ -152,6 +152,45 @@ fn brew_cask_upgrade_fn() -> &'static str {
 "#
 }
 
+// Bash function that adopts one app into Homebrew management. $1 is "user" to
+// install into ~/Applications (otherwise /Applications), $2 is the cask token.
+// Depends on pm_fix_protected_bundle (protected_bundle_fn) being defined too.
+fn adopt_cask_fn() -> &'static str {
+    r#"adopt_cask() {
+  local use_userdir="$1" token="$2"
+  local flag=""
+  [ "$use_userdir" = "user" ] && flag="--appdir $HOME/Applications"
+  local TMPOUT; TMPOUT=$(mktemp)
+  brew install --cask --force $flag "$token" 2>&1 | tee "$TMPOUT"
+  local BREW_EXIT=${PIPESTATUS[0]}
+  if grep -q "Permission denied @ apply2files" "$TMPOUT"; then
+    if pm_fix_protected_bundle "$TMPOUT"; then
+      rm -f "$TMPOUT"
+      if brew install --cask --force $flag "$token" 2>&1; then
+        echo "→  Done! $token is now managed by Homebrew."
+      else
+        echo "✖  Setup failed for $token."
+      fi
+    else
+      rm -f "$TMPOUT"
+    fi
+  elif [ "$BREW_EXIT" -eq 0 ]; then
+    rm -f "$TMPOUT"
+    echo "→  Done! $token is now managed by Homebrew."
+  elif grep -qE "Running installer for|/usr/sbin/installer|installer -pkg" "$TMPOUT"; then
+    rm -f "$TMPOUT"
+    echo "✖  $token couldn't be set up — its installer failed."
+    echo "→  This usually means the app is still running, or it is managed by your organization (MDM)."
+    echo "→  Quit the app completely (check the menu bar) and try again."
+    echo "→  If it keeps failing, it is likely managed by IT and can't be adopted by Homebrew — you can leave it to update on its own."
+  else
+    rm -f "$TMPOUT"
+    echo "✖  Setup failed for $token."
+  fi
+}
+"#
+}
+
 fn section_label(section: &str) -> &'static str {
     match section {
         "macos_updates"  => "OS System Updates",
@@ -277,41 +316,15 @@ async fn track_app(app: AppHandle, cask_token: String, appdir: Option<String>) {
         emit_upgrade_status(&app, "untracked_apps", "error").await;
         return;
     }
-    // Only allow the known user-Applications path; reject anything else
-    let appdir_flag = match appdir.as_deref() {
-        Some("~/Applications") => "--appdir \"$HOME/Applications\"",
-        _ => "",
-    };
+    // Only allow the known user-Applications path; reject anything else.
+    let use_userdir = if matches!(appdir.as_deref(), Some("~/Applications")) { "user" } else { "" };
     let section = "untracked_apps";
     let script = format!(
-        r#"CURRENT_USER=$(whoami)
-export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
-TMPOUT=$(mktemp)
-brew install --cask --force {appdir_flag} {cask_token} 2>&1 | tee "$TMPOUT"
-BREW_EXIT=${{PIPESTATUS[0]}}
-if grep -q "Permission denied @ apply2files" "$TMPOUT"; then
-  APP_PATH=$(grep "Permission denied @ apply2files" "$TMPOUT" | head -1 | sed 's/.*@ apply2files - //' | sed 's|/Contents/.*||')
-  rm -f "$TMPOUT"
-  if [ -n "$APP_PATH" ]; then
-    echo "→  $(basename "$APP_PATH") is protected by macOS. Enter your password to let the update manager take over."
-    echo "→  Requesting administrator access…"
-    osascript -e "do shell script \"chown -R $CURRENT_USER '$APP_PATH'\" with administrator privileges" 2>&1
-    brew install --cask --force {appdir_flag} {cask_token} 2>&1
-    if [ $? -eq 0 ]; then
-      echo "→  Done! Run a check to see this app move to Homebrew Apps."
-    else
-      echo "✖  Setup failed."
-    fi
-  else
-    echo "✖  Setup failed."
-  fi
-elif [ "$BREW_EXIT" -eq 0 ]; then
-  rm -f "$TMPOUT"
-  echo "→  Done! Run a check to see this app move to Homebrew Apps."
-else
-  rm -f "$TMPOUT"
-  echo "✖  Setup failed."
-fi"#
+        "export PATH=\"/opt/homebrew/bin:/usr/local/bin:$PATH\"\nif command -v brew &>/dev/null; then\n{helper}\n{adopt}\nadopt_cask '{ud}' '{token}'\necho '→  Run a check to see this app move to Homebrew Apps.'\nelse\n  echo '✖  brew not found'\nfi",
+        helper = protected_bundle_fn(),
+        adopt = adopt_cask_fn(),
+        ud = use_userdir,
+        token = cask_token,
     );
     let lines = run_upgrade_shell(&app, section, &script).await;
     let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
@@ -321,6 +334,53 @@ fi"#
         section: section.to_string(),
         items: vec![cask_token.clone()],
         item_names: vec![cask_token],
+        lines,
+    });
+}
+
+#[derive(serde::Deserialize)]
+struct TrackItem {
+    token: String,
+    name: String,
+    appdir: Option<String>,
+}
+
+// Adopt several apps into Homebrew in one shell, so a single sudo session covers
+// the whole batch (one password prompt) instead of one prompt per app.
+#[tauri::command]
+async fn track_apps(app: AppHandle, items: Vec<TrackItem>) {
+    let section = "untracked_apps";
+    let mut calls = String::new();
+    let mut tokens: Vec<String> = Vec::new();
+    let mut names: Vec<String> = Vec::new();
+    for it in &items {
+        if !it.token.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '@' || c == '.') {
+            continue;
+        }
+        let ud = if matches!(it.appdir.as_deref(), Some("~/Applications")) { "user" } else { "" };
+        calls.push_str(&format!("adopt_cask '{ud}' '{token}'\n", ud = ud, token = it.token));
+        tokens.push(it.token.clone());
+        names.push(it.name.clone());
+    }
+    if tokens.is_empty() {
+        emit_upgrade_line(&app, section, "No apps to enable.").await;
+        emit_upgrade_status(&app, section, "done").await;
+        return;
+    }
+    let script = format!(
+        "export PATH=\"/opt/homebrew/bin:/usr/local/bin:$PATH\"\nif command -v brew &>/dev/null; then\n{helper}\n{adopt}\n{calls}echo '→  All set! Run a check to move these apps to Homebrew Apps.'\nelse\n  echo '✖  brew not found'\nfi",
+        helper = protected_bundle_fn(),
+        adopt = adopt_cask_fn(),
+        calls = calls,
+    );
+    let lines = run_upgrade_shell(&app, section, &script).await;
+    let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    append_upgrade_log(&app, HistoryEntry {
+        ts,
+        label: section_label(section).to_string(),
+        section: section.to_string(),
+        items: tokens,
+        item_names: names,
         lines,
     });
 }
@@ -1068,7 +1128,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             run_check, run_upgrade, run_upgrade_items, get_platform,
-            get_upgrade_history, search_cask, track_app,
+            get_upgrade_history, search_cask, track_app, track_apps,
             check_app_update, open_release_url
         ])
         .run(tauri::generate_context!())

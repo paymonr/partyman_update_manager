@@ -317,6 +317,31 @@
     }
   }
 
+  async function trackAllApps() {
+    const items = activeParsedItems
+      .filter(it => caskSearch[it.id]?.status === "found" && (caskSearch[it.id].candidates?.length ?? 0) > 0)
+      .map(it => ({
+        token: caskSearch[it.id].candidates[0].token,
+        name: it.name,
+        appdir: it.appDir ?? null,
+      }));
+    if (items.length === 0) return;
+    upgradeLogs["untracked_apps"] = [];
+    upgradeLogs = upgradeLogs;
+    viewMode["untracked_apps"] = "upgrade";
+    viewMode = viewMode;
+    upgradeStatuses["untracked_apps"] = "running";
+    upgradeStatuses = upgradeStatuses;
+    try {
+      await invoke("track_apps", { items });
+    } catch (e) {
+      upgradeLogs["untracked_apps"] = [...(upgradeLogs["untracked_apps"] ?? []), `Error: ${e}`];
+      upgradeLogs = upgradeLogs;
+      upgradeStatuses["untracked_apps"] = "error";
+      upgradeStatuses = upgradeStatuses;
+    }
+  }
+
   async function runSection(id: string) {
     outputs[id] = [];
     outputs = outputs;
@@ -465,6 +490,9 @@
   $: activeHasItemSelection = !!activeSectionId && itemSections.has(activeSectionId);
   $: activeViewMode = activeSectionId ? (viewMode[activeSectionId] ?? "readonly") : "readonly";
   $: activeUpgradeLines = activeSectionId ? (upgradeLogs[activeSectionId] ?? []) : [] as string[];
+  $: activeFoundCount = activeSectionId === "untracked_apps"
+    ? activeParsedItems.filter(it => caskSearch[it.id]?.status === "found").length
+    : 0;
   $: showSelectView = activeHasItemSelection && activeStatus === "done" && activeParsedItems.length > 0 && activeViewMode === "select";
 
   $: filteredHistory = historySearch.trim()
@@ -859,6 +887,11 @@
             <div class="items-bar">
               <span class="items-count">{activeParsedItems.length} app{activeParsedItems.length === 1 ? "" : "s"} found</span>
               <button class="items-sel-btn" onclick={findAllCasks}>Check All</button>
+              {#if activeFoundCount > 0}
+                <button class="items-sel-btn" onclick={trackAllApps} disabled={activeUpgradeStatus === "running"}>
+                  {activeUpgradeStatus === "running" ? "Enabling…" : `Enable All (${activeFoundCount})`}
+                </button>
+              {/if}
             </div>
             {#each activeParsedItems as item}
               <div class="item-row untracked-row">
