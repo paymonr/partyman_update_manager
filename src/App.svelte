@@ -4,6 +4,7 @@
   import { getVersion } from "@tauri-apps/api/app";
   import { check as checkUpdate } from "@tauri-apps/plugin-updater";
   import { relaunch } from "@tauri-apps/plugin-process";
+  import { THEMES, applyTheme, loadTheme, saveTheme, watchSystemTheme, type ThemeId } from "./themes/theme";
   import { enable as enableAutostart, disable as disableAutostart, isEnabled as isAutostartEnabled } from "@tauri-apps/plugin-autostart";
   import { onMount, afterUpdate } from "svelte";
   import iconUrl from "./assets/icon.png";
@@ -136,6 +137,189 @@
   let showMenu = false;
   let showSettings = false;
   let showAbout = false;
+  let showSchedule = false;
+  let theme: ThemeId = loadTheme();
+
+  function changeTheme() {
+    saveTheme(theme);
+    applyTheme(theme);
+  }
+
+  type ScheduleConfig = {
+    enabled: boolean;
+    frequency: "hourly" | "daily" | "weekly";
+    minute: number;
+    hour: number;
+    weekday: number;
+    notify: boolean;
+    lastRun: number;
+    lastTotal: number;
+    lastCounts: Record<string, number>;
+    snoozedUntil: number;
+    countDevUpdates: boolean;
+    checkOnLaunch: boolean;
+  };
+
+  let schedule: ScheduleConfig = {
+    enabled: false, frequency: "daily", minute: 0, hour: 10, weekday: 1, notify: true,
+    lastRun: 0, lastTotal: 0, lastCounts: {}, snoozedUntil: 0,
+    countDevUpdates: false, checkOnLaunch: false,
+  };
+  let scheduleSaving = false;
+  let scheduleRunning = false;
+  let scheduleError = "";
+
+  const FREQUENCIES = [
+    { id: "hourly", label: "Hourly" },
+    { id: "daily", label: "Daily" },
+    { id: "weekly", label: "Weekly" },
+  ] as const;
+
+  const WEEKDAYS = [
+    { id: 0, label: "Sunday" },
+    { id: 1, label: "Monday" },
+    { id: 2, label: "Tuesday" },
+    { id: 3, label: "Wednesday" },
+    { id: 4, label: "Thursday" },
+    { id: 5, label: "Friday" },
+    { id: 6, label: "Saturday" },
+  ];
+
+  const HOURS = Array.from({ length: 24 }, (_, h) => ({
+    id: h,
+    label: `${h % 12 === 0 ? 12 : h % 12} ${h < 12 ? "AM" : "PM"}`,
+  }));
+
+  function hourLabel(h: number): string {
+    return `${h % 12 === 0 ? 12 : h % 12}:`;
+  }
+
+  let nextRunAt = 0;
+
+  function pad(n: number): string {
+    return String(n).padStart(2, "0");
+  }
+
+  async function setMinute(e: Event) {
+    const m = Number((e.target as HTMLInputElement).value);
+    if (!Number.isFinite(m)) return;
+    schedule.minute = Math.min(59, Math.max(0, Math.trunc(m)));
+    await saveSchedule();
+  }
+
+  async function refreshNextRun() {
+    try {
+      nextRunAt = await invoke<number>("next_run");
+    } catch {
+      nextRunAt = 0;
+    }
+  }
+
+  function sectionLabel(id: string): string {
+    return sections.find((s) => s.id === id)?.label ?? id;
+  }
+
+  async function loadSchedule() {
+    try {
+      schedule = await invoke<ScheduleConfig>("get_schedule");
+      await refreshNextRun();
+    } catch (e) {
+      console.error("Failed to read schedule:", e);
+    }
+  }
+
+  async function saveSchedule() {
+    scheduleSaving = true;
+    scheduleError = "";
+    try {
+      schedule = await invoke<ScheduleConfig>("set_schedule", { config: schedule });
+      await refreshNextRun();
+    } catch (e) {
+      // Installing the background agent can fail; re-read so the controls show
+      // what is actually in effect rather than what was clicked.
+      scheduleError = String(e);
+      await loadSchedule();
+    } finally {
+      scheduleSaving = false;
+    }
+  }
+
+  async function runScheduleNow() {
+    scheduleRunning = true;
+    scheduleError = "";
+    try {
+      schedule = await invoke<ScheduleConfig>("run_schedule_now");
+    } catch (e) {
+      scheduleError = String(e);
+    } finally {
+      scheduleRunning = false;
+    }
+  }
+
+  // The scheduled run already did this work, so the app opens with each section
+  // filled in rather than eight empty tabs and a Check button.
+  async function hydrateLastCheck() {
+    try {
+      const last = await invoke<{ ts: number; sections: Record<string, string[]> }>("get_last_check");
+      if (!last?.ts) return;
+      const when = new Date(last.ts * 1000);
+      for (const [id, lines] of Object.entries(last.sections ?? {})) {
+        if (!sections.some((sec) => sec.id === id)) continue;
+        if (outputs[id]?.length) continue; // anything checked live this session wins
+        outputs[id] = lines;
+        parsedItems[id] = parseItems(id, lines);
+        statuses[id] = "done";
+        if (!lastChecked[id] || lastChecked[id]!.getTime() < when.getTime()) {
+          lastChecked[id] = when;
+        }
+      }
+      outputs = outputs;
+      parsedItems = parsedItems;
+      statuses = statuses;
+      lastChecked = lastChecked;
+    } catch (e) {
+      console.error("Failed to preload the last check:", e);
+    }
+  }
+
+  function isSnoozed(): boolean {
+    return schedule.snoozedUntil * 1000 > Date.now();
+  }
+
+  async function snoozeUpdates(hours: number) {
+    try {
+      schedule = await invoke<ScheduleConfig>("snooze_updates", { hours });
+    } catch (e) {
+      scheduleError = String(e);
+    }
+  }
+
+  // Installing is always something the user starts: several of these need an
+  // administrator password, so they have to be at the machine to answer it.
+  // Sections run one after another so the prompts cannot overlap.
+  async function installOutstanding() {
+    showSchedule = false;
+    showSettings = false;
+    showHistory = false;
+    showAbout = false;
+    const pending = Object.entries(schedule.lastCounts)
+      .filter(([, n]) => n > 0)
+      .map(([id]) => id)
+      .filter((id) => sections.some((sec) => sec.id === id && platformVisible(sec)));
+    for (const id of pending) {
+      activeTab = id;
+      await runUpgrade(id);
+    }
+  }
+
+  function formatWhen(ts: number): string {
+    return ts ? new Date(ts * 1000).toLocaleString() : "Never";
+  }
+
+  function nextRunLabel(): string {
+    if (!schedule.enabled) return "Off";
+    return nextRunAt ? new Date(nextRunAt * 1000).toLocaleString() : "—";
+  }
 
   sections.forEach((s) => {
     statuses[s.id] = "idle";
@@ -232,7 +416,11 @@
 
     try { startOnLogin = await isAutostartEnabled(); } catch (e) { console.error("Failed to read start-on-login state:", e); }
 
+    watchSystemTheme(() => theme);
+
     loadLastChecked();
+    await loadSchedule();
+    await hydrateLastCheck();
 
     if (autoCheckUpdates) {
       const lastCheck = parseInt(localStorage.getItem("lastUpdateCheck") ?? "0", 10);
@@ -246,6 +434,10 @@
 
     const firstDev = sections.find(s => platformVisible(s) && !!s.dev);
     if (firstDev) activeDevTab = firstDev.id;
+
+    await listen<ScheduleConfig>("schedule-updated", ({ payload }) => {
+      schedule = payload;
+    });
 
     await listen<{ section: string; line: string }>("check-output", ({ payload }) => {
       outputs[payload.section] = [...outputs[payload.section], payload.line];
@@ -284,6 +476,13 @@
     await listen<{ section: string; status: string }>("upgrade-status", ({ payload }) => {
       upgradeStatuses[payload.section] = payload.status as Status;
       upgradeStatuses = upgradeStatuses;
+      // Re-check what is left so the menu-bar count matches what is now installed
+      // instead of what was outstanding before the upgrade ran.
+      if (payload.status === "done") {
+        invoke("recount_section", { section: payload.section }).catch((e) =>
+          console.error("Failed to recount after upgrade:", e),
+        );
+      }
     });
   });
 
@@ -635,8 +834,8 @@
     </div>
     <p class="subtitle">Check for updates and apply them with one click</p>
     <div class="view-switcher">
-      <button class:active={!showHistory && !showSettings && !showAbout} onclick={() => { showHistory = false; showSettings = false; showAbout = false; }}>Updates</button>
-      <button class:active={showHistory} onclick={() => { showHistory = true; showSettings = false; showAbout = false; loadHistory(); }}>History</button>
+      <button class:active={!showHistory && !showSettings && !showAbout && !showSchedule} onclick={() => { showHistory = false; showSettings = false; showAbout = false; showSchedule = false; }}>Updates</button>
+      <button class:active={showHistory} onclick={() => { showHistory = true; showSettings = false; showAbout = false; showSchedule = false; loadHistory(); }}>History</button>
     </div>
     <div class="menu-wrap">
       <button class="hamburger" onclick={() => { showMenu = !showMenu; }}
@@ -655,17 +854,22 @@
 
           <div class="menu-sep"></div>
 
-          <button class="menu-item" onclick={() => { showSettings = true; showHistory = false; showAbout = false; showMenu = false; }}>
-            <span class="menu-item-label">Settings</span>
+          <button class="menu-item" onclick={() => { showSchedule = true; showSettings = false; showHistory = false; showAbout = false; showMenu = false; loadSchedule(); }}>
+            <span class="menu-item-label">Scheduler</span>
+            {#if schedule.enabled}<span class="menu-item-badge">On</span>{/if}
           </button>
 
-          <button class="menu-item" onclick={() => { showHistory = true; showSettings = false; showAbout = false; showMenu = false; loadHistory(); }}>
+          <button class="menu-item" onclick={() => { showHistory = true; showSettings = false; showAbout = false; showSchedule = false; showMenu = false; loadHistory(); }}>
             <span class="menu-item-label">History</span>
+          </button>
+
+          <button class="menu-item" onclick={() => { showSettings = true; showHistory = false; showAbout = false; showSchedule = false; showMenu = false; }}>
+            <span class="menu-item-label">Settings</span>
           </button>
 
           <div class="menu-sep"></div>
 
-          <button class="menu-item" onclick={() => { showAbout = true; showHistory = false; showSettings = false; showMenu = false; }}>
+          <button class="menu-item" onclick={() => { showAbout = true; showHistory = false; showSettings = false; showSchedule = false; showMenu = false; }}>
             <span class="menu-item-label">About</span>
           </button>
 
@@ -686,7 +890,163 @@
     </div>
   {/if}
 
-  {#if showSettings}
+  {#if schedule.lastTotal > 0 && !isSnoozed()}
+    <div class="update-prompt">
+      <span class="update-prompt-count">
+        {schedule.lastTotal} update{schedule.lastTotal === 1 ? "" : "s"} available
+      </span>
+      <button class="update-prompt-install" onclick={installOutstanding}>Install Now</button>
+      <span class="update-prompt-later">Remind me in</span>
+      <button class="update-prompt-snooze" onclick={() => snoozeUpdates(1)}>1 hour</button>
+      <button class="update-prompt-snooze" onclick={() => snoozeUpdates(24)}>1 day</button>
+      <button class="update-prompt-snooze" onclick={() => snoozeUpdates(72)}>3 days</button>
+    </div>
+  {/if}
+
+  {#if showSchedule}
+    <div class="settings-panel">
+      <div class="page-header">
+        <h2>Scheduler</h2>
+        <button class="page-close" onclick={() => { showSchedule = false; }}>✕</button>
+      </div>
+      <div class="settings-body">
+        {#if scheduleError}
+          <div class="schedule-error">{scheduleError}</div>
+        {/if}
+
+        <div class="settings-section">
+          <h3 class="settings-section-title">Automatic Checks</h3>
+          <label class="settings-row">
+            <div class="settings-row-info">
+              <span class="settings-row-label">Check for updates automatically</span>
+              <span class="settings-row-desc">Keeps checking in the background even after you quit PartyMAN</span>
+            </div>
+            <input type="checkbox" bind:checked={schedule.enabled}
+              onchange={saveSchedule} disabled={scheduleSaving} />
+          </label>
+          <div class="settings-row">
+            <div class="settings-row-info">
+              <span class="settings-row-label">How often</span>
+              <span class="settings-row-desc">Next run: {nextRunLabel()}</span>
+            </div>
+            <select class="schedule-select" bind:value={schedule.frequency}
+              onchange={saveSchedule} disabled={!schedule.enabled || scheduleSaving}>
+              {#each FREQUENCIES as choice}
+                <option value={choice.id}>{choice.label}</option>
+              {/each}
+            </select>
+          </div>
+
+          {#if schedule.frequency === "weekly"}
+            <div class="settings-row">
+              <div class="settings-row-info">
+                <span class="settings-row-label">Day of the week</span>
+                <span class="settings-row-desc">Which day the weekly check runs on</span>
+              </div>
+              <select class="schedule-select" bind:value={schedule.weekday}
+                onchange={saveSchedule} disabled={!schedule.enabled || scheduleSaving}>
+                {#each WEEKDAYS as day}
+                  <option value={day.id}>{day.label}</option>
+                {/each}
+              </select>
+            </div>
+          {/if}
+
+          {#if schedule.frequency !== "hourly"}
+            <div class="settings-row">
+              <div class="settings-row-info">
+                <span class="settings-row-label">Hour</span>
+                <span class="settings-row-desc">Local time, so it holds through daylight saving</span>
+              </div>
+              <select class="schedule-select" bind:value={schedule.hour}
+                onchange={saveSchedule} disabled={!schedule.enabled || scheduleSaving}>
+                {#each HOURS as h}
+                  <option value={h.id}>{h.label}</option>
+                {/each}
+              </select>
+            </div>
+          {/if}
+
+          <div class="settings-row">
+            <div class="settings-row-info">
+              <span class="settings-row-label">Minutes past the hour</span>
+              <span class="settings-row-desc">
+                {schedule.frequency === "hourly"
+                  ? "Runs at this minute of every hour"
+                  : `Runs at ${hourLabel(schedule.hour)}${pad(schedule.minute)}`}
+              </span>
+            </div>
+            <input class="schedule-select schedule-number" type="number" min="0" max="59"
+              value={schedule.minute} onchange={setMinute}
+              disabled={!schedule.enabled || scheduleSaving} />
+          </div>
+          <label class="settings-row">
+            <div class="settings-row-info">
+              <span class="settings-row-label">Check when PM Updater opens</span>
+              <span class="settings-row-desc">Runs a check on launch instead of waiting for the next interval</span>
+            </div>
+            <input type="checkbox" bind:checked={schedule.checkOnLaunch}
+              onchange={saveSchedule} disabled={scheduleSaving} />
+          </label>
+        </div>
+
+        <div class="settings-section">
+          <h3 class="settings-section-title">Notifications</h3>
+          <label class="settings-row">
+            <div class="settings-row-info">
+              <span class="settings-row-label">Notify me when updates are found</span>
+              <span class="settings-row-desc">The menu bar always shows the count; this adds a notification</span>
+            </div>
+            <input type="checkbox" bind:checked={schedule.notify}
+              onchange={saveSchedule} disabled={scheduleSaving} />
+          </label>
+          <label class="settings-row">
+            <div class="settings-row-info">
+              <span class="settings-row-label">Include developer tools in the count</span>
+              <span class="settings-row-desc">
+                Counts brew formulae, npm, pip and gems too. They often run to hundreds of
+                packages, so by default the count sticks to apps and system updates.
+              </span>
+            </div>
+            <input type="checkbox" bind:checked={schedule.countDevUpdates}
+              onchange={saveSchedule} disabled={scheduleSaving} />
+          </label>
+          {#if isSnoozed()}
+            <div class="settings-row">
+              <div class="settings-row-info">
+                <span class="settings-row-label">Reminders paused</span>
+                <span class="settings-row-desc">Until {formatWhen(schedule.snoozedUntil)}</span>
+              </div>
+              <button class="settings-check-btn" onclick={() => snoozeUpdates(0)}>Resume</button>
+            </div>
+          {/if}
+        </div>
+
+        <div class="settings-section">
+          <h3 class="settings-section-title">Last Run</h3>
+          <div class="settings-row">
+            <div class="settings-row-info">
+              <span class="settings-row-label">
+                {schedule.lastTotal} update{schedule.lastTotal === 1 ? "" : "s"} found
+              </span>
+              <span class="settings-row-desc">Last checked: {formatWhen(schedule.lastRun)}</span>
+            </div>
+            <button class="settings-check-btn" onclick={runScheduleNow} disabled={scheduleRunning}>
+              {scheduleRunning ? "Checking…" : "Run Now"}
+            </button>
+          </div>
+          {#if Object.values(schedule.lastCounts).some((n) => n > 0)}
+            <div class="schedule-breakdown">
+              {#each Object.entries(schedule.lastCounts).filter(([, n]) => n > 0) as [sec, n]}
+                <span class="schedule-chip">{sectionLabel(sec)} <strong>{n}</strong></span>
+              {/each}
+            </div>
+          {/if}
+        </div>
+      </div>
+    </div>
+
+  {:else if showSettings}
     <div class="settings-panel">
       <div class="page-header">
         <h2>Settings</h2>
@@ -695,6 +1055,19 @@
       <div class="settings-body">
         <div class="settings-section">
           <h3 class="settings-section-title">General</h3>
+          <div class="settings-row">
+            <div class="settings-row-info">
+              <span class="settings-row-label">Theme</span>
+              <span class="settings-row-desc">
+                {THEMES.find((t) => t.id === theme)?.note ?? ""}
+              </span>
+            </div>
+            <select class="schedule-select" bind:value={theme} onchange={changeTheme}>
+              {#each THEMES as choice}
+                <option value={choice.id}>{choice.label}</option>
+              {/each}
+            </select>
+          </div>
           <label class="settings-row">
             <div class="settings-row-info">
               <span class="settings-row-label">Start on login</span>
@@ -754,6 +1127,15 @@
           </button>
         </div>
         <p class="about-license">Licensed under the Apache License 2.0</p>
+        <div class="about-credits">
+          <p>
+            Kawaii Meadow themes use
+            <button class="about-link" onclick={() => openReleaseUrl("https://github.com/paymonr/kawaii-meadow")}>kawaii-meadow</button>,
+            an MIT-licensed CSS kit by
+            <button class="about-link" onclick={() => openReleaseUrl("https://github.com/paymonr")}>@paymonr</button>.
+          </p>
+          <p>Set in Nunito, licensed under the SIL Open Font License.</p>
+        </div>
       </div>
     </div>
 
@@ -1004,12 +1386,12 @@
     overflow: hidden;
   }
   :global(body) {
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-    background: #111822;
-    color: #e2e8f0;
+    font-family: var(--pm-font);
+    background: var(--pm-surface);
+    color: var(--pm-text-2);
   }
 
-  main { max-width: 860px; margin: 0 auto; padding: 1.5rem 1rem 1.5rem; display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
+  main { max-width: 860px; margin: 0 auto; padding: 2.1rem 1rem 1.5rem; display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
 
   header {
     display: flex;
@@ -1019,7 +1401,7 @@
     margin-bottom: 1rem;
     flex-wrap: wrap;
     padding-bottom: 0.9rem;
-    border-bottom: 1px solid #2a3848;
+    border-bottom: 1px solid var(--pm-border);
     position: relative;
   }
   header::after {
@@ -1029,16 +1411,16 @@
     left: 0;
     width: 3rem;
     height: 2px;
-    background: #F58026;
+    background: var(--pm-accent);
     border-radius: 1px;
   }
 
   .title-block { display: flex; align-items: center; gap: 0.65rem; flex: 1; }
-  .app-icon { width: 36px; height: 36px; border-radius: 8px; flex-shrink: 0; }
-  h1 { font-size: 1.4rem; font-weight: 700; color: #f8fafc; letter-spacing: -0.01em; }
-  .brand-bed { color: #F58026; }
-  .version { font-size: 0.75rem; color: #3d5166; font-weight: 500; }
-  .subtitle { font-size: 0.78rem; color: #3d5166; width: 100%; margin-top: -0.5rem; }
+  .app-icon { width: 36px; height: 36px; border-radius: var(--pm-radius); flex-shrink: 0; }
+  h1 { font-size: 1.4rem; font-weight: 700; color: var(--pm-text-bright); letter-spacing: -0.01em; }
+  .brand-bed { color: var(--pm-accent); }
+  .version { font-size: 0.75rem; color: var(--pm-label); font-weight: 500; }
+  .subtitle { font-size: 0.78rem; color: var(--pm-label); width: 100%; margin-top: 0.15rem; }
 
 
   /* ── Main tab bar ── */
@@ -1046,10 +1428,10 @@
     display: flex;
     gap: 2px;
     overflow-x: auto;
-    border-bottom: 1px solid #2a3848;
     padding-bottom: 0;
     scrollbar-width: none;
     margin-top: -0.25rem;
+    margin-bottom: 0.5rem;
   }
   .tab-bar::-webkit-scrollbar { display: none; }
 
@@ -1061,7 +1443,7 @@
     background: transparent;
     border: none;
     border-bottom: 2px solid transparent;
-    color: #4a6070;
+    color: var(--pm-faint-2);
     font-size: 0.82rem;
     font-weight: 500;
     cursor: pointer;
@@ -1069,11 +1451,11 @@
     transition: color 0.15s, border-color 0.15s;
     margin-bottom: -1px;
   }
-  .tab:hover { color: #a8bfcc; }
-  .tab.active { color: #f1f5f9; border-bottom-color: #F58026; }
-  .tab.running { color: #00659A; }
-  .tab.done { color: #6a8899; }
-  .tab.error { color: #ef4444; }
+  .tab:hover { color: var(--pm-text-dim); }
+  .tab.active { color: var(--pm-text); border-bottom-color: var(--pm-accent); }
+  .tab.running { color: var(--pm-info); }
+  .tab.done { color: var(--pm-faint); }
+  .tab.error { color: var(--pm-err); }
 
   .tab-dot {
     width: 6px;
@@ -1088,8 +1470,8 @@
     display: flex;
     gap: 2px;
     overflow-x: auto;
-    background: #161e29;
-    border-bottom: 1px solid #2a3848;
+    background: var(--pm-surface-2);
+    border-bottom: 1px solid var(--pm-border);
     padding: 0 0.5rem;
     scrollbar-width: none;
   }
@@ -1103,7 +1485,7 @@
     background: transparent;
     border: none;
     border-bottom: 2px solid transparent;
-    color: #3d5166;
+    color: var(--pm-label);
     font-size: 0.78rem;
     font-weight: 500;
     cursor: pointer;
@@ -1111,18 +1493,17 @@
     transition: color 0.15s, border-color 0.15s;
     margin-bottom: -1px;
   }
-  .sub-tab:hover { color: #8aa4b8; }
-  .sub-tab.active { color: #e2e8f0; border-bottom-color: #F58026; }
-  .sub-tab.running { color: #00659A; }
-  .sub-tab.done { color: #4a6070; }
-  .sub-tab.error { color: #ef4444; }
+  .sub-tab:hover { color: var(--pm-muted); }
+  .sub-tab.active { color: var(--pm-text-2); border-bottom-color: var(--pm-accent); }
+  .sub-tab.running { color: var(--pm-info); }
+  .sub-tab.done { color: var(--pm-faint-2); }
+  .sub-tab.error { color: var(--pm-err); }
 
   /* ── Panel ── */
   .panel {
-    background: #1E2733;
-    border: 1px solid #2a3848;
-    border-top: none;
-    border-radius: 0 0 12px 12px;
+    background: var(--pm-card-2);
+    border: 1px solid var(--pm-border);
+    border-radius: var(--pm-radius-lg);
     overflow: hidden;
     transition: border-color 0.2s;
     display: flex;
@@ -1131,77 +1512,77 @@
     min-height: 0;
     margin-bottom: 0;
   }
-  .panel.running { border-color: #00659A; }
-  .panel.done { border-color: #22c55e44; }
-  .panel.error { border-color: #ef444444; }
+  .panel.running { border-color: var(--pm-info); }
+  .panel.done { border-color: var(--pm-ok-border); }
+  .panel.error { border-color: var(--pm-err-border); }
 
   .panel-header {
     display: flex;
     align-items: center;
     justify-content: space-between;
     padding: 1rem 1.25rem;
-    border-bottom: 1px solid #2a3848;
+    border-bottom: 1px solid var(--pm-border);
     gap: 1rem;
     flex-wrap: wrap;
-    background: #1a2230;
+    background: var(--pm-card);
   }
 
-  h2 { font-size: 1rem; font-weight: 600; color: #f1f5f9; }
-  .desc { font-size: 0.78rem; color: #4a6070; margin-top: 0.2rem; }
+  h2 { font-size: 1rem; font-weight: 600; color: var(--pm-text); }
+  .desc { font-size: 0.78rem; color: var(--pm-faint-2); margin-top: 0.2rem; }
 
   .panel-actions { display: flex; gap: 0.5rem; align-items: center; flex-shrink: 0; }
 
   .check-btn {
-    background: #00659A;
+    background: var(--pm-info);
     color: white;
     border: none;
-    border-radius: 7px;
+    border-radius: var(--pm-radius);
     padding: 0.45rem 1rem;
     font-size: 0.85rem;
     font-weight: 600;
     cursor: pointer;
     transition: background 0.15s;
   }
-  .check-btn:hover:not(:disabled) { background: #0076b3; }
+  .check-btn:hover:not(:disabled) { background: var(--pm-info-hover); }
   .check-btn:disabled { opacity: 0.5; cursor: not-allowed; }
 
   .update-btn {
-    background: #F58026;
-    color: #111822;
+    background: var(--pm-accent);
+    color: var(--pm-surface);
     border: none;
-    border-radius: 7px;
+    border-radius: var(--pm-radius);
     padding: 0.45rem 1rem;
     font-size: 0.85rem;
     font-weight: 600;
     cursor: pointer;
     transition: background 0.15s;
   }
-  .update-btn:hover:not(:disabled) { background: #d96e1a; }
+  .update-btn:hover:not(:disabled) { background: var(--pm-accent-hover); }
   .update-btn:disabled { opacity: 0.5; cursor: not-allowed; }
 
   /* ── View toggle ── */
   .view-toggle {
     display: flex;
-    border: 1px solid #2a3848;
-    border-radius: 6px;
+    border: 1px solid var(--pm-border);
+    border-radius: var(--pm-radius-sm);
     overflow: hidden;
   }
   .view-toggle button {
     background: transparent;
     border: none;
-    color: #4a6070;
+    color: var(--pm-faint-2);
     font-size: 0.78rem;
     font-weight: 500;
     padding: 0.3rem 0.65rem;
     cursor: pointer;
     transition: background 0.12s, color 0.12s;
   }
-  .view-toggle button:hover { color: #8aa4b8; }
-  .view-toggle button.active { background: #2a3848; color: #f1f5f9; }
+  .view-toggle button:hover { color: var(--pm-muted); }
+  .view-toggle button.active { background: var(--pm-border); color: var(--pm-text); }
 
   /* ── Items checklist ── */
   .items-list {
-    background: #0d1219;
+    background: var(--pm-bg);
     padding: 0.75rem 1.25rem 1rem;
     flex: 1;
     min-height: 0;
@@ -1215,9 +1596,109 @@
     margin-bottom: 0.45rem;
   }
 
+  .update-prompt {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin: 0 0 14px;
+    padding: 9px 12px;
+    border-radius: var(--pm-radius);
+    background: rgba(90, 140, 220, 0.12);
+    border: 1px solid rgba(90, 140, 220, 0.32);
+    font-size: 12.5px;
+  }
+
+  .update-prompt-count { font-weight: 600; }
+
+  .update-prompt-later {
+    margin-left: 4px;
+    opacity: 0.7;
+  }
+
+  .update-prompt-install,
+  .update-prompt-snooze {
+    font: inherit;
+    font-size: 12px;
+    padding: 4px 11px;
+    border-radius: var(--pm-radius);
+    cursor: pointer;
+    border: 1px solid rgba(128, 128, 128, 0.35);
+    background: transparent;
+    color: inherit;
+  }
+
+  .update-prompt-install {
+    font-weight: 600;
+    border-color: transparent;
+    background: rgba(90, 140, 220, 0.9);
+    color: var(--pm-on-accent);
+  }
+
+  .update-prompt-install:hover { background: rgba(90, 140, 220, 1); }
+  .update-prompt-snooze:hover { background: rgba(128, 128, 128, 0.14); }
+
+  .schedule-error {
+    margin: 0 0 14px;
+    padding: 10px 12px;
+    border-radius: var(--pm-radius);
+    background: rgba(220, 60, 60, 0.12);
+    border: 1px solid rgba(220, 60, 60, 0.35);
+    font-size: 12.5px;
+    line-height: 1.45;
+  }
+
+  .schedule-select {
+    font: inherit;
+    font-size: 13px;
+    padding: 5px 8px;
+    border-radius: var(--pm-radius-sm);
+    border: 1px solid var(--pm-border-strong);
+    background: var(--pm-card);
+    color: var(--pm-text);
+  }
+
+  /* The opened menu is drawn by macOS, not the page, so its rows have to carry
+     their own colours or they inherit ones meant for the app's background. */
+  .schedule-select option {
+    background: var(--pm-card);
+    color: var(--pm-text);
+  }
+
+  .schedule-select:disabled { opacity: 0.5; }
+
+  .schedule-number { width: 4.5rem; }
+
+  .schedule-breakdown {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    padding: 4px 0 2px;
+  }
+
+  .schedule-chip {
+    font-size: 11.5px;
+    padding: 3px 9px;
+    border-radius: 999px;
+    background: rgba(128, 128, 128, 0.14);
+    border: 1px solid rgba(128, 128, 128, 0.22);
+    white-space: nowrap;
+  }
+
+  .menu-item-badge {
+    margin-left: auto;
+    font-size: 10.5px;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    padding: 2px 7px;
+    border-radius: 999px;
+    background: rgba(80, 170, 110, 0.18);
+    border: 1px solid rgba(80, 170, 110, 0.4);
+  }
+
   .items-count {
     font-size: 0.72rem;
-    color: #3d5166;
+    color: var(--pm-label);
     flex: 1;
     text-transform: uppercase;
     letter-spacing: 0.04em;
@@ -1225,15 +1706,15 @@
 
   .items-sel-btn {
     background: transparent;
-    border: 1px solid #2a3848;
-    border-radius: 4px;
-    color: #4a6070;
+    border: 1px solid var(--pm-border);
+    border-radius: var(--pm-radius-sm);
+    color: var(--pm-faint-2);
     font-size: 0.68rem;
     padding: 0.1rem 0.45rem;
     cursor: pointer;
     transition: color 0.1s, border-color 0.1s;
   }
-  .items-sel-btn:hover { color: #8aa4b8; border-color: #3a4858; }
+  .items-sel-btn:hover { color: var(--pm-muted); border-color: var(--pm-border-strong); }
 
   .item-row {
     display: flex;
@@ -1244,7 +1725,7 @@
     user-select: none;
   }
   .item-row input[type="checkbox"] {
-    accent-color: #F58026;
+    accent-color: var(--pm-accent);
     width: 13px;
     height: 13px;
     cursor: pointer;
@@ -1252,23 +1733,23 @@
   }
   .item-name {
     font-size: 0.8rem;
-    color: #8aa4b8;
+    color: var(--pm-muted);
     font-family: "SF Mono", "Fira Code", monospace;
   }
-  .item-row:hover .item-name { color: #c8dae6; }
+  .item-row:hover .item-name { color: var(--pm-text-hover); }
 
   /* ── Updates hint bar ── */
   .updates-hint {
     padding: 0.45rem 1.25rem;
-    background: #0f1a26;
-    border-bottom: 1px solid #1a2d40;
+    background: var(--pm-bg-deep);
+    border-bottom: 1px solid var(--pm-border-accent);
     font-size: 0.78rem;
-    color: #4a6070;
+    color: var(--pm-faint-2);
   }
   .hint-link {
     background: none;
     border: none;
-    color: #00659A;
+    color: var(--pm-info);
     font-size: inherit;
     font-weight: 600;
     cursor: pointer;
@@ -1276,12 +1757,12 @@
     text-decoration: underline;
     text-underline-offset: 2px;
   }
-  .hint-link:hover { color: #5ab8e8; }
+  .hint-link:hover { color: var(--pm-link-hover); }
 
   /* ── Output ── */
   .output {
     flex: 1;
-    background: #0d1219;
+    background: var(--pm-bg);
     padding: 1rem 1.25rem;
     overflow-y: auto;
     font-family: "SF Mono", "Fira Code", monospace;
@@ -1289,9 +1770,9 @@
     line-height: 1.7;
   }
 
-  .last-checked { font-size: 0.72rem; color: #3d5166; margin-top: 0.25rem; }
-  .empty { color: #3d5166; font-style: italic; font-family: inherit; font-size: 0.85rem; }
-  .line { white-space: pre-wrap; word-break: break-all; color: #8aa4b8; }
+  .last-checked { font-size: 0.72rem; color: var(--pm-label); margin-top: 0.25rem; }
+  .empty { color: var(--pm-label); font-style: italic; font-family: inherit; font-size: 0.85rem; }
+  .line { white-space: pre-wrap; word-break: break-all; color: var(--pm-muted); }
 
   /* ── App update banner ── */
   .app-update-banner {
@@ -1299,36 +1780,36 @@
     align-items: center;
     gap: 0.6rem;
     padding: 0.5rem 1rem;
-    background: #1a2d1a;
-    border: 1px solid #22c55e44;
-    border-radius: 8px;
+    background: var(--pm-ok-bg);
+    border: 1px solid var(--pm-ok-border);
+    border-radius: var(--pm-radius);
     font-size: 0.82rem;
-    color: #22c55e;
+    color: var(--pm-ok);
     margin-bottom: 0.5rem;
   }
   .banner-dl-btn {
-    background: #22c55e;
-    color: #0d1a0d;
+    background: var(--pm-ok);
+    color: var(--pm-ok-fg);
     border: none;
-    border-radius: 5px;
+    border-radius: var(--pm-radius-sm);
     padding: 0.22rem 0.7rem;
     font-size: 0.78rem;
     font-weight: 600;
     cursor: pointer;
     transition: background 0.12s;
   }
-  .banner-dl-btn:hover { background: #16a34a; }
+  .banner-dl-btn:hover { background: var(--pm-ok-hover); }
   .banner-dismiss {
     background: transparent;
     border: none;
-    color: #22c55e88;
+    color: var(--pm-ok-dim);
     font-size: 0.75rem;
     cursor: pointer;
     margin-left: auto;
     padding: 0.1rem 0.25rem;
     transition: color 0.1s;
   }
-  .banner-dismiss:hover { color: #22c55e; }
+  .banner-dismiss:hover { color: var(--pm-ok); }
 
   /* ── Hamburger + dropdown ── */
   .menu-wrap {
@@ -1343,15 +1824,15 @@
     align-items: center;
     justify-content: center;
     background: transparent;
-    border: 1px solid #2a3848;
-    border-radius: 8px;
-    color: #4a6070;
+    border: 1px solid var(--pm-border);
+    border-radius: var(--pm-radius);
+    color: var(--pm-faint-2);
     width: 36px;
     height: 36px;
     cursor: pointer;
     transition: color 0.12s, border-color 0.12s, background 0.12s;
   }
-  .hamburger:hover, .hamburger.active { color: #f1f5f9; border-color: #3a4858; background: #1a2230; }
+  .hamburger:hover, .hamburger.active { color: var(--pm-text); border-color: var(--pm-border-strong); background: var(--pm-card); }
 
   .menu-backdrop { position: fixed; inset: 0; z-index: 10; }
 
@@ -1360,12 +1841,12 @@
     top: calc(100% + 2px);
     right: 0;
     z-index: 20;
-    background: #1a2230;
-    border: 1px solid #2a3848;
-    border-radius: 10px;
+    background: var(--pm-card);
+    border: 1px solid var(--pm-border);
+    border-radius: var(--pm-radius-lg);
     min-width: 210px;
     padding: 0.35rem 0;
-    box-shadow: 0 8px 24px #00000055;
+    box-shadow: 0 8px 24px var(--pm-shadow);
   }
 
   .menu-item {
@@ -1375,7 +1856,7 @@
     padding: 0.5rem 1rem;
     background: transparent;
     border: none;
-    color: #c8dae6;
+    color: var(--pm-text-hover);
     font-size: 0.84rem;
     font-weight: 500;
     cursor: pointer;
@@ -1383,12 +1864,12 @@
     gap: 0.5rem;
     transition: background 0.1s;
   }
-  .menu-item:hover:not(:disabled) { background: #212e3f; }
+  .menu-item:hover:not(:disabled) { background: var(--pm-hover); }
   .menu-item:disabled { opacity: 0.5; cursor: not-allowed; }
-  .menu-item-primary { color: #f1f5f9; font-weight: 600; }
-  .menu-item-primary:hover:not(:disabled) { background: #00659A22; }
+  .menu-item-primary { color: var(--pm-text); font-weight: 600; }
+  .menu-item-primary:hover:not(:disabled) { background: var(--pm-info-tint); }
   .menu-item-label { flex: 1; }
-  .menu-sep { height: 1px; background: #2a3848; margin: 0.25rem 0; }
+  .menu-sep { height: 1px; background: var(--pm-border); margin: 0.25rem 0; }
 
   /* ── Shared page header (Settings, About) ── */
   .page-header {
@@ -1396,28 +1877,27 @@
     align-items: center;
     justify-content: space-between;
     padding: 0.9rem 1.25rem;
-    border-bottom: 1px solid #2a3848;
-    background: #1a2230;
+    border-bottom: 1px solid var(--pm-border);
+    background: var(--pm-card);
   }
-  .page-header h2 { font-size: 0.95rem; font-weight: 600; color: #f1f5f9; }
+  .page-header h2 { font-size: 0.95rem; font-weight: 600; color: var(--pm-text); }
   .page-close {
     background: transparent;
     border: none;
-    color: #3d5166;
+    color: var(--pm-label);
     font-size: 0.85rem;
     cursor: pointer;
     padding: 0.2rem 0.4rem;
-    border-radius: 4px;
+    border-radius: var(--pm-radius-sm);
     transition: color 0.1s, background 0.1s;
   }
-  .page-close:hover { color: #f1f5f9; background: #2a3848; }
+  .page-close:hover { color: var(--pm-text); background: var(--pm-border); }
 
   /* ── Settings page ── */
   .settings-panel {
-    background: #1E2733;
-    border: 1px solid #2a3848;
-    border-top: none;
-    border-radius: 0 0 12px 12px;
+    background: var(--pm-card-2);
+    border: 1px solid var(--pm-border);
+    border-radius: var(--pm-radius-lg);
     display: flex;
     flex-direction: column;
     flex: 1;
@@ -1431,7 +1911,7 @@
     font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.07em;
-    color: #3d5166;
+    color: var(--pm-label);
     margin-bottom: 0.75rem;
   }
   .settings-row {
@@ -1440,21 +1920,21 @@
     justify-content: space-between;
     gap: 1.5rem;
     padding: 0.75rem 1rem;
-    background: #1a2230;
-    border: 1px solid #2a3848;
-    border-radius: 8px;
+    background: var(--pm-card);
+    border: 1px solid var(--pm-border);
+    border-radius: var(--pm-radius);
     cursor: pointer;
   }
   .settings-row-info { display: flex; flex-direction: column; gap: 0.15rem; }
-  .settings-row-label { font-size: 0.84rem; color: #e2e8f0; font-weight: 500; }
-  .settings-row-desc { font-size: 0.72rem; color: #3d5166; }
-  .settings-row input[type="checkbox"] { accent-color: #F58026; cursor: pointer; width: 16px; height: 16px; flex-shrink: 0; }
+  .settings-row-label { font-size: 0.84rem; color: var(--pm-text-2); font-weight: 500; }
+  .settings-row-desc { font-size: 0.72rem; color: var(--pm-label); }
+  .settings-row input[type="checkbox"] { accent-color: var(--pm-accent); cursor: pointer; width: 16px; height: 16px; flex-shrink: 0; }
 
   .settings-check-btn {
-    background: #00659A;
+    background: var(--pm-info);
     color: white;
     border: none;
-    border-radius: 6px;
+    border-radius: var(--pm-radius-sm);
     padding: 0.35rem 0.85rem;
     font-size: 0.78rem;
     font-weight: 600;
@@ -1463,15 +1943,14 @@
     flex-shrink: 0;
     transition: background 0.15s;
   }
-  .settings-check-btn:hover:not(:disabled) { background: #0076b3; }
+  .settings-check-btn:hover:not(:disabled) { background: var(--pm-info-hover); }
   .settings-check-btn:disabled { opacity: 0.5; cursor: not-allowed; }
 
   /* ── About page ── */
   .about-panel {
-    background: #1E2733;
-    border: 1px solid #2a3848;
-    border-top: none;
-    border-radius: 0 0 12px 12px;
+    background: var(--pm-card-2);
+    border: 1px solid var(--pm-border);
+    border-radius: var(--pm-radius-lg);
     display: flex;
     flex-direction: column;
     flex: 1;
@@ -1488,52 +1967,72 @@
     padding: 2rem 1.5rem;
     text-align: center;
   }
-  .about-icon { width: 72px; height: 72px; border-radius: 16px; margin-bottom: 0.5rem; }
-  .about-app-name { font-size: 1.25rem; font-weight: 700; color: #f8fafc; }
-  .about-app-version { font-size: 0.78rem; color: #3d5166; }
-  .about-app-desc { font-size: 0.82rem; color: #4a6070; max-width: 360px; line-height: 1.6; margin: 0.5rem 0; }
+  .about-icon { width: 72px; height: 72px; border-radius: var(--pm-radius-lg); margin-bottom: 0.5rem; }
+  .about-app-name { font-size: 1.25rem; font-weight: 700; color: var(--pm-text-bright); }
+  .about-app-version { font-size: 0.78rem; color: var(--pm-label); }
+  .about-app-desc { font-size: 0.82rem; color: var(--pm-faint-2); max-width: 360px; line-height: 1.6; margin: 0.5rem 0; }
   .about-actions { display: flex; gap: 0.5rem; margin-top: 0.5rem; }
   .about-action-btn {
     background: transparent;
-    border: 1px solid #2a3848;
-    border-radius: 7px;
-    color: #8aa4b8;
+    border: 1px solid var(--pm-border);
+    border-radius: var(--pm-radius);
+    color: var(--pm-muted);
     font-size: 0.82rem;
     font-weight: 500;
     padding: 0.4rem 1rem;
     cursor: pointer;
     transition: color 0.12s, border-color 0.12s, background 0.12s;
   }
-  .about-action-btn:hover { color: #f1f5f9; border-color: #3a4858; background: #1a2230; }
-  .about-license { font-size: 0.68rem; color: #2a3848; margin-top: 1rem; }
+  .about-action-btn:hover { color: var(--pm-text); border-color: var(--pm-border-strong); background: var(--pm-card); }
+  .about-credits {
+    margin-top: 0.9rem;
+    padding-top: 0.9rem;
+    border-top: 1px solid var(--pm-border);
+    font-size: 0.72rem;
+    line-height: 1.6;
+    color: var(--pm-label);
+    max-width: 30rem;
+  }
+
+  .about-link {
+    font: inherit;
+    color: var(--pm-accent);
+    background: none;
+    border: none;
+    padding: 0;
+    cursor: pointer;
+    text-decoration: underline;
+  }
+
+  .about-license { font-size: 0.68rem; color: var(--pm-border); margin-top: 1rem; }
 
   /* ── View switcher (Updates / History toggle) ── */
   .view-switcher {
     display: flex;
-    border: 1px solid #2a3848;
-    border-radius: 8px;
+    border: 1px solid var(--pm-border);
+    border-radius: var(--pm-radius);
     overflow: hidden;
     flex-shrink: 0;
   }
   .view-switcher button {
     background: transparent;
     border: none;
-    color: #4a6070;
+    color: var(--pm-faint-2);
     font-size: 0.82rem;
     font-weight: 500;
     padding: 0.4rem 1rem;
     cursor: pointer;
     transition: background 0.12s, color 0.12s;
   }
-  .view-switcher button:hover { color: #a8bfcc; }
-  .view-switcher button.active { background: #2a3848; color: #f1f5f9; }
+  .view-switcher button:hover { color: var(--pm-text-dim); }
+  .view-switcher button.active { background: var(--pm-border); color: var(--pm-text); }
 
 
   /* ── History panel ── */
   .history-panel {
-    background: #1E2733;
-    border: 1px solid #2a3848;
-    border-radius: 0 0 12px 12px;
+    background: var(--pm-card-2);
+    border: 1px solid var(--pm-border);
+    border-radius: var(--pm-radius-lg);
     display: flex;
     flex-direction: column;
     flex: 1;
@@ -1546,27 +2045,27 @@
     align-items: center;
     gap: 1rem;
     padding: 0.9rem 1.25rem;
-    border-bottom: 1px solid #2a3848;
-    background: #1a2230;
+    border-bottom: 1px solid var(--pm-border);
+    background: var(--pm-card);
     flex-wrap: wrap;
   }
-  .history-header h2 { font-size: 0.95rem; font-weight: 600; color: #f1f5f9; flex-shrink: 0; }
-  .history-sub { font-size: 0.72rem; color: #3d5166; font-weight: 400; margin-left: 0.4rem; }
+  .history-header h2 { font-size: 0.95rem; font-weight: 600; color: var(--pm-text); flex-shrink: 0; }
+  .history-sub { font-size: 0.72rem; color: var(--pm-label); font-weight: 400; margin-left: 0.4rem; }
 
   .history-search {
     flex: 1;
     min-width: 180px;
-    background: #0d1219;
-    border: 1px solid #2a3848;
-    border-radius: 6px;
-    color: #e2e8f0;
+    background: var(--pm-bg);
+    border: 1px solid var(--pm-border);
+    border-radius: var(--pm-radius-sm);
+    color: var(--pm-text-2);
     font-size: 0.82rem;
     padding: 0.3rem 0.65rem;
     outline: none;
     transition: border-color 0.15s;
   }
-  .history-search:focus { border-color: #00659A; }
-  .history-search::placeholder { color: #3d5166; }
+  .history-search:focus { border-color: var(--pm-info); }
+  .history-search::placeholder { color: var(--pm-label); }
 
   .history-list {
     flex: 1;
@@ -1575,7 +2074,7 @@
   }
 
   .history-entry {
-    border-bottom: 1px solid #1a2230;
+    border-bottom: 1px solid var(--pm-card);
   }
 
   .history-entry-header {
@@ -1591,7 +2090,7 @@
     text-align: left;
     color: inherit;
   }
-  .history-entry-header:hover { background: #1a2230; }
+  .history-entry-header:hover { background: var(--pm-card); }
 
   .history-meta {
     display: flex;
@@ -1603,11 +2102,11 @@
   .history-label {
     font-size: 0.78rem;
     font-weight: 600;
-    color: #F58026;
+    color: var(--pm-accent);
   }
   .history-time {
     font-size: 0.68rem;
-    color: #3d5166;
+    color: var(--pm-label);
   }
 
   .history-items {
@@ -1619,34 +2118,34 @@
   }
 
   .history-item-chip {
-    background: #0d1219;
-    border: 1px solid #2a3848;
-    border-radius: 4px;
+    background: var(--pm-bg);
+    border: 1px solid var(--pm-border);
+    border-radius: var(--pm-radius-sm);
     padding: 0.1rem 0.45rem;
     font-size: 0.72rem;
     font-family: "SF Mono", "Fira Code", monospace;
-    color: #8aa4b8;
+    color: var(--pm-muted);
   }
   .history-item-bulk {
-    color: #3d5166;
+    color: var(--pm-label);
     font-style: italic;
     font-family: inherit;
   }
 
   .history-expand {
     font-size: 0.6rem;
-    color: #3d5166;
+    color: var(--pm-label);
     flex-shrink: 0;
     align-self: center;
   }
 
   .history-output {
     padding: 0.5rem 1.25rem 0.75rem 2.5rem;
-    background: #0d1219;
+    background: var(--pm-bg);
     font-family: "SF Mono", "Fira Code", monospace;
     font-size: 0.75rem;
     line-height: 1.7;
-    border-top: 1px solid #1a2230;
+    border-top: 1px solid var(--pm-card);
   }
 
   /* ── Untracked apps find/track row ── */
@@ -1661,41 +2160,41 @@
 
   .find-cask-btn {
     background: transparent;
-    border: 1px solid #2a3848;
-    border-radius: 4px;
-    color: #4a6070;
+    border: 1px solid var(--pm-border);
+    border-radius: var(--pm-radius-sm);
+    color: var(--pm-faint-2);
     font-size: 0.68rem;
     padding: 0.1rem 0.5rem;
     cursor: pointer;
     transition: color 0.1s, border-color 0.1s;
   }
-  .find-cask-btn:hover { color: #8aa4b8; border-color: #3a4858; }
+  .find-cask-btn:hover { color: var(--pm-muted); border-color: var(--pm-border-strong); }
 
   .cask-status-text {
     font-size: 0.7rem;
-    color: #3d5166;
+    color: var(--pm-label);
     font-style: italic;
   }
-  .cask-none { color: #4a3030; }
+  .cask-none { color: var(--pm-cask-none); }
 
   .cask-match {
     font-size: 0.7rem;
-    color: #22c55e;
+    color: var(--pm-ok);
     font-weight: 500;
   }
 
   .track-btn {
-    background: #F58026;
-    color: #111822;
+    background: var(--pm-accent);
+    color: var(--pm-surface);
     border: none;
-    border-radius: 4px;
+    border-radius: var(--pm-radius-sm);
     padding: 0.12rem 0.55rem;
     font-size: 0.68rem;
     font-weight: 600;
     cursor: pointer;
     transition: background 0.12s;
   }
-  .track-btn:hover:not(:disabled) { background: #d96e1a; }
+  .track-btn:hover:not(:disabled) { background: var(--pm-accent-hover); }
   .track-btn:disabled { opacity: 0.5; cursor: not-allowed; }
 
   /* ── Panel info column ── */
@@ -1707,9 +2206,9 @@
     align-items: center;
     gap: 0.4rem;
     margin-top: 0.55rem;
-    background: #0d1219;
-    border: 1px solid #2a3848;
-    border-radius: 6px;
+    background: var(--pm-bg);
+    border: 1px solid var(--pm-border);
+    border-radius: var(--pm-radius-sm);
     padding: 0.28rem 0.28rem 0.28rem 0.6rem;
     align-self: flex-start;
     max-width: 100%;
@@ -1718,7 +2217,7 @@
   .cmd-text {
     font-family: "SF Mono", "Fira Code", monospace;
     font-size: 0.71rem;
-    color: #5ab8e8;
+    color: var(--pm-link-hover);
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -1727,16 +2226,16 @@
   .cmd-copy {
     background: transparent;
     border: none;
-    color: #3d5166;
+    color: var(--pm-label);
     cursor: pointer;
     display: flex;
     align-items: center;
     justify-content: center;
     padding: 0.22rem;
-    border-radius: 4px;
+    border-radius: var(--pm-radius-sm);
     transition: color 0.12s, background 0.12s;
     flex-shrink: 0;
   }
-  .cmd-copy:hover { color: #5ab8e8; background: #00659A22; }
+  .cmd-copy:hover { color: var(--pm-link-hover); background: var(--pm-info-tint); }
 
 </style>
