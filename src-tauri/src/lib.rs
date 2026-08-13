@@ -1284,6 +1284,40 @@ async fn check_app_update(current_version: String) -> AppUpdateInfo {
     }
 }
 
+// Release notes for one specific version, used to show what changed after an
+// update has already been applied — the pending update's own notes are gone by
+// then, and a fresh download never had them.
+#[tauri::command]
+async fn get_release_notes(version: String) -> String {
+    // Straight into a URL, so keep it to what a version can actually contain.
+    if version.is_empty()
+        || version.len() > 32
+        || !version.chars().all(|c| c.is_ascii_digit() || c == '.')
+    {
+        return String::new();
+    }
+
+    let out = Command::new("curl")
+        .args([
+            "-sf", "--max-time", "8",
+            "-H", "Accept: application/vnd.github+json",
+            "-H", "User-Agent: PartyMAN-Update-Manager",
+            &format!(
+                "https://api.github.com/repos/paymonr/partyman_update_manager/releases/tags/v{version}"
+            ),
+        ])
+        .output()
+        .await;
+
+    match out {
+        Ok(o) if o.status.success() => serde_json::from_slice::<serde_json::Value>(&o.stdout)
+            .ok()
+            .and_then(|json| json["body"].as_str().map(str::to_string))
+            .unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
 #[tauri::command]
 fn open_release_url(url: String) {
     // Allowlisted so the webview cannot hand this arbitrary URLs to `open`.
@@ -1707,7 +1741,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             run_check, run_upgrade, run_upgrade_items, get_platform,
             get_upgrade_history, search_cask, track_app, track_apps,
-            check_app_update, open_release_url,
+            check_app_update, open_release_url, get_release_notes,
             get_schedule, set_schedule, run_schedule_now, snooze_updates, get_last_check, recount_section, next_run
         ])
         .run(tauri::generate_context!())

@@ -138,7 +138,81 @@
   let showSettings = false;
   let showAbout = false;
   let showSchedule = false;
+  let showWhatsNew = false;
+  let whatsNewVersion = "";
+  let whatsNewNotes = "";
   let theme: ThemeId = loadTheme();
+
+  const SEEN_VERSION_KEY = "lastSeenVersion";
+  const PENDING_NOTES_KEY = "pendingUpdateNotes";
+
+  // Turns the release body into something readable without pulling in a markdown
+  // library: headings, bullets and blank lines are all these notes use.
+  type NoteSegment = { text: string; strong: boolean };
+  type NoteLine = { kind: "heading" | "bullet" | "text"; segments: NoteSegment[] };
+
+  // **bold** is the only inline markup these notes use; splitting on the marker
+  // alternates plain and bold, so the asterisks never reach the screen.
+  function splitBold(text: string): NoteSegment[] {
+    return text
+      .split("**")
+      .map((part, i) => ({ text: part, strong: i % 2 === 1 }))
+      .filter((seg) => seg.text !== "");
+  }
+
+  function renderNotes(body: string): NoteLine[] {
+    return body
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line !== "")
+      .map((line) => {
+        if (/^#{1,6}\s/.test(line)) {
+          return { kind: "heading" as const, segments: splitBold(line.replace(/^#{1,6}\s*/, "")) };
+        }
+        if (/^[-*]\s/.test(line)) {
+          return { kind: "bullet" as const, segments: splitBold(line.replace(/^[-*]\s*/, "")) };
+        }
+        return { kind: "text" as const, segments: splitBold(line) };
+      });
+  }
+
+  function openWhatsNew(version: string, notes: string) {
+    whatsNewVersion = version;
+    whatsNewNotes = notes;
+    showWhatsNew = true;
+    showSettings = false;
+    showHistory = false;
+    showAbout = false;
+    showSchedule = false;
+  }
+
+  // Shown once, the first time a version runs. A fresh install has nothing to
+  // compare against, so it records the version and stays quiet.
+  async function checkWhatsNew() {
+    const seen = localStorage.getItem(SEEN_VERSION_KEY);
+    localStorage.setItem(SEEN_VERSION_KEY, appVersion);
+    if (!seen || seen === appVersion) return;
+
+    // Stashed before the app relaunched into this version; falls back to the
+    // network for an update applied some other way.
+    let notes = "";
+    try {
+      const stashed = JSON.parse(localStorage.getItem(PENDING_NOTES_KEY) ?? "null");
+      if (stashed?.version === appVersion) notes = stashed.notes ?? "";
+    } catch {
+      notes = "";
+    }
+    localStorage.removeItem(PENDING_NOTES_KEY);
+
+    if (!notes) {
+      try {
+        notes = await invoke<string>("get_release_notes", { version: appVersion });
+      } catch (e) {
+        console.error("Failed to fetch release notes:", e);
+      }
+    }
+    if (notes.trim()) openWhatsNew(appVersion, notes);
+  }
 
   function changeTheme() {
     saveTheme(theme);
@@ -417,6 +491,8 @@
     try { startOnLogin = await isAutostartEnabled(); } catch (e) { console.error("Failed to read start-on-login state:", e); }
 
     watchSystemTheme(() => theme);
+
+    await checkWhatsNew();
 
     loadLastChecked();
     await loadSchedule();
@@ -751,6 +827,13 @@
 
   async function installAppUpdate() {
     if (!pendingUpdate) return;
+    // Kept for after the relaunch: the pending update object does not survive it.
+    if (appUpdateInfo) {
+      localStorage.setItem(
+        PENDING_NOTES_KEY,
+        JSON.stringify({ version: appUpdateInfo.version, notes: appUpdateInfo.notes }),
+      );
+    }
     appUpdateStatus = "checking";
     await pendingUpdate.downloadAndInstall();
     await relaunch();
@@ -885,6 +968,12 @@
         <path d="M8 5v3.5M8 11v.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
       </svg>
       <span>PartyMAN v{appUpdateInfo.version} is available</span>
+      {#if appUpdateInfo.notes?.trim()}
+        <button class="banner-notes-btn"
+          onclick={() => openWhatsNew(appUpdateInfo!.version, appUpdateInfo!.notes)}>
+          What's new
+        </button>
+      {/if}
       <button class="banner-dl-btn" onclick={installAppUpdate}>Install Update</button>
       <button class="banner-dismiss" onclick={() => { appUpdateStatus = "idle"; appUpdateInfo = null; }}>✕</button>
     </div>
@@ -903,7 +992,30 @@
     </div>
   {/if}
 
-  {#if showSchedule}
+  {#if showWhatsNew}
+    <div class="settings-panel">
+      <div class="page-header">
+        <h2>What's New in v{whatsNewVersion}</h2>
+        <button class="page-close" onclick={() => { showWhatsNew = false; }}>✕</button>
+      </div>
+      <div class="settings-body">
+        <div class="whats-new">
+          {#each renderNotes(whatsNewNotes) as line}
+            {#if line.kind === "heading"}
+              <h3 class="whats-new-heading">
+                {#each line.segments as seg}{seg.text}{/each}
+              </h3>
+            {:else}
+              <p class={line.kind === "bullet" ? "whats-new-bullet" : "whats-new-text"}>
+                {#each line.segments as seg}{#if seg.strong}<strong>{seg.text}</strong>{:else}{seg.text}{/if}{/each}
+              </p>
+            {/if}
+          {/each}
+        </div>
+      </div>
+    </div>
+
+  {:else if showSchedule}
     <div class="settings-panel">
       <div class="page-header">
         <h2>Scheduler</h2>
@@ -1637,6 +1749,43 @@
 
   .update-prompt-install:hover { background: rgba(90, 140, 220, 1); }
   .update-prompt-snooze:hover { background: rgba(128, 128, 128, 0.14); }
+
+  .whats-new { max-width: 40rem; }
+
+  .whats-new-heading {
+    font-size: 0.82rem;
+    font-weight: 700;
+    color: var(--pm-text);
+    margin: 1.1rem 0 0.4rem;
+  }
+
+  .whats-new-heading:first-child { margin-top: 0; }
+
+  .whats-new-text,
+  .whats-new-bullet {
+    font-size: 0.8rem;
+    line-height: 1.65;
+    color: var(--pm-muted);
+    margin: 0.25rem 0;
+  }
+
+  .whats-new-bullet { padding-left: 1rem; text-indent: -0.65rem; }
+  .whats-new-text strong,
+  .whats-new-bullet strong { color: var(--pm-text); font-weight: 600; }
+  .whats-new-bullet::before { content: "• "; color: var(--pm-accent); }
+
+  .banner-notes-btn {
+    font: inherit;
+    font-size: 0.72rem;
+    padding: 3px 10px;
+    border-radius: var(--pm-radius-sm);
+    border: 1px solid var(--pm-border-strong);
+    background: transparent;
+    color: inherit;
+    cursor: pointer;
+  }
+
+  .banner-notes-btn:hover { background: var(--pm-hover); }
 
   .schedule-error {
     margin: 0 0 14px;
