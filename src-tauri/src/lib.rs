@@ -892,7 +892,16 @@ is_tracked() {
   local app="$1"
   local base
   base=$(basename "$app")
-  codesign -dvv "$app" 2>&1 | grep -q "Authority=Software Signing" && return 0
+  # PartyMAN updates itself, so it has no business appearing in its own list of
+  # apps that lack auto-updates. Matched on bundle identifier so renaming the
+  # app or installing it elsewhere does not bring it back.
+  [ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist" 2>/dev/null)" = "com.partyman.updater" ] && return 0
+  # Apple ships its own apps under two different leaf certificates: older ones
+  # say "Software Signing", current ones "macOS Software Signing". Matching only
+  # the former let Apple's own apps — Safari among them — fall through as
+  # untracked, since "Authority=Software Signing" is not a substring of
+  # "Authority=macOS Software Signing".
+  codesign -dvv "$app" 2>&1 | grep -qE "^Authority=(macOS )?Software Signing" && return 0
   [ -e "$app/Contents/_MASReceipt/receipt" ] && return 0
   [ -n "$cask_apps" ] && echo "$cask_apps" | grep -qxF "$base" && return 0
   local norm
