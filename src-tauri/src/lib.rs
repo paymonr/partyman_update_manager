@@ -595,7 +595,10 @@ fi
 _pm_reply="$PM_PW_DIR/reply.$$"
 mkfifo "$_pm_reply" 2>/dev/null || exit 1
 chmod 600 "$_pm_reply"
-printf '%s\n' "$_pm_reply" > "$PM_PW_FIFO"
+if ! printf '%s\n' "$_pm_reply" > "$PM_PW_FIFO" 2>/dev/null; then
+  rm -f "$_pm_reply"
+  exit 1
+fi
 cat "$_pm_reply"
 rm -f "$_pm_reply"
 PARTYMAN_ASKPASS
@@ -619,8 +622,14 @@ export PM_ASK_STAMP="$_pm_dir/asked"
 (
   _pw=""
   _pm_again=""
-  # One request per line, each naming the pipe to answer on.
-  while read -r _pm_reply < "$_pm_fifo"; do
+  # Held open read-write for the life of the run. Reopening per request made the
+  # pipe readerless between requests, so callers arriving together got EPIPE, and
+  # a failed read ended the loop outright — killing the server and leaving every
+  # later request with no answer at all. Keeping our own write end open means the
+  # read blocks for the next request instead of hitting EOF.
+  exec 9<>"$_pm_fifo" || exit 1
+  while :; do
+    IFS= read -r _pm_reply <&9 || continue
     [ -z "$_pm_reply" ] && continue
     if [ -f "$PM_PW_RETRY" ]; then
       _pw=""
@@ -637,7 +646,8 @@ export PM_ASK_STAMP="$_pm_dir/asked"
       _pw=$(osascript -e "display dialog \"${_pm_msg}\" default answer \"\" with hidden answer with title \"PartyMAN Update Manager\" with icon caution giving up after 120" -e 'text returned of result' 2>/dev/null)
       _pm_again=""
     fi
-    printf '%s' "$_pw" > "$_pm_reply"
+    # A caller that gave up leaves nothing reading; that must not kill the server.
+    printf '%s' "$_pw" > "$_pm_reply" 2>/dev/null || true
   done
 ) >/dev/null 2>&1 &
 _pm_server=$!
