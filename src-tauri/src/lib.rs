@@ -572,31 +572,77 @@ command -v rbenv &>/dev/null && eval "$(rbenv init -)"
 _pm_dir=$(mktemp -d /tmp/partyman-askpass-XXXXXX)
 chmod 700 "$_pm_dir"
 _pm_askpass="$_pm_dir/askpass"
+_pm_fifo="$_pm_dir/pw.fifo"
+mkfifo "$_pm_fifo" && chmod 600 "$_pm_fifo"
+
 cat > "$_pm_askpass" <<'PARTYMAN_ASKPASS'
 #!/bin/bash
+# sudo calls this whenever it wants a password. It never prompts itself: it asks
+# the server below, which prompts once and then answers from memory.
 _pm_stamp="${PM_ASK_STAMP:-}"
-_pm_retry=""
 if [ -n "$_pm_stamp" ] && [ -s "$_pm_stamp" ]; then
   _pm_last=$(cat "$_pm_stamp" 2>/dev/null)
+  # The same sudo process asking again within seconds means what it was given
+  # was rejected, so tell the server to discard it and ask afresh.
   if [ "${_pm_last%% *}" = "$PPID" ] && [ $(( $(date +%s) - ${_pm_last##* } )) -lt 20 ]; then
-    _pm_retry=1
+    touch "${PM_PW_RETRY:-/dev/null}" 2>/dev/null
   fi
 fi
-_pm_app="${PM_ASKPASS_APP:-}"
-if [ -n "$_pm_app" ]; then
-  _pm_msg="PartyMAN Update Manager needs your administrator password to update ${_pm_app}."
-else
-  _pm_msg="PartyMAN Update Manager needs your administrator password to complete this update."
-fi
-[ -n "$_pm_retry" ] && _pm_msg="That password didn't work. $_pm_msg"
-_pm_pw=$(osascript -e "display dialog \"${_pm_msg}\" default answer \"\" with hidden answer with title \"PartyMAN Update Manager\" with icon caution giving up after 120" -e 'text returned of result' 2>/dev/null) || exit 1
-[ -z "$_pm_pw" ] && exit 1
 [ -n "$_pm_stamp" ] && printf '%s %s' "$PPID" "$(date +%s)" > "$_pm_stamp"
-printf '%s' "$_pm_pw"
+
+# Each request carries its own reply pipe. A single shared pipe lets two
+# exchanges run together and the answers arrive spliced into one another.
+_pm_reply="$PM_PW_DIR/reply.$$"
+mkfifo "$_pm_reply" 2>/dev/null || exit 1
+chmod 600 "$_pm_reply"
+printf '%s\n' "$_pm_reply" > "$PM_PW_FIFO"
+cat "$_pm_reply"
+rm -f "$_pm_reply"
 PARTYMAN_ASKPASS
 chmod 700 "$_pm_askpass"
+
 export SUDO_ASKPASS="$_pm_askpass"
+export PM_PW_FIFO="$_pm_fifo"
+export PM_PW_DIR="$_pm_dir"
+export PM_PW_RETRY="$_pm_dir/retry"
 export PM_ASK_STAMP="$_pm_dir/asked"
+
+# The password server. It is asked once and answers for the rest of the run, so
+# the number of prompts does not depend on sudo's credential cache surviving —
+# which it does not across a long batch, since each cask can outlast the
+# five-minute timeout while downloading.
+#
+# The password lives only in this subshell's memory. It is never written to disk
+# and never exported, so it is not visible in any child's environment. Opening
+# the pipe for writing blocks until something actually asks, so nothing is
+# requested unless a password is genuinely needed.
+(
+  _pw=""
+  _pm_again=""
+  # One request per line, each naming the pipe to answer on.
+  while read -r _pm_reply < "$_pm_fifo"; do
+    [ -z "$_pm_reply" ] && continue
+    if [ -f "$PM_PW_RETRY" ]; then
+      _pw=""
+      rm -f "$PM_PW_RETRY"
+      _pm_again="That password didn't work. "
+    fi
+    if [ -z "$_pw" ]; then
+      _pm_app="${PM_ASKPASS_APP:-}"
+      if [ -n "$_pm_app" ]; then
+        _pm_msg="${_pm_again}PartyMAN Update Manager needs your administrator password to update ${_pm_app}."
+      else
+        _pm_msg="${_pm_again}PartyMAN Update Manager needs your administrator password to complete this update."
+      fi
+      _pw=$(osascript -e "display dialog \"${_pm_msg}\" default answer \"\" with hidden answer with title \"PartyMAN Update Manager\" with icon caution giving up after 120" -e 'text returned of result' 2>/dev/null)
+      _pm_again=""
+    fi
+    printf '%s' "$_pw" > "$_pm_reply"
+  done
+) >/dev/null 2>&1 &
+_pm_server=$!
+disown "$_pm_server" 2>/dev/null
+
 # run_upgrade_shell attaches a controlling terminal, which sudo prefers over
 # SUDO_ASKPASS — and a prompt written there is invisible and never answered, so it
 # would block forever. Our own calls and Homebrew's always pass -A, so this shim
@@ -619,15 +665,8 @@ exec /usr/bin/sudo -A "$@"
 PARTYMAN_SUDO
 chmod 700 "$_pm_dir/bin/sudo"
 export PATH="$_pm_dir/bin:$PATH"
-# Refresh sudo's cached credential every minute so it cannot lapse (default 5
-# min) part-way through a long batch and ask a second time. Fully detached from
-# our pipes so it never emits anything into the update log.
-( while :; do sleep 60; sudo -n -v; done ) >/dev/null 2>&1 &
-_pm_keepalive=$!
-# Off the job table, or bash announces "Terminated" on stderr when the trap kills
-# it and that lands in the update log.
-disown "$_pm_keepalive" 2>/dev/null
-trap '[ -n "$_pm_keepalive" ] && kill "$_pm_keepalive" 2>/dev/null; [ -n "$_pm_dir" ] && rm -rf "$_pm_dir"' EXIT
+
+trap '[ -n "$_pm_server" ] && kill "$_pm_server" 2>/dev/null; [ -n "$_pm_dir" ] && rm -rf "$_pm_dir"' EXIT
 "#;
 
 // Label for the one password dialog that covers a whole batch: the app's own name
