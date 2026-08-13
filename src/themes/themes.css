@@ -1,0 +1,156 @@
+/* Theme layer.
+ *
+ * Every colour in the app resolves through a --pm-* role token, so a theme is
+ * just one block that redefines those roles. Two sources feed them:
+ *
+ *   Default        the app's original palette, spelled out below. This is the
+ *                  baseline, so the app looks unchanged unless a theme is picked.
+ *   Kawaii Meadow  html.km maps the roles onto kawaii-meadow's own role tokens.
+ *                  One mapping covers all three of its themes, because Classic,
+ *                  Day and Night are the kit remapping those same roles behind
+ *                  data-theme — so this file never needs to know which is active.
+ *
+ * kawaii-meadow-core.css is vendored unmodified. It defines tokens and component
+ * classes only, no bare-element rules, so importing it cannot alter the Default
+ * theme — nothing here uses its component classes.
+ */
+
+@font-face {
+  font-family: "Nunito";
+  font-style: normal;
+  /* Variable font: one file serves the kit's 400–900 range. */
+  font-weight: 400 900;
+  font-display: swap;
+  src: url("./fonts/nunito-latin.woff2") format("woff2");
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA,
+    U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193,
+    U+2212, U+2215, U+FEFF, U+FFFD;
+}
+
+@font-face {
+  font-family: "Nunito";
+  font-style: normal;
+  font-weight: 400 900;
+  font-display: swap;
+  src: url("./fonts/nunito-latin-ext.woff2") format("woff2");
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF,
+    U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020,
+    U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+
+/* Tells macOS which way to draw the controls it renders itself — select popups,
+ * scrollbars, focus rings. Without it a light theme gets dark popup rows and the
+ * text in them disappears. */
+:root { color-scheme: dark; }
+html.km:not([data-theme="night"]) { color-scheme: light; }
+html.km[data-theme="night"] { color-scheme: dark; }
+
+/* ---------------------------------------------------------------- Default -- */
+
+:root {
+  --pm-font: system-ui, -apple-system, "Segoe UI", sans-serif;
+
+  --pm-bg: #0d1219;
+  --pm-bg-deep: #0f1a26;
+  --pm-surface: #111822;
+  --pm-surface-2: #161e29;
+  --pm-card: #1a2230;
+  --pm-card-2: #1e2733;
+  --pm-hover: #212e3f;
+
+  --pm-border: #2a3848;
+  --pm-border-strong: #3a4858;
+  --pm-border-accent: #1a2d40;
+
+  --pm-text-bright: #f8fafc;
+  --pm-text: #f1f5f9;
+  --pm-text-2: #e2e8f0;
+  --pm-text-hover: #c8dae6;
+  --pm-text-dim: #a8bfcc;
+  --pm-muted: #8aa4b8;
+  --pm-faint: #6a8899;
+  --pm-faint-2: #4a6070;
+  --pm-label: #3d5166;
+
+  --pm-accent: #f58026;
+  --pm-accent-hover: #d96e1a;
+  --pm-on-accent: #fff;
+  --pm-info: #00659a;
+  --pm-info-hover: #0076b3;
+  --pm-info-tint: #00659a22;
+  --pm-link-hover: #5ab8e8;
+
+  --pm-ok: #22c55e;
+  --pm-ok-hover: #16a34a;
+  --pm-ok-border: #22c55e44;
+  --pm-ok-dim: #22c55e88;
+  --pm-ok-bg: #1a2d1a;
+  --pm-ok-fg: #0d1a0d;
+  --pm-err: #ef4444;
+  --pm-err-border: #ef444444;
+  --pm-cask-none: #4a3030;
+
+  --pm-shadow: #00000055;
+  --pm-radius-sm: 5px;
+  --pm-radius: 8px;
+  --pm-radius-lg: 12px;
+}
+
+/* ---------------------------------------------------- Kawaii Meadow ------- */
+
+/* `km` selects the kit; data-theme on the same element picks Classic (absent),
+ * Day or Night. html.km beats the kit's own :root on specificity, which is what
+ * lets these roles read the kit's values rather than the Default ones above.
+ */
+html.km {
+  --pm-font: var(--font);
+
+  --pm-bg: var(--bg-page);
+  --pm-bg-deep: var(--bg-page);
+  --pm-surface: var(--bg-panel);
+  --pm-surface-2: var(--bg-panel-2);
+  --pm-card: var(--bg-card);
+  --pm-card-2: var(--bg-panel-2);
+  --pm-hover: var(--surface-hover);
+
+  --pm-border: var(--line);
+  --pm-border-strong: var(--accent-border);
+  --pm-border-accent: var(--accent-border);
+
+  /* The kit's own guidance: recessive tints are decorative, and anything the
+   * reader actually reads steps up to --fg or --accent-deep. Body copy here is
+   * all read, so it takes --fg; only labels use the muted roles. */
+  --pm-text-bright: var(--fg);
+  --pm-text: var(--fg);
+  --pm-text-2: var(--fg);
+  --pm-text-hover: var(--accent-text);
+  --pm-text-dim: var(--fg-muted);
+  --pm-muted: var(--fg-muted);
+  --pm-faint: var(--fg-faint);
+  --pm-faint-2: var(--fg-faint);
+  --pm-label: var(--fg-label);
+
+  --pm-accent: var(--accent);
+  --pm-accent-hover: var(--accent-deep);
+  --pm-on-accent: var(--on-accent);
+  --pm-info: var(--accent-deep);
+  --pm-info-hover: var(--accent);
+  --pm-info-tint: var(--accent-surface);
+  --pm-link-hover: var(--accent-text);
+
+  --pm-ok: var(--state-ok);
+  --pm-ok-hover: var(--state-ok-deep);
+  --pm-ok-border: var(--state-ok-border);
+  --pm-ok-dim: var(--state-ok);
+  --pm-ok-bg: var(--state-ok-surface);
+  --pm-ok-fg: var(--state-ok-text);
+  --pm-err: var(--state-error);
+  --pm-err-border: var(--state-error-border);
+  --pm-cask-none: var(--fg-faint);
+
+  --pm-shadow: rgba(0, 0, 0, 0.45);
+  /* The kit's signature is deeply rounded cards. */
+  --pm-radius-sm: 9px;
+  --pm-radius: 14px;
+  --pm-radius-lg: 20px;
+}

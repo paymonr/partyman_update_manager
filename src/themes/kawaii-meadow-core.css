@@ -1,0 +1,1269 @@
+/* ═══════════════════════════════════════════════════════════════════════════
+   kawaii-meadow — core.css
+   Tokens and components. Theme-agnostic; stands alone without meadow.css.
+
+   Every colour in the kit is declared in this file's token blocks and nowhere
+   else. Components reference generic --accent-* names, so putting
+   data-accent="purple" (or "blue") on any wrapper reskins the whole subtree.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+/* ── Tokens ──────────────────────────────────────────────────────────────── */
+
+:root {
+  /* Accent family — pink, the default.
+     Fifteen slots, mirrored by every other family. --accent-deep is the darker
+     emphasis shade used by large numerals and gradient ends; --hero-num-dim is
+     the lighter one the hero numeral takes when dimmed. --accent-rule is the
+     hairline after a section label: equal to --accent-border in pink and
+     purple, paler in blue, which is why it cannot simply reuse the border. */
+  --accent:            #e0559a;
+  --accent-deep:       #c23b8a;
+  --accent-border:     #f5d0e8;
+  --accent-surface:    #fff8fc;
+  --accent-label:      #e0a0c8;
+  --accent-text:       #5a2a4a;
+  --accent-grad-from:  #e0559a;
+  --accent-grad-to:    #c23b8a;
+  --accent-glow:       rgba(224, 85, 154, 0.35);
+  --accent-ring:       rgba(224, 85, 154, 0.20);
+  --accent-faint:      #ddb0c8;
+  --accent-muted:      #c4a0b8;
+  --accent-rule:       #f5d0e8;
+  --accent-surface-2:  #fff0f8;
+  --hero-num-dim:      #d4608a;
+
+  /* ── Roles ──────────────────────────────────────────────────────────────
+     What components actually reference. A theme redefines these; the family
+     values above are what they resolve to in Classic and Day.
+     These are written as literals, not var() indirection: a custom property's
+     var() is substituted on the element that declares it, so
+     `--bg-panel: var(--accent-surface)` at :root would freeze to pink and the
+     data-accent remap would silently stop working. */
+  --bg-page:      #faf7fb;
+  --bg-card:      #ffffff;
+  --bg-panel:     #fff8fc;
+  --bg-panel-2:   #fff0f8;
+  --bg-inset:     #fff5fa;
+  --fg:           #5a2a4a;
+  --fg-muted:     #c4a0b8;
+  --fg-faint:     #ddb0c8;
+  --fg-label:     #e0a0c8;
+  --line:         #f5d0e8;
+  --line-divider: #f5d0e8;
+  --on-accent:    #ffffff;
+
+  /* Neutrals and shared surfaces */
+  --surface-card:      #ffffff;
+  --page-bg:           #faf7fb;
+  --surface-alt:       #fff5fa;
+  --surface-hover:     #fff0f8;
+  --divider:           #f0d0e8;
+  --tab-idle:          #c0a0b8;
+  --tab-hover:         #d070b0;
+  --scrim:             rgba(26, 8, 48, 0.55);
+  --night:             #1a0830;
+
+  /* Hero panel */
+  --hero-from:         #fff0f8;
+  --hero-to:           #f0e8ff;
+  --hero-off-from:     #fff5f5;
+  --hero-off-to:       #ffe8f0;
+
+  /* Stat cell — deliberately fixed blue regardless of accent, so numeric
+     readouts read as "data" against an accent-coloured card. */
+  --stat-from:         #f0f8ff;
+  --stat-to:           #e8f0ff;
+  --stat-border:       #d0e0ff;
+  --stat-label:        #90a8d8;
+  --stat-text:         #3a5090;
+
+  /* Progress panel — deliberately fixed purple regardless of accent, like the
+     stat cell is fixed blue. --progress-accent keeps the title and the active
+     step inside the panel's own hue instead of following the card's. */
+  --progress-accent:   #9030c0;
+  --progress-from:     #fdf0ff;
+  --progress-to:       #f5e8ff;
+  --progress-border:   #e0c0f8;
+  --progress-note:     #b090c8;
+  --step-pending:      #c0a0d8;
+  --step-pending-bg:   #f5f0ff;
+  --step-pending-bd:   #d0c0e8;
+  --step-active-bg:    #f0e0ff;
+
+  /* State palette — never drawn from the accent family, and vice versa.
+     The pink accent and the pink "off" state look alike and are not related. */
+  --state-ok:          #50c878;
+  --state-ok-deep:     #30a860;
+  --state-ok-text:     #2a7a50;
+  --state-ok-surface:  #e8faf0;
+  --state-ok-border:   #a8e6c0;
+  --state-ok-tint:     #f0fff8;
+  --state-ok-icon:     #e0fff0;
+
+  --state-off:         #ff6090;
+  --state-off-text:    #a0204a;
+  --state-off-surface: #ffeef4;
+  --state-off-border:  #ffb0c8;
+
+  --state-error:         #c03030;
+  --state-error-text:    #c03030;
+  --state-error-surface: #ffe0e0;
+  --state-error-border:  #e8a0a0;   /* derived — source has no error border */
+
+  --state-warn:         #e0b040;
+  --state-warn-deep:    #c0903a;
+  --state-warn-surface: #fff8e8;    /* derived — source has no warn surface */
+  --state-warn-border:  #f0d060;
+
+  --state-unknown:         #a080e0;
+  --state-unknown-text:    #6a40a0;
+  --state-unknown-surface: #f5f0ff;
+  --state-unknown-border:  #d0b8f0;
+
+  /* State gradients and glows, for buttons that signal an action's outcome */
+  --grad-ok-from:      #60e090;
+  --grad-ok-to:        #30c070;
+  --grad-off-from:     #ff758c;
+  --grad-off-to:       #ff4d7e;
+  --grad-warn-from:    #f0d060;
+  --grad-warn-to:      #e0b040;
+  --glow-ok:           rgba(50, 180, 100, 0.35);
+  --glow-off:          rgba(255, 77, 126, 0.35);
+  --glow-warn:         rgba(200, 160, 40, 0.30);
+
+  /* Decorative gradients, consumed by meadow.css */
+  --rainbow: linear-gradient(90deg,
+    #ff9aa2, #ffb7b2, #ffdac1, #ffffd1,
+    #e2f0cb, #b5ead7, #c7ceea, #ffc8dd);
+  --rainbow-short: linear-gradient(90deg,
+    #ff9aa2, #ffdac1, #ffffd1, #b5ead7, #c7ceea, #ffc8dd);
+  --grass-fade: linear-gradient(180deg, transparent 0%, rgba(20, 80, 30, 0.35) 100%);
+
+  /* Type */
+  --font: "Nunito", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --fs-badge: 0.52rem;
+  --fs-micro: 0.58rem;
+  --fs-label: 0.60rem;
+  --fs-tiny:  0.63rem;
+  --fs-sm:    0.72rem;
+  --fs-base:  0.78rem;
+  --fs-md:    0.82rem;
+  --fs-lg:    0.88rem;
+  --fs-hero:  2rem;
+  --fs-hero-dim: 1.15rem;
+  --fs-icon:  1.1rem;
+  --ls-title:   0.06em;
+  --ls-label:   0.10em;
+  --ls-section: 0.14em;
+
+  /* Radius ladder — pick by nesting depth, outermost first */
+  --r-card:    32px;
+  --r-hero:    22px;
+  --r-panel:   18px;
+  --r-control: 14px;
+  --r-cell:    12px;
+  --r-tight:   10px;
+  --r-pill:    999px;
+
+  /* Spacing */
+  --sp-1: 0.35rem;
+  --sp-2: 0.55rem;
+  --sp-3: 0.75rem;
+  --sp-4: 1rem;
+  --sp-5: 1.25rem;
+  --sp-6: 1.75rem;
+
+  /* Borders, motion, shadow */
+  --bw:       1.5px;
+  --bw-thick: 2px;
+  --t-fast: 0.15s;
+  --t-base: 0.20s;
+  --t-slow: 0.40s;
+  --t-hero: 0.50s;
+  --shadow-card:
+    0 0 0 1.5px rgba(255, 180, 220, 0.30),
+    0 12px 60px rgba(0, 0, 0, 0.50),
+    0 4px 20px rgba(255, 100, 180, 0.15);
+  --shadow-btn:   0 3px 12px var(--accent-glow);
+  --shadow-block: 0 4px 16px var(--accent-glow);
+}
+
+[data-accent="pink"] {
+  --accent:           #e0559a;
+  --accent-deep:      #c23b8a;
+  --accent-border:    #f5d0e8;
+  --accent-surface:   #fff8fc;
+  --accent-label:     #e0a0c8;
+  --accent-text:      #5a2a4a;
+  --accent-grad-from: #e0559a;
+  --accent-grad-to:   #c23b8a;
+  --accent-glow:      rgba(224, 85, 154, 0.35);
+  --accent-ring:      rgba(224, 85, 154, 0.20);
+  --accent-faint:     #ddb0c8;
+  --accent-muted:     #c4a0b8;
+  --accent-rule:      #f5d0e8;
+  --accent-surface-2: #fff0f8;
+  --hero-num-dim:     #d4608a;
+  --bg-panel:     #fff8fc;
+  --bg-panel-2:   #fff0f8;
+  --fg:           #5a2a4a;
+  --fg-muted:     #c4a0b8;
+  --fg-faint:     #ddb0c8;
+  --fg-label:     #e0a0c8;
+  --line:         #f5d0e8;
+  --line-divider: #f5d0e8;
+  --shadow-btn:   0 3px 12px var(--accent-glow);
+  --shadow-block: 0 4px 16px var(--accent-glow);
+}
+
+[data-accent="purple"] {
+  --accent:           #9030c0;
+  --accent-deep:      #9030c0;   /* no darker shade exists in the source */
+  --accent-border:    #e8d0f8;
+  --accent-surface:   #fdf8ff;
+  --accent-label:     #b060d0;
+  --accent-text:      #5a2a6a;
+  --accent-grad-from: #c060e0;
+  --accent-grad-to:   #9030c0;
+  --accent-glow:      rgba(144, 48, 192, 0.40);
+  --accent-ring:      rgba(192, 96, 224, 0.20);
+  --accent-faint:     #c0a0d8;
+  --accent-muted:     #b080c0;
+  --accent-rule:      #e8d0f8;
+  --accent-surface-2: #faf0ff;
+  --hero-num-dim:     var(--accent);   /* no dim shade exists in the source */
+  --bg-panel:     #fdf8ff;
+  --bg-panel-2:   #faf0ff;
+  --fg:           #5a2a6a;
+  --fg-muted:     #b080c0;
+  --fg-faint:     #c0a0d8;
+  --fg-label:     #b060d0;
+  --line:         #e8d0f8;
+  --line-divider: #e8d0f8;
+  --shadow-btn:   0 3px 12px var(--accent-glow);
+  --shadow-block: 0 4px 16px var(--accent-glow);
+}
+
+[data-accent="blue"] {
+  --accent:           #3888cc;
+  --accent-deep:      #3060a0;
+  --accent-border:    #b0d0f0;
+  --accent-surface:   #f0f8ff;
+  --accent-label:     #5090c0;
+  --accent-text:      #3a5090;
+  --accent-grad-from: #60b8e8;
+  --accent-grad-to:   #3888cc;
+  --accent-glow:      rgba(56, 136, 204, 0.35);
+  --accent-ring:      rgba(56, 136, 204, 0.20);
+  --accent-faint:     #a8c0e0;
+  --accent-muted:     #90a8d8;
+  --accent-rule:      #cce0f8;
+  --accent-surface-2: #e8f4ff;
+  --hero-num-dim:     var(--accent);   /* no dim shade exists in the source */
+  --bg-panel:     #f0f8ff;
+  --bg-panel-2:   #e8f4ff;
+  --fg:           #3a5090;
+  --fg-muted:     #90a8d8;
+  --fg-faint:     #a8c0e0;
+  --fg-label:     #5090c0;
+  --line:         #b0d0f0;
+  --line-divider: #cce0f8;
+  --shadow-btn:   0 3px 12px var(--accent-glow);
+  --shadow-block: 0 4px 16px var(--accent-glow);
+}
+
+/* ── Day ──────────────────────────────────────────────────────────────────
+   A sunlit meadow. Cards stay light; the hero carries a sunrise gradient.
+   Blue warms by luminance and by the hero's top stop only — never by a hue
+   shift, which turns its borders sage and fights the accent. */
+[data-theme="day"] {
+  --bg-page:      #fdf6e4;
+  --bg-card:      #fffcf0;
+  --bg-inset:     #fff6df;
+  /* No theme-level --line-divider here: the [data-theme="day"] arm of the
+     pink block below has the same specificity (0,1,0) and comes later, so
+     anything set here would be shadowed on every element it could reach.
+     Day's dividers are per family, in the three blocks below. */
+  --shadow-card:
+    0 0 0 1.5px rgba(255, 196, 150, 0.35),
+    0 12px 40px rgba(140, 105, 45, 0.20),
+    0 4px 20px rgba(255, 150, 120, 0.16);
+  --rainbow: linear-gradient(90deg,
+    #ff8f7a, #ffa96e, #ffc061, #ffe86b,
+    #bde27c, #93dc8f, #6fc6ea, #c79bf0);
+  --rainbow-short: linear-gradient(90deg,
+    #ff8f7a, #ffc061, #ffe86b, #93dc8f, #6fc6ea, #c79bf0);
+
+  /* Scenery, consumed by meadow.css's [data-theme="day"] block. A daylight
+     sky gradient replaces --night; a warm --grass-fade replaces the dark
+     one that reads as dusk. */
+  --sky-from:   #6ec6f5;
+  --sky-mid:    #aee2f5;
+  --sky-to:     #fff3d6;
+  --sun:        #ffdd66;
+  --sun-glow:   rgba(255, 221, 102, 0.45);
+  --cloud:      rgba(255, 255, 255, 0.90);
+  --grass-fade: linear-gradient(180deg, transparent 0%, rgba(255, 214, 120, 0.35) 100%);
+}
+[data-theme="day"],
+[data-theme="day"] [data-accent="pink"],
+[data-theme="day"][data-accent="pink"] {
+  --bg-panel:     #fff3e6;
+  --bg-panel-2:   #ffe9d8;
+  --line:         #f3cdb4;
+  --line-divider: #f3cdb4;
+  --hero-from:    #fff0d4;
+  --hero-to:      #ffdfe9;
+}
+[data-theme="day"] [data-accent="purple"],
+[data-theme="day"][data-accent="purple"] {
+  --bg-panel:     #fbf2f6;
+  --bg-panel-2:   #f6e8f2;
+  --line:         #e4c8dd;
+  --line-divider: #e4c8dd;
+  --hero-from:    #fff1d8;
+  --hero-to:      #eadcff;
+}
+[data-theme="day"] [data-accent="blue"],
+[data-theme="day"][data-accent="blue"] {
+  --bg-panel:     #eef5fb;
+  --bg-panel-2:   #e4eff9;
+  --line:         #b8d4ea;
+  --line-divider: #cfe4f5;
+  --hero-from:    #fff3dd;
+  --hero-to:      #dcebfb;
+  --stat-from:    #fdf4e2;
+  --stat-to:      #e9f1fb;
+  --stat-border:  #cfe0f2;
+}
+
+/* ── Night ────────────────────────────────────────────────────────────────
+   Deep and quiet. Dark cards tinted toward their family, on a near-black sky.
+   The lightness ramp inverts: --bg-panel-2 is LIGHTER than --bg-panel here,
+   where it is deeper in Classic. That inversion is why the roles are named by
+   function rather than by lightness. */
+[data-theme="night"] {
+  --bg-page:   #0d0619;
+  --scrim:     rgba(3, 1, 10, 0.78);
+  --tab-hover: #e694c4;
+  --shadow-card:
+    0 0 0 1.5px rgba(255, 240, 250, 0.26),
+    0 18px 70px rgba(0, 0, 0, 0.70),
+    0 4px 24px rgba(0, 0, 0, 0.45);
+  --hero-off-from: #4b1f26;
+  --hero-off-to:   #441929;
+  --stat-from:   #15293c;
+  --stat-to:     #112138;
+  --stat-border: #284562;
+  --stat-label:  #779fcd;
+  --stat-text:   #81c2f4;
+  --progress-accent: #dda8f7;
+  --progress-from:   #371c45;
+  --progress-to:     #2d163f;
+  --progress-border: #59336c;
+  --step-pending-bg: #392145;
+  --step-pending-bd: #613c74;
+  --step-active-bg:  #502466;
+  --state-ok-tint:   #152e21;
+  /* The state palette stays independent of the ACCENT, but not of the THEME:
+     left at their light values these are pale pills on a dark card. */
+  --state-ok-surface:      #14301f;
+  --state-ok-border:       #2f6b47;
+  --state-ok-text:         #7fe0a8;
+  --state-ok-icon:         #16351f;
+  --state-off-surface:     #38141f;
+  --state-off-border:      #8c3350;
+  --state-off-text:        #ffa8c2;
+  --state-error-surface:   #391414;
+  --state-error-border:    #8a3030;
+  --state-error-text:      #ff9c9c;
+  --state-warn-surface:    #322a11;
+  --state-warn-border:     #7a6320;
+  --state-unknown-surface: #241a3a;
+  --state-unknown-border:  #52407e;
+  --state-unknown-text:    #c4b0f2;
+  --rainbow: linear-gradient(90deg,
+    #9c3f56, #a55246, #a86a3c, #a89440,
+    #5d8a52, #3f7d5e, #3f5f85, #7a5090);
+  --rainbow-short: linear-gradient(90deg,
+    #9c3f56, #a86a3c, #a89440, #3f7d5e, #3f5f85, #7a5090);
+
+  /* Scenery, consumed by meadow.css's [data-theme="night"] block. --sky-from/
+     -mid/-to reuse Day's role names for the same job — .page's gradient —
+     scoped here to Night's own near-black values; the mid stop matches
+     --bg-page (#0d0619) exactly so meadow-on and meadow-off don't diverge.
+     --moon and --moon-glow are new; --star-field points .star at a colour
+     that actually means "starlight" instead of the incidental --surface-card
+     it inherits under Classic; --firefly is new; --grass-fade overrides the
+     Classic dusk fade with a near-black one so the silhouette dissolves into
+     the sky. */
+  --sky-from:    #05020e;
+  --sky-mid:     #0d0619;
+  --sky-to:      #150a28;
+  --moon:        #f4eeff;
+  --moon-glow:   rgba(244, 238, 255, 0.35);
+  --star-field:  #e4ecff;
+  --firefly:     #d4f76a;
+  --grass-fade:  linear-gradient(180deg, transparent 0%, rgba(8, 3, 18, 0.65) 100%);
+}
+[data-theme="night"],
+[data-theme="night"] [data-accent="pink"],
+[data-theme="night"][data-accent="pink"] {
+  --bg-card: #321624;  --bg-panel: #3c1e2d;  --bg-panel-2: #402231;  --bg-inset: #250f1a;
+  --fg: #efdce5;  --fg-muted: #c6a3b4;  --fg-faint: #ca98b1;  --fg-label: #d588af;
+  --line: #a26784;  --line-divider: #a26784;  --on-accent: #fffefe;
+  --surface-hover: #402231;  --divider: #a26784;
+  --accent: #e55da1;  --accent-deep: #faadd4;  --hero-num-dim: #ed84b8;
+  --accent-grad-from: #cd3071;  --accent-grad-to: #cd1480;
+  --accent-glow: rgba(250, 173, 212, 0.30);
+  --accent-ring: rgba(250, 173, 212, 0.50);
+  --shadow-btn:   0 3px 12px var(--accent-glow);
+  --shadow-block: 0 4px 16px var(--accent-glow);
+  --hero-from: #451e31;  --hero-to: #53264a;
+}
+[data-theme="night"] [data-accent="purple"],
+[data-theme="night"][data-accent="purple"] {
+  --bg-card: #2b1735;  --bg-panel: #341f3e;  --bg-panel-2: #382342;  --bg-inset: #1f1027;
+  --fg: #e9dcef;  --fg-muted: #bda7c8;  --fg-faint: #bb9acb;  --fg-label: #be8dd7;
+  --line: #916aa4;  --line-divider: #916aa4;  --on-accent: #fffeff;
+  --surface-hover: #382342;  --divider: #916aa4;
+  --accent: #bd6ae7;  --accent-deep: #e2b2fa;  --hero-num-dim: #cd8cee;
+  --accent-grad-from: #ab3ad1;  --accent-grad-to: #9c2eea;
+  --accent-glow: rgba(226, 178, 250, 0.30);
+  --accent-ring: rgba(226, 178, 250, 0.50);
+  --shadow-btn:   0 3px 12px var(--accent-glow);
+  --shadow-block: 0 4px 16px var(--accent-glow);
+  --hero-from: #3a2050;  --hero-to: #432a63;
+}
+[data-theme="night"] [data-accent="blue"],
+[data-theme="night"][data-accent="blue"] {
+  --bg-card: #13202c;  --bg-panel: #1a2935;  --bg-panel-2: #1f2d39;  --bg-inset: #0d1720;
+  --fg: #d6e2ed;  --fg-muted: #9db2c4;  --fg-faint: #8ba9c3;  --fg-label: #75a5ce;
+  --line: #5d7c97;  --line-divider: #4d6478;  --on-accent: #fdfeff;
+  --surface-hover: #1f2d39;  --divider: #4d6478;
+  --accent: #3b93df;  --accent-deep: #94c9f8;  --hero-num-dim: #66ace8;
+  --accent-grad-from: #2e71c3;  --accent-grad-to: #1171ad;
+  --accent-glow: rgba(148, 201, 248, 0.30);
+  --accent-ring: rgba(148, 201, 248, 0.50);
+  --shadow-btn:   0 3px 12px var(--accent-glow);
+  --shadow-block: 0 4px 16px var(--accent-glow);
+  --hero-from: #15293e;  --hero-to: #1b3550;
+}
+
+/* Base ink, themes only. core.css sets no base colour, so a component that
+   declares none inherits the UA default black — invisible on a Night card.
+   Deliberately NOT applied to Classic: it would move nine components from
+   black to --fg and break the byte-identical guarantee. */
+[data-theme="day"] .card,
+[data-theme="night"] .card { color: var(--fg); }
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   EXTRACTED COMPONENTS
+   Lifted from the source page. Proven in production.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+/* ── Decoration defaults ─────────────────────────────────────────────────
+   meadow.css styles and positions every one of these; core.css only decides
+   what they do when meadow.css is *absent*. The answer has to be "nothing",
+   and it has to live here rather than there: the decorative markup carries
+   emoji text content — 26 glyphs, 9 on .floater, 9 on .petal, 8 on .butterfly
+   — so a page that keeps the markup and drops the optional stylesheet would
+   otherwise dump a band of stray emoji into document flow above the content,
+   in every theme. (.star, .grass and the rest are empty elements and would
+   only leave empty boxes, but they are listed here too so that the rule is
+   "the decorative layer is off", not a list of exceptions.) Measured: 26
+   stray text runs before this block existed, 0 after.
+
+   A default written in meadow.css cannot
+   defend against meadow.css being deleted; that is the whole point of the
+   tier split, so the default belongs on core's side of it.
+
+   meadow.css turns back on the ones its theme actually uses. */
+.star, .floater, .grass,
+.sun, .cloud, .butterfly, .petal,
+.moon, .firefly, .firefly-rise, .star-extra,
+.rainbow-stripe { display: none; }
+
+/* ── Page shell ──────────────────────────────────────────────────────────── */
+
+.page {
+  font-family: var(--font);
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: var(--sp-4);
+  position: relative;
+  background: var(--bg-page);
+}
+/* Centring only suits a page shorter than the viewport. Long pages get .top,
+   or the overflow is clipped at the head. */
+.page.top { justify-content: flex-start; }
+@media (min-width: 460px) { .page { padding: 2rem; } }
+
+.card {
+  position: relative;
+  z-index: 10;
+  width: 100%;
+  max-width: 440px;
+  background: var(--bg-card);
+  border-radius: var(--r-card);
+  overflow: hidden;
+  box-shadow: var(--shadow-card);
+}
+.card--wide { max-width: 880px; }
+
+.card-stripe {
+  height: 6px;
+  background: linear-gradient(90deg, var(--accent-grad-from), var(--accent-grad-to));
+}
+
+.card-body { padding: var(--sp-6); }
+@media (max-width: 360px) { .card-body { padding: var(--sp-5); } }
+
+/* ── Tabs ────────────────────────────────────────────────────────────────
+   Put data-accent on an individual tab to give it its own hue, the way the
+   source page keyed one colour per section. */
+
+.tab-bar {
+  display: flex;
+  background: var(--bg-panel);
+  border-bottom: var(--bw) solid var(--divider);
+}
+.tab {
+  flex: 1;
+  font-family: var(--font);
+  font-size: var(--fs-sm);
+  font-weight: 800;
+  padding: var(--sp-3) var(--sp-1);
+  border: none;
+  border-bottom: 2.5px solid transparent;
+  margin-bottom: calc(var(--bw) * -1);
+  background: none;
+  color: var(--tab-idle);
+  cursor: pointer;
+  white-space: nowrap;
+  letter-spacing: 0.01em;
+  transition: color var(--t-fast), background var(--t-fast),
+              border-color var(--t-fast);
+}
+.tab:hover:not(.active) { background: var(--surface-hover); color: var(--tab-hover); }
+.tab.active {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+  background: var(--bg-card);
+}
+@media (max-width: 360px) {
+  .tab { font-size: var(--fs-micro); padding: var(--sp-3) 0.15rem; }
+}
+
+.tab-panel { display: none; }
+.tab-panel.active { display: block; }
+
+/* ── Header and footer ───────────────────────────────────────────────────── */
+
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 1.5rem;   /* no --sp rung is 1.5rem; the ladder must not move */
+}
+.title-group { display: flex; align-items: center; gap: var(--sp-1); }
+.title-icon { font-size: var(--fs-icon); }
+.title {
+  font-size: var(--fs-md);
+  font-weight: 900;
+  color: var(--accent);
+  letter-spacing: var(--ls-title);
+  text-transform: uppercase;
+}
+.ts { font-size: var(--fs-tiny); font-weight: 700; color: var(--fg-faint); }
+
+.footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding-top: var(--sp-2);
+  font-size: var(--fs-tiny);
+  font-weight: 700;
+  color: var(--fg-faint);
+}
+.footer-btn {
+  font-family: var(--font);
+  font-size: var(--fs-tiny);
+  font-weight: 800;
+  background: none;
+  border: none;
+  color: var(--accent);
+  cursor: pointer;
+}
+.footer-btn:hover { text-decoration: underline; }
+
+/* ── Hero panel ──────────────────────────────────────────────────────────── */
+
+.hero {
+  position: relative;
+  overflow: hidden;
+  padding: var(--sp-5);
+  margin-bottom: var(--sp-5);
+  text-align: center;
+  background: linear-gradient(135deg, var(--hero-from), var(--hero-to));
+  border: var(--bw-thick) solid var(--line);
+  border-radius: var(--r-hero);
+  transition: background var(--t-hero), border-color var(--t-hero);
+}
+.hero.off {
+  background: linear-gradient(135deg, var(--hero-off-from), var(--hero-off-to));
+  border-color: var(--state-off-border);
+}
+
+.hero-num {
+  font-size: var(--fs-hero);
+  font-weight: 900;
+  color: var(--accent-deep);
+  letter-spacing: 0.03em;
+  line-height: 1.1;
+  margin-bottom: 0.3rem;
+  transition: color var(--t-slow), font-size var(--t-base);
+}
+.hero-num.dim { color: var(--hero-num-dim); font-size: var(--fs-hero-dim); }
+.hero-sub {
+  font-size: var(--fs-sm);
+  font-weight: 700;
+  color: var(--fg-muted);
+  min-height: 1.1em;
+}
+
+/* ── Chip ────────────────────────────────────────────────────────────────── */
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-1);
+  padding: 0.25rem 0.9rem;
+  margin-bottom: var(--sp-3);
+  border: var(--bw) solid transparent;
+  border-radius: var(--r-pill);
+  font-size: var(--fs-sm);
+  font-weight: 800;
+  transition: background var(--t-slow), border-color var(--t-slow),
+              color var(--t-slow);
+}
+.chip.ok      { background: var(--state-ok-surface);      border-color: var(--state-ok-border);      color: var(--state-ok-text); }
+.chip.off     { background: var(--state-off-surface);     border-color: var(--state-off-border);     color: var(--state-off-text); }
+.chip.error   { background: var(--state-error-surface);   border-color: var(--state-error-border);   color: var(--state-error-text); }
+.chip.warn    { background: var(--state-warn-surface);    border-color: var(--state-warn-border);    color: var(--state-warn-deep); }
+.chip.unknown { background: var(--state-unknown-surface); border-color: var(--state-unknown-border); color: var(--state-unknown-text); }
+
+.chip-dot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
+.chip.ok      .chip-dot { background: var(--state-ok);      box-shadow: 0 0 5px var(--state-ok); animation: pulse 1.8s infinite; }
+.chip.off     .chip-dot { background: var(--state-off);     box-shadow: 0 0 5px var(--state-off); }
+.chip.error   .chip-dot { background: var(--state-error); }
+.chip.warn    .chip-dot { background: var(--state-warn); }
+.chip.unknown .chip-dot { background: var(--state-unknown); }
+
+@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.2; } }
+
+/* ── Toggle row ──────────────────────────────────────────────────────────── */
+
+.toggle-area {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.85rem 1.1rem;
+  margin-bottom: var(--sp-5);
+  background: var(--bg-inset);
+  border: var(--bw) solid var(--line);
+  border-radius: var(--r-panel);
+  transition: background var(--t-slow), border-color var(--t-slow);
+}
+.toggle-area.off { border-color: var(--state-off-border); }
+.toggle-left { display: flex; align-items: center; gap: var(--sp-2); }
+.toggle-text { font-size: var(--fs-md); font-weight: 800; color: var(--accent-deep); }
+.toggle-sub  { font-size: var(--fs-label); font-weight: 600; color: var(--fg-faint); }
+
+/* ── Section label ───────────────────────────────────────────────────────── */
+
+.section-label {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+  margin-bottom: 0.6rem;
+  font-size: var(--fs-label);
+  font-weight: 900;
+  text-transform: uppercase;
+  letter-spacing: var(--ls-section);
+  color: var(--fg-label);
+}
+.section-label::after {
+  content: '';
+  flex: 1;
+  height: 1px;
+  background: var(--line-divider);
+}
+
+/* ── Info and stat cells ─────────────────────────────────────────────────── */
+
+.info-grid, .stat-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--sp-2);
+  margin-bottom: var(--sp-5);
+}
+@media (max-width: 320px) {
+  .info-grid, .stat-grid { grid-template-columns: 1fr; }
+}
+
+.info-cell {
+  padding: 0.6rem var(--sp-3);
+  background: var(--bg-panel);
+  border: var(--bw) solid var(--line);
+  border-radius: var(--r-control);
+}
+.info-label {
+  margin-bottom: 0.2rem;
+  font-size: var(--fs-micro);
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: var(--ls-label);
+  color: var(--fg-label);
+}
+.info-val { font-size: var(--fs-md); font-weight: 700; color: var(--fg); }
+
+.stat-cell {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: 0.6rem var(--sp-3);
+  background: linear-gradient(135deg, var(--stat-from), var(--stat-to));
+  border: var(--bw) solid var(--stat-border);
+  border-radius: var(--r-control);
+}
+.stat-icon { font-size: var(--fs-icon); }
+.stat-label {
+  margin-bottom: 0.15rem;
+  font-size: var(--fs-micro);
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: var(--ls-label);
+  color: var(--stat-label);
+}
+.stat-val { font-size: var(--fs-lg); font-weight: 800; color: var(--stat-text); }
+
+/* ── List rows ───────────────────────────────────────────────────────────── */
+
+.list { display: flex; flex-direction: column; gap: var(--sp-1); margin-bottom: var(--sp-4); }
+
+.list-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--sp-2) 0.8rem;
+  background: var(--bg-panel);
+  border: var(--bw) solid var(--line);
+  border-radius: var(--r-cell);
+  cursor: pointer;
+  transition: border-color var(--t-fast), background var(--t-fast),
+              box-shadow var(--t-fast);
+}
+.list-row:hover    { border-color: var(--accent); background: var(--bg-panel-2); }
+.list-row.selected { border-color: var(--accent); background: var(--bg-panel-2); box-shadow: 0 0 0 2px var(--accent-ring); }
+.list-row.ok       { border-color: var(--state-ok); background: var(--state-ok-tint); }
+.list-row.ok.selected {
+  border-color: var(--state-ok-deep);
+  box-shadow: 0 0 0 2px var(--state-ok-border);
+}
+
+.list-left { display: flex; align-items: center; gap: var(--sp-2); }
+.list-radio {
+  width: 14px;
+  height: 14px;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg-card);
+  border: var(--bw-thick) solid var(--line);
+  border-radius: 50%;
+  transition: background var(--t-fast), border-color var(--t-fast);
+}
+.list-row.selected .list-radio { background: var(--accent); border-color: var(--accent); }
+.list-row.selected .list-radio::after {
+  content: '';
+  display: block;
+  width: 5px;
+  height: 5px;
+  background: var(--on-accent);
+  border-radius: 50%;
+}
+.list-row.ok .list-radio { border-color: var(--state-ok-deep); }
+.list-row.ok.selected .list-radio { background: var(--state-ok-deep); border-color: var(--state-ok-deep); }
+
+.list-info { display: flex; flex-direction: column; }
+.list-name { font-size: var(--fs-sm); font-weight: 800; color: var(--fg); }
+.list-badges { display: flex; align-items: center; gap: 0.3rem; margin-top: 0.1rem; }
+
+.metric { font-size: var(--fs-sm); font-weight: 800; }
+.metric.fast { color: var(--state-ok-deep); }
+.metric.ok   { color: var(--state-warn-deep); }
+.metric.slow { color: var(--state-error-text); }
+
+.empty-msg {
+  padding: var(--sp-2);
+  font-size: var(--fs-sm);
+  color: var(--fg-label);
+  text-align: center;
+}
+
+/* ── Buttons ─────────────────────────────────────────────────────────────── */
+
+.btn {
+  font-family: var(--font);
+  font-size: var(--fs-sm);
+  font-weight: 800;
+  padding: 0.45rem 1.1rem;
+  border: none;
+  border-radius: var(--r-pill);
+  background: linear-gradient(135deg, var(--accent-grad-from), var(--accent-grad-to));
+  color: var(--on-accent);
+  box-shadow: var(--shadow-btn);
+  cursor: pointer;
+  transition: transform var(--t-fast), box-shadow var(--t-fast), opacity var(--t-base);
+}
+.btn:active { transform: scale(0.93); }
+.btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.btn.ok      { background: linear-gradient(135deg, var(--grad-ok-from), var(--grad-ok-to));     box-shadow: 0 3px 12px var(--glow-ok); }
+.btn.off     { background: linear-gradient(135deg, var(--grad-off-from), var(--grad-off-to));   box-shadow: 0 3px 12px var(--glow-off); }
+.btn.pending { background: linear-gradient(135deg, var(--grad-warn-from), var(--grad-warn-to)); box-shadow: 0 3px 12px var(--glow-warn); }
+
+.btn-block {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--sp-2);
+  width: 100%;
+  font-family: var(--font);
+  font-size: var(--fs-md);
+  font-weight: 900;
+  padding: 0.65rem var(--sp-4);
+  border: none;
+  border-radius: var(--r-control);
+  background: linear-gradient(135deg, var(--accent-grad-from), var(--accent-grad-to));
+  color: var(--on-accent);
+  box-shadow: var(--shadow-block);
+  cursor: pointer;
+  transition: transform var(--t-fast), box-shadow var(--t-fast), opacity var(--t-base);
+}
+/* The same button at its inline width, for a control toolbar. */
+.btn-block.auto { width: auto; flex-shrink: 0; }
+.btn-block:active { transform: scale(0.97); }
+.btn-block:disabled { opacity: 0.5; cursor: not-allowed; }
+
+.btn-icon {
+  flex-shrink: 0;
+  font-size: var(--fs-icon);
+  line-height: 1;
+  padding: 0 var(--sp-2);
+  background: none;
+  border: var(--bw) solid var(--line);
+  border-radius: var(--r-tight);
+  color: var(--accent);
+  cursor: pointer;
+  transition: background var(--t-fast);
+}
+.btn-icon:hover { background: var(--bg-panel); }
+.btn-icon:disabled { opacity: 0.4; cursor: not-allowed; }
+
+/* ── Select ──────────────────────────────────────────────────────────────
+   The source page drew the chevron with a data-URI SVG carrying a baked-in
+   hex, which cannot follow the accent. Here the wrapper draws it with a CSS
+   triangle instead, so it recolours with the family:
+
+     <div class="select-wrap"><select class="select">…</select></div> */
+
+/* Block by default. Inside a .row it may flex; as a column-flex child a
+   flex-basis would be read as a height and drop the chevron below the box. */
+.select-wrap { position: relative; display: block; width: 100%; }
+.row > .select-wrap { flex: 1 1 8rem; width: auto; }
+.select-wrap::after {
+  content: '';
+  position: absolute;
+  top: 50%;
+  right: 0.7rem;
+  width: 0;
+  height: 0;
+  border-left: 4px solid transparent;
+  border-right: 4px solid transparent;
+  border-top: 5px solid var(--accent);
+  transform: translateY(-50%);
+  pointer-events: none;
+}
+.select {
+  width: 100%;
+  font-family: var(--font);
+  font-size: var(--fs-base);
+  font-weight: 700;
+  padding: 0.6rem var(--sp-3);
+  padding-right: 1.8rem;
+  background: var(--bg-panel);
+  color: var(--fg);
+  border: var(--bw) solid var(--line);
+  border-radius: var(--r-cell);
+  cursor: pointer;
+  appearance: none;
+  transition: border-color var(--t-fast);
+}
+.select:focus { outline: none; border-color: var(--accent); }
+.select:disabled { opacity: 0.5; cursor: not-allowed; }
+
+/* ── Region tabs ─────────────────────────────────────────────────────────── */
+
+.region-tabs {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(6.5rem, 1fr));
+  gap: var(--sp-2);
+  margin-bottom: var(--sp-4);
+}
+.region-tab {
+  font-family: var(--font);
+  font-size: var(--fs-sm);
+  font-weight: 800;
+  padding: var(--sp-2);
+  text-align: center;
+  white-space: nowrap;
+  background: var(--bg-panel);
+  color: var(--fg-label);
+  border: var(--bw) solid var(--line);
+  border-radius: var(--r-cell);
+  cursor: pointer;
+  transition: background var(--t-base), color var(--t-base),
+              border-color var(--t-base), box-shadow var(--t-base);
+}
+.region-tab.active {
+  background: linear-gradient(135deg, var(--accent-grad-from), var(--accent-grad-to));
+  color: var(--on-accent);
+  border-color: transparent;
+  box-shadow: var(--shadow-btn);
+}
+
+/* ── Progress stepper ────────────────────────────────────────────────────── */
+
+.progress {
+  padding: 1.1rem;
+  margin-bottom: var(--sp-4);
+  background: linear-gradient(135deg, var(--progress-from), var(--progress-to));
+  border: var(--bw) solid var(--progress-border);
+  border-radius: var(--r-panel);
+}
+.progress-title {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  margin-bottom: var(--sp-3);
+  font-size: var(--fs-sm);
+  font-weight: 900;
+  color: var(--progress-accent);
+}
+.progress-steps { display: flex; flex-direction: column; gap: var(--sp-1); }
+
+.step {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  font-size: var(--fs-tiny);
+  font-weight: 700;
+}
+.step.done    { color: var(--state-ok-deep); }
+.step.active  { color: var(--progress-accent); font-weight: 800; }
+.step.pending { color: var(--step-pending); }
+.step.error   { color: var(--state-error-text); }
+
+.step-icon {
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: var(--fs-micro);
+  border: var(--bw) solid currentColor;
+  border-radius: 50%;
+}
+.step.done    .step-icon { background: var(--state-ok-icon); }
+.step.active  .step-icon { background: var(--step-active-bg); animation: pulse 1s infinite; }
+.step.pending .step-icon { background: var(--step-pending-bg); border-color: var(--step-pending-bd); }
+.step.error   .step-icon { background: var(--state-error-surface); }
+
+.progress-note {
+  margin-top: var(--sp-3);
+  font-size: var(--fs-label);
+  font-weight: 700;
+  line-height: 1.5;
+  text-align: center;
+  color: var(--progress-note);
+}
+
+.spinner { display: inline-block; animation: spin 1s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   DESIGNED COMPONENTS
+   Not in the source page — it was one card on one screen and never needed
+   them. Built from the six rules in CLAUDE.md so they read as native.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+/* ── Fields ──────────────────────────────────────────────────────────────── */
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  margin-bottom: var(--sp-4);
+}
+.field-label {
+  font-size: var(--fs-micro);
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: var(--ls-label);
+  color: var(--fg-label);
+}
+.field-help  { font-size: var(--fs-tiny); font-weight: 600; color: var(--fg-faint); }
+.field-error { font-size: var(--fs-tiny); font-weight: 700; color: var(--state-error-text); }
+.field-row   { display: flex; align-items: center; gap: var(--sp-2); }
+
+/* ── Text inputs ─────────────────────────────────────────────────────────── */
+
+.input, .textarea {
+  width: 100%;
+  font-family: var(--font);
+  font-size: var(--fs-base);
+  font-weight: 700;
+  padding: 0.6rem var(--sp-3);
+  background: var(--bg-panel);
+  color: var(--fg);
+  border: var(--bw) solid var(--line);
+  border-radius: var(--r-cell);
+  transition: border-color var(--t-fast);
+}
+.input::placeholder, .textarea::placeholder { color: var(--fg-faint); font-weight: 600; }
+.input:focus, .textarea:focus { outline: none; border-color: var(--accent); }
+.input:disabled, .textarea:disabled { opacity: 0.5; cursor: not-allowed; }
+.input.error, .textarea.error { border-color: var(--state-error-border); }
+.textarea { min-height: 5rem; resize: vertical; }
+
+/* ── Checkbox, radio, switch ─────────────────────────────────────────────
+   Real inputs with appearance:none, so they stay keyboard- and
+   screen-reader-native without a wrapper element. */
+
+.checkbox, .radio {
+  appearance: none;
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+  display: inline-grid;
+  place-content: center;
+  background: var(--bg-card);
+  border: var(--bw-thick) solid var(--line);
+  cursor: pointer;
+  transition: background var(--t-fast), border-color var(--t-fast);
+}
+.checkbox { border-radius: 4px; }
+.radio    { border-radius: 50%; }
+.checkbox:checked, .radio:checked { background: var(--accent); border-color: var(--accent); }
+.checkbox:checked::after {
+  content: '';
+  width: 9px;
+  height: 5px;
+  border-left: 2px solid var(--on-accent);
+  border-bottom: 2px solid var(--on-accent);
+  transform: rotate(-45deg) translate(1px, -2px);
+}
+.radio:checked::after {
+  content: '';
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--on-accent);
+}
+.checkbox:focus-visible, .radio:focus-visible, .switch:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+.checkbox:disabled, .radio:disabled, .switch:disabled { opacity: 0.5; cursor: not-allowed; }
+
+.switch {
+  appearance: none;
+  position: relative;
+  width: 34px;
+  height: 20px;
+  flex-shrink: 0;
+  background: var(--line);
+  border: none;
+  border-radius: var(--r-pill);
+  cursor: pointer;
+  transition: background var(--t-fast);
+}
+.switch::after {
+  content: '';
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 14px;
+  height: 14px;
+  background: var(--on-accent);
+  border-radius: 50%;
+  transition: transform var(--t-fast);
+}
+.switch:checked {
+  background: linear-gradient(135deg, var(--accent-grad-from), var(--accent-grad-to));
+}
+.switch:checked::after { transform: translateX(14px); }
+
+/* ── Table ───────────────────────────────────────────────────────────────── */
+
+.table-wrap {
+  overflow-x: auto;
+  margin-bottom: var(--sp-4);
+  border: var(--bw) solid var(--line);
+  border-radius: var(--r-control);
+}
+.table {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: var(--font);
+}
+.table th {
+  padding: var(--sp-2) var(--sp-3);
+  text-align: left;
+  white-space: nowrap;
+  font-size: var(--fs-micro);
+  font-weight: 900;
+  text-transform: uppercase;
+  letter-spacing: var(--ls-label);
+  color: var(--fg-label);
+  background: var(--bg-panel);
+  border-bottom: var(--bw) solid var(--line);
+}
+.table td {
+  padding: var(--sp-2) var(--sp-3);
+  font-size: var(--fs-base);
+  font-weight: 700;
+  color: var(--fg);
+  border-bottom: var(--bw) solid var(--line);
+}
+.table tbody tr:last-child td { border-bottom: none; }
+.table tbody tr { transition: background var(--t-fast); }
+.table tbody tr:hover { background: var(--bg-panel); }
+
+/* ── Alert ───────────────────────────────────────────────────────────────── */
+
+.alert {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-3);
+  padding: var(--sp-3) var(--sp-4);
+  margin-bottom: var(--sp-4);
+  border: var(--bw) solid var(--line);
+  border-radius: var(--r-panel);
+  background: var(--bg-panel);
+}
+.alert-icon  { font-size: var(--fs-icon); line-height: 1.2; flex-shrink: 0; }
+.alert-title { font-size: var(--fs-md); font-weight: 800; margin-bottom: 0.15rem; }
+.alert-body  { font-size: var(--fs-base); font-weight: 600; line-height: 1.5; }
+
+.alert.ok      { background: var(--state-ok-surface);      border-color: var(--state-ok-border);      color: var(--state-ok-text); }
+.alert.off     { background: var(--state-off-surface);     border-color: var(--state-off-border);     color: var(--state-off-text); }
+.alert.error   { background: var(--state-error-surface);   border-color: var(--state-error-border);   color: var(--state-error-text); }
+.alert.warn    { background: var(--state-warn-surface);    border-color: var(--state-warn-border);    color: var(--state-warn-deep); }
+.alert.unknown { background: var(--state-unknown-surface); border-color: var(--state-unknown-border); color: var(--state-unknown-text); }
+
+/* ── Badge ───────────────────────────────────────────────────────────────── */
+
+.badge {
+  display: inline-block;
+  padding: 0.1rem 0.45rem;
+  font-size: var(--fs-badge);
+  font-weight: 900;
+  text-transform: uppercase;
+  letter-spacing: var(--ls-title);
+  border-radius: var(--r-pill);
+  color: var(--on-accent);
+  background: linear-gradient(135deg, var(--accent-grad-from), var(--accent-grad-to));
+}
+.badge.ok      { background: linear-gradient(135deg, var(--state-ok), var(--state-ok-deep)); }
+.badge.off     { background: linear-gradient(135deg, var(--grad-off-from), var(--grad-off-to)); }
+.badge.error   { background: var(--state-error); }
+.badge.warn    { background: linear-gradient(135deg, var(--grad-warn-from), var(--grad-warn-to)); }
+.badge.unknown { background: var(--state-unknown); }
+
+/* ── Modal ───────────────────────────────────────────────────────────────
+   CSS only — the kit ships no JS. Toggle the .open class yourself. */
+
+.modal-backdrop {
+  display: none;
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  align-items: center;
+  justify-content: center;
+  padding: var(--sp-4);
+  background: var(--scrim);
+}
+.modal-backdrop.open { display: flex; }
+
+.modal {
+  width: 100%;
+  max-width: 440px;
+  background: var(--bg-card);
+  border-radius: var(--r-card);
+  box-shadow: var(--shadow-card);
+  overflow: hidden;
+}
+.modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-3);
+  padding: var(--sp-5) var(--sp-5) 0;
+  font-size: var(--fs-md);
+  font-weight: 900;
+  text-transform: uppercase;
+  letter-spacing: var(--ls-title);
+  color: var(--accent);
+}
+.modal-body {
+  padding: var(--sp-4) var(--sp-5);
+  font-size: var(--fs-base);
+  font-weight: 600;
+  line-height: 1.6;
+  color: var(--fg);
+}
+.modal-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--sp-2);
+  padding: 0 var(--sp-5) var(--sp-5);
+}
+
+/* ── Layout helpers ──────────────────────────────────────────────────────
+   Six utilities, deliberately not a grid framework. */
+
+.stack { display: flex; flex-direction: column; gap: var(--sp-4); }
+.row   { display: flex; align-items: center; gap: var(--sp-2); flex-wrap: wrap; }
+/* Control toolbars: makes an icon button match the height of the select beside it. */
+.row.stretch { align-items: stretch; }
+.row-between { display: flex; align-items: center; justify-content: space-between; gap: var(--sp-2); }
+
+.grid-2 { display: grid; grid-template-columns: repeat(2, 1fr); gap: var(--sp-2); }
+.grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: var(--sp-2); }
+.grid-auto {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(6.5rem, 1fr));
+  gap: var(--sp-2);
+}
+@media (max-width: 320px) {
+  .grid-2, .grid-3 { grid-template-columns: 1fr; }
+}

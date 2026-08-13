@@ -1,3 +1,5 @@
+mod schedule;
+
 use std::fs;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -50,7 +52,7 @@ struct HistoryEntry {
 fn protected_bundle_fn() -> &'static str {
     r#"pm_fix_protected_bundle() {
   local tmpout="$1"
-  local current_user app_path app_basename chownout
+  local current_user app_path app_basename chownout rc
   current_user=$(whoami)
   app_path=$(grep "Permission denied @ apply2files" "$tmpout" | head -1 \
     | sed 's/.*@ apply2files - //' | sed 's|/Contents/.*||')
@@ -59,12 +61,24 @@ fn protected_bundle_fn() -> &'static str {
     return 1
   fi
   app_basename=$(basename "$app_path")
-  echo "→  $app_basename is protected by macOS. Enter your password to allow the change."
-  echo "→  Requesting administrator access…"
-  # '2>&1; true' keeps chown errors in the result and stops `do shell script`
-  # from raising, so we can inspect what actually happened.
+  echo "→  $app_basename is protected by macOS — requesting administrator access…"
   chownout=$(mktemp)
-  osascript -e "do shell script \"chown -R $current_user '$app_path' 2>&1; true\" with administrator privileges" > "$chownout" 2>&1
+  # `sudo -A` rides on the credential sudo already cached for this run (see
+  # ASKPASS_PREAMBLE) rather than opening a second, unrelated auth dialog.
+  sudo -A chown -R "$current_user" "$app_path" > "$chownout" 2>&1
+  rc=$?
+  if [ "$rc" -ne 0 ] && ! grep -q "Operation not permitted" "$chownout"; then
+    if grep -qiE "no password was provided|a password is required|incorrect password" "$chownout"; then
+      rm -f "$chownout"
+      echo "✖  Cancelled — administrator access is needed for $app_basename."
+      return 1
+    fi
+    # sudo itself could not run (e.g. the account is not an admin). Fall back to
+    # Authorization Services, which can authenticate as a different admin user.
+    # '2>&1; true' keeps chown errors in the result and stops `do shell script`
+    # from raising, so we can inspect what actually happened.
+    osascript -e "do shell script \"chown -R $current_user '$app_path' 2>&1; true\" with administrator privileges" > "$chownout" 2>&1
+  fi
   if grep -q "Operation not permitted" "$chownout"; then
     # EPERM as root = macOS App Management / SIP bundle protection, not ownership.
     rm -f "$chownout"
@@ -368,7 +382,8 @@ async fn track_apps(app: AppHandle, items: Vec<TrackItem>) {
         return;
     }
     let script = format!(
-        "export PATH=\"/opt/homebrew/bin:/usr/local/bin:$PATH\"\nif command -v brew &>/dev/null; then\n{helper}\n{adopt}\n{calls}echo '→  All set! Run a check to move these apps to Homebrew Apps.'\nelse\n  echo '✖  brew not found'\nfi",
+        "export PATH=\"/opt/homebrew/bin:/usr/local/bin:$PATH\"\nif command -v brew &>/dev/null; then\nexport PM_ASKPASS_APP='{scope}'\n{helper}\n{adopt}\n{calls}echo '→  All set! Run a check to move these apps to Homebrew Apps.'\nelse\n  echo '✖  brew not found'\nfi",
+        scope = askpass_scope(&names),
         helper = protected_bundle_fn(),
         adopt = adopt_cask_fn(),
         calls = calls,
@@ -432,16 +447,52 @@ async fn emit_status(app: &AppHandle, section: &str, status: &str) {
     );
 }
 
+// Puts the version managers on PATH so checks see the same tools the user's own
+// shell would. Checks never need root, so this carries no askpass plumbing.
+const CHECK_PREAMBLE: &str = r#"
+export PATH="$HOME/.rvm/bin:$HOME/.rbenv/bin:$HOME/.nvm/versions/node/$(ls $HOME/.nvm/versions/node 2>/dev/null | tail -1)/bin:/usr/local/bin:/opt/homebrew/bin:$PATH"
+[ -s "$HOME/.rvm/scripts/rvm" ] && source "$HOME/.rvm/scripts/rvm"
+command -v rbenv &>/dev/null && eval "$(rbenv init -)"
+"#;
+
+// Runs a section's check and returns its output instead of streaming it to a
+// window. Used by the scheduled run, which has no webview to emit events to.
+pub(crate) async fn run_check_collect(section: &str) -> Vec<String> {
+    let script = match check_script(section) {
+        Some(s) => s,
+        None => return Vec::new(),
+    };
+    let preamble = if cfg!(target_os = "macos") || cfg!(target_os = "linux") {
+        CHECK_PREAMBLE
+    } else { "" };
+    let shell = if cfg!(target_os = "windows") { "powershell" } else { "bash" };
+    let flag  = if cfg!(target_os = "windows") { "-Command" } else { "-c" };
+
+    let out = Command::new(shell)
+        .arg(flag)
+        .arg(format!("{preamble}{script}"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await;
+
+    match out {
+        Ok(o) => String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .chain(String::from_utf8_lossy(&o.stderr).lines().collect::<Vec<_>>())
+            .map(|l| l.to_string())
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
 async fn run_shell(app: &AppHandle, section: &str, script: &str) {
     let shell = if cfg!(target_os = "windows") { "powershell" } else { "bash" };
     let flag  = if cfg!(target_os = "windows") { "-Command" } else { "-c" };
 
     let preamble = if cfg!(target_os = "macos") || cfg!(target_os = "linux") {
-        r#"
-export PATH="$HOME/.rvm/bin:$HOME/.rbenv/bin:$HOME/.nvm/versions/node/$(ls $HOME/.nvm/versions/node 2>/dev/null | tail -1)/bin:/usr/local/bin:/opt/homebrew/bin:$PATH"
-[ -s "$HOME/.rvm/scripts/rvm" ] && source "$HOME/.rvm/scripts/rvm"
-command -v rbenv &>/dev/null && eval "$(rbenv init -)"
-"#
+        CHECK_PREAMBLE
     } else { "" };
 
     let full_script = format!("{}{}", preamble, script);
@@ -499,32 +550,170 @@ const CASK_END: &str = "__PM_CASK_END__:";
 
 // Askpass preamble: sets SUDO_ASKPASS to a helper that pops a native password
 // dialog whenever a child process (e.g. Homebrew) shells out to `sudo -A`.
-//   - Names the specific app via $PM_ASKPASS_APP when set.
+//   - Names the specific app (or the batch) via $PM_ASKPASS_APP when set.
 //   - Uses a plain `osascript` dialog (no "System Events") to avoid the TCC
 //     automation permission prompt.
 //   - Exits non-zero on Cancel or timeout so sudo aborts cleanly instead of
 //     receiving an error string as the password.
+//   - Asks ONCE per run, without ever storing the password: sudo's own
+//     credential cache covers every later `sudo` call in the batch. That cache
+//     is keyed to the invoking terminal, so run_upgrade_shell gives the shell a
+//     controlling terminal shared by all its descendants — otherwise sudo falls
+//     back to keying by parent process and each `brew` invocation asks again.
+//     The keep-alive below stops that credential expiring mid-batch.
+//   - Warns on a rejected password: sudo re-invokes the askpass helper for each
+//     of its retries, so a second call from the same sudo process (same $PPID)
+//     within a few seconds means what we handed over was wrong. $PM_ASK_STAMP
+//     holds only "<ppid> <epoch>" — no password material is written to disk.
 const ASKPASS_PREAMBLE: &str = r#"
 export PATH="$HOME/.rvm/bin:$HOME/.rbenv/bin:$HOME/.nvm/versions/node/$(ls $HOME/.nvm/versions/node 2>/dev/null | tail -1)/bin:/usr/local/bin:/opt/homebrew/bin:$PATH"
 [ -s "$HOME/.rvm/scripts/rvm" ] && source "$HOME/.rvm/scripts/rvm"
 command -v rbenv &>/dev/null && eval "$(rbenv init -)"
-_pm_askpass=$(mktemp /tmp/partyman-askpass-XXXX)
+_pm_dir=$(mktemp -d /tmp/partyman-askpass-XXXXXX)
+chmod 700 "$_pm_dir"
+_pm_askpass="$_pm_dir/askpass"
 cat > "$_pm_askpass" <<'PARTYMAN_ASKPASS'
 #!/bin/bash
+_pm_stamp="${PM_ASK_STAMP:-}"
+_pm_retry=""
+if [ -n "$_pm_stamp" ] && [ -s "$_pm_stamp" ]; then
+  _pm_last=$(cat "$_pm_stamp" 2>/dev/null)
+  if [ "${_pm_last%% *}" = "$PPID" ] && [ $(( $(date +%s) - ${_pm_last##* } )) -lt 20 ]; then
+    _pm_retry=1
+  fi
+fi
 _pm_app="${PM_ASKPASS_APP:-}"
 if [ -n "$_pm_app" ]; then
   _pm_msg="PartyMAN Update Manager needs your administrator password to update ${_pm_app}."
 else
   _pm_msg="PartyMAN Update Manager needs your administrator password to complete this update."
 fi
+[ -n "$_pm_retry" ] && _pm_msg="That password didn't work. $_pm_msg"
 _pm_pw=$(osascript -e "display dialog \"${_pm_msg}\" default answer \"\" with hidden answer with title \"PartyMAN Update Manager\" with icon caution giving up after 120" -e 'text returned of result' 2>/dev/null) || exit 1
 [ -z "$_pm_pw" ] && exit 1
+[ -n "$_pm_stamp" ] && printf '%s %s' "$PPID" "$(date +%s)" > "$_pm_stamp"
 printf '%s' "$_pm_pw"
 PARTYMAN_ASKPASS
 chmod 700 "$_pm_askpass"
 export SUDO_ASKPASS="$_pm_askpass"
-trap 'rm -f "$_pm_askpass"' EXIT
+export PM_ASK_STAMP="$_pm_dir/asked"
+# run_upgrade_shell attaches a controlling terminal, which sudo prefers over
+# SUDO_ASKPASS — and a prompt written there is invisible and never answered, so it
+# would block forever. Our own calls and Homebrew's always pass -A, so this shim
+# only matters for third-party scripts that shell out to a bare `sudo`. Left alone
+# if the caller already chose how to read the password.
+mkdir -p "$_pm_dir/bin"
+cat > "$_pm_dir/bin/sudo" <<'PARTYMAN_SUDO'
+#!/bin/bash
+# Only sudo's own leading options are inspected; scanning further could mistake a
+# flag belonging to the command being run (sudo tar -S …) for one of sudo's.
+for _a in "$@"; do
+  case "$_a" in
+    --) break ;;
+    -A|--askpass|-S|--stdin|-*[AS]*) exec /usr/bin/sudo "$@" ;;
+    -*) ;;
+    *) break ;;
+  esac
+done
+exec /usr/bin/sudo -A "$@"
+PARTYMAN_SUDO
+chmod 700 "$_pm_dir/bin/sudo"
+export PATH="$_pm_dir/bin:$PATH"
+# Refresh sudo's cached credential every minute so it cannot lapse (default 5
+# min) part-way through a long batch and ask a second time. Fully detached from
+# our pipes so it never emits anything into the update log.
+( while :; do sleep 60; sudo -n -v; done ) >/dev/null 2>&1 &
+_pm_keepalive=$!
+# Off the job table, or bash announces "Terminated" on stderr when the trap kills
+# it and that lands in the update log.
+disown "$_pm_keepalive" 2>/dev/null
+trap '[ -n "$_pm_keepalive" ] && kill "$_pm_keepalive" 2>/dev/null; [ -n "$_pm_dir" ] && rm -rf "$_pm_dir"' EXIT
 "#;
+
+// Label for the one password dialog that covers a whole batch: the app's own name
+// when it is the only one, otherwise a count. Sanitized for the AppleScript
+// string and for the single-quoted shell export it is interpolated into.
+fn askpass_scope(names: &[String]) -> String {
+    let raw = match names {
+        [one] => one.clone(),
+        _ => format!("these {} apps", names.len()),
+    };
+    raw.replace(['\\', '"'], "").replace('\'', "'\\''")
+}
+
+// Holds both ends of the pty open for the child's lifetime; closing the master
+// would hang up the terminal we just attached. The parent's copy of the slave fd
+// cannot be closed before spawn (the child needs to inherit it), so it is closed
+// here too rather than leaked.
+#[cfg(unix)]
+struct PtyMaster {
+    master: libc::c_int,
+    slave: libc::c_int,
+}
+
+#[cfg(unix)]
+impl Drop for PtyMaster {
+    fn drop(&mut self) {
+        unsafe {
+            libc::close(self.master);
+            libc::close(self.slave);
+        }
+    }
+}
+
+// Give `cmd` a pty as its controlling terminal, so that one sudo authentication
+// covers every `sudo` call the batch makes. sudo keys its cached credential to
+// the invoking terminal; with no terminal at all it keys by parent process
+// instead, which is why each `brew` invocation used to pop its own dialog.
+//
+// Only the *controlling* terminal is a pty — stdout/stderr stay pipes, so brew
+// still sees a non-tty and its output keeps the exact form we already parse (no
+// spinners, colour codes or CR line endings).
+//
+// The master end is held open but never read: nothing writes to this terminal in
+// normal operation, because every sudo call in a batch routes its prompt to
+// SUDO_ASKPASS — ours pass `-A` explicitly, Homebrew adds it whenever
+// SUDO_ASKPASS is set (system_command.rb), and ASKPASS_PREAMBLE shims `sudo` on
+// PATH so third-party scripts get it too. A `sudo` that still managed to reach
+// this terminal would prompt into it and block, since sudo discards queued input
+// (TCSAFLUSH) and macOS sets no passwd_timeout; that is why the shim exists.
+//
+// Best effort: on any failure the child still runs, just without a controlling
+// terminal — i.e. the previous behaviour of asking per `brew` invocation.
+#[cfg(unix)]
+fn attach_controlling_pty(cmd: &mut Command) -> Option<PtyMaster> {
+    use std::os::unix::process::CommandExt;
+
+    let (master, slave) = unsafe {
+        let mut master: libc::c_int = -1;
+        let mut slave: libc::c_int = -1;
+        let rc = libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        );
+        if rc != 0 {
+            return None;
+        }
+        (master, slave)
+    };
+
+    unsafe {
+        cmd.as_std_mut().pre_exec(move || {
+            // Signal-safe calls only, and deliberately non-fatal: a child without
+            // a controlling terminal still updates correctly.
+            if libc::setsid() != -1 {
+                libc::ioctl(slave, libc::TIOCSCTTY as _, 0);
+            }
+            libc::close(slave);
+            Ok(())
+        });
+    }
+
+    Some(PtyMaster { master, slave })
+}
 
 // Returns collected output lines for logging (including any cask sentinels).
 async fn run_upgrade_shell(app: &AppHandle, section: &str, script: &str) -> Vec<String> {
@@ -537,13 +726,18 @@ async fn run_upgrade_shell(app: &AppHandle, section: &str, script: &str) -> Vec<
 
     let full_script = format!("{}{}", preamble, script);
 
-    let mut child = match Command::new(shell)
-        .arg(flag)
+    let mut cmd = Command::new(shell);
+    cmd.arg(flag)
         .arg(&full_script)
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
+        .stderr(Stdio::piped());
+
+    // Kept alive until the child exits; see attach_controlling_pty.
+    #[cfg(unix)]
+    let _pty = attach_controlling_pty(&mut cmd);
+
+    let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
             emit_upgrade_line(app, section, &format!("Failed to spawn: {e}")).await;
@@ -946,17 +1140,17 @@ async fn run_upgrade_items(app: AppHandle, section: String, items: Vec<String>, 
         }
 
         let mut body = String::new();
-        for (token, name) in &pairs {
-            // Sanitize for the AppleScript dialog (strip quotes/backslashes) and the
-            // single-quoted shell export.
-            let name_esc = name.replace(['\\', '"'], "").replace('\'', "'\\''");
+        for (token, _) in &pairs {
             body.push_str(&format!("echo '{CASK_START}{token}'\n"));
-            body.push_str(&format!("export PM_ASKPASS_APP='{name_esc}'\n"));
             body.push_str(&format!("brew_upgrade_cask '{token}'\n"));
             body.push_str(&format!("echo '{CASK_END}{token}'\n"));
         }
+        // One password covers the whole batch, so the dialog is labelled once for
+        // the batch rather than per cask.
+        let scope = askpass_scope(&pairs.iter().map(|(_, n)| n.clone()).collect::<Vec<_>>());
         let script = format!(
-            "export PATH=\"/opt/homebrew/bin:/usr/local/bin:$PATH\"\nif command -v brew &>/dev/null; then\n{fn_def}\n{body}else\n  echo '✖  brew not found'\nfi",
+            "export PATH=\"/opt/homebrew/bin:/usr/local/bin:$PATH\"\nif command -v brew &>/dev/null; then\nexport PM_ASKPASS_APP='{scope}'\n{fn_def}\n{body}else\n  echo '✖  brew not found'\nfi",
+            scope = scope,
             fn_def = cask_fns(),
             body = body,
         );
@@ -1092,7 +1286,18 @@ async fn check_app_update(current_version: String) -> AppUpdateInfo {
 
 #[tauri::command]
 fn open_release_url(url: String) {
-    if url.starts_with("https://github.com/paymonr/partyman_update_manager") {
+    // Allowlisted so the webview cannot hand this arbitrary URLs to `open`.
+    const ALLOWED: &[&str] = &[
+        "https://github.com/paymonr/partyman_update_manager",
+        "https://github.com/paymonr/kawaii-meadow",
+        "https://github.com/paymonr",
+    ];
+    // Exact match, or the entry followed by a path separator. A bare prefix test
+    // would also accept a look-alike account such as .../paymonr-evil.
+    if ALLOWED
+        .iter()
+        .any(|base| url == *base || url.starts_with(&format!("{base}/")))
+    {
         let _ = std::process::Command::new("open").arg(&url).spawn();
     }
 }
@@ -1111,30 +1316,489 @@ fn get_platform() -> String {
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
+// The tray icon, kept so the update count on it can be refreshed later.
+struct Tray(tauri::tray::TrayIcon);
+
+// Held for the lifetime of the open app so a launchd run knows to stand down.
+struct RunLock(#[allow(dead_code)] std::fs::File);
+
+fn app_icon() -> Result<tauri::image::Image<'static>, Box<dyn std::error::Error>> {
+    let png = include_bytes!("../icons/128x128@2x.png");
+    let img = image::load_from_memory(png)?;
+    let (w, h) = img.dimensions();
+    Ok(tauri::image::Image::new_owned(img.to_rgba8().into_raw(), w, h))
+}
+
+// Removes the logo's dark backing plate, leaving the orange ring and white arrow
+// on transparency so the menu bar shows through.
+//
+// A plain colour-key would leave a dark halo, because the pixels along each edge
+// are a blend of the plate and the mark. Instead each pixel is un-composited: how
+// far it has travelled from the plate colour towards the nearer of the two mark
+// colours becomes its alpha, and it takes that mark colour outright. Edges stay
+// smooth with no fringe.
+fn drop_icon_plate(img: &mut image::RgbaImage) {
+    const PLATE: [f32; 3] = [30.0, 39.0, 51.0]; // #1e2733
+    const MARKS: [[f32; 3]; 2] = [
+        [245.0, 128.0, 38.0], // #f58026, the ring
+        [255.0, 255.0, 255.0], // the arrow
+    ];
+
+    let dist = |a: [f32; 3], b: [f32; 3]| {
+        ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt()
+    };
+
+    for px in img.pixels_mut() {
+        if px.0[3] == 0 {
+            continue;
+        }
+        let c = [px.0[0] as f32, px.0[1] as f32, px.0[2] as f32];
+        let mark = MARKS
+            .iter()
+            .min_by(|a, b| dist(c, **a).total_cmp(&dist(c, **b)))
+            .copied()
+            .unwrap_or(MARKS[1]);
+
+        let span = dist(mark, PLATE);
+        let coverage = if span > 0.0 {
+            (dist(c, PLATE) / span).clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+
+        px.0[0] = mark[0] as u8;
+        px.0[1] = mark[1] as u8;
+        px.0[2] = mark[2] as u8;
+        px.0[3] = (px.0[3] as f32 * coverage) as u8;
+    }
+}
+
+// The menu-bar icon: the app's own logo, with the outstanding count in a badge
+// over its top-right corner.
+//
+// It is deliberately *not* a template image. macOS treats a template as a mask —
+// colour discarded, shape tinted to match the menu bar — which would flatten the
+// logo and take the badge with it. Drawn in colour, both survive.
+//
+// Everything is composed at 4x and scaled down at the end, so the badge circle
+// and the digits come out smooth rather than stepped.
+fn tray_icon(count: usize) -> tauri::image::Image<'static> {
+    use ab_glyph::{Font, FontRef, ScaleFont};
+
+    const SIZE: u32 = 44; // 22pt at 2x, the standard menu-bar height
+    const SS: u32 = 4;
+    let big = SIZE * SS;
+
+    let logo = image::load_from_memory(include_bytes!("../icons/128x128@2x.png"))
+        .map(|img| {
+            let mut rgba = img.to_rgba8();
+            drop_icon_plate(&mut rgba);
+            image::imageops::resize(&rgba, big, big, image::imageops::FilterType::Lanczos3)
+        })
+        .unwrap_or_else(|_| image::RgbaImage::new(big, big));
+    let mut canvas = logo;
+
+    if count == 0 {
+        let scaled = image::imageops::resize(&canvas, SIZE, SIZE, image::imageops::FilterType::Lanczos3);
+        return tauri::image::Image::new_owned(scaled.into_raw(), SIZE, SIZE);
+    }
+
+    // Three digits is the most that stays legible at 22pt; beyond that it is a
+    // "lots" indicator rather than a number anyone reads.
+    let label = if count > 99 { "99+".to_string() } else { count.to_string() };
+
+    // Badge geometry in 44x44 space. The circle grows only slightly with longer
+    // labels — past about half the icon's width it stops reading as a badge and
+    // starts hiding the logo — so the digits shrink to fit instead.
+    let (r, text_scale) = match label.chars().count() {
+        1 => (8.5_f32, 1.30_f32),
+        2 => (10.0, 1.05),
+        _ => (11.0, 0.78),
+    };
+    let cx = 44.0 - r - 1.0;
+    let cy = r + 1.0;
+
+    let (bx, by, br) = (cx * SS as f32, cy * SS as f32, r * SS as f32);
+    for y in 0..big {
+        for x in 0..big {
+            let dx = x as f32 + 0.5 - bx;
+            let dy = y as f32 + 0.5 - by;
+            let d = (dx * dx + dy * dy).sqrt();
+            if d <= br {
+                // A ring of the menu-bar background lifts the badge off the logo.
+                let px = if d > br - 1.6 * SS as f32 {
+                    image::Rgba([255, 255, 255, 255])
+                } else {
+                    image::Rgba([228, 48, 48, 255])
+                };
+                canvas.put_pixel(x, y, px);
+            }
+        }
+    }
+
+    if let Ok(font) = FontRef::try_from_slice(include_bytes!("../assets/Nunito.ttf")) {
+        let scaled = font.as_scaled(r * text_scale * SS as f32);
+
+        let glyphs: Vec<_> = label
+            .chars()
+            .map(|c| scaled.scaled_glyph(c))
+            .collect();
+        let width: f32 = label.chars().map(|c| scaled.h_advance(font.glyph_id(c))).sum();
+
+        let mut pen_x = bx - width / 2.0;
+        // Centre on the digits' own height rather than the line box, or they sit low.
+        let baseline = by + scaled.ascent() * 0.36;
+
+        for mut glyph in glyphs {
+            glyph.position = ab_glyph::point(pen_x, baseline);
+            pen_x += scaled.h_advance(glyph.id);
+            if let Some(outlined) = font.outline_glyph(glyph) {
+                let bounds = outlined.px_bounds();
+                outlined.draw(|gx, gy, coverage| {
+                    let px = bounds.min.x as i32 + gx as i32;
+                    let py = bounds.min.y as i32 + gy as i32;
+                    if px < 0 || py < 0 || px >= big as i32 || py >= big as i32 {
+                        return;
+                    }
+                    let dst = canvas.get_pixel_mut(px as u32, py as u32);
+                    let a = coverage.clamp(0.0, 1.0);
+                    for i in 0..3 {
+                        dst.0[i] = (dst.0[i] as f32 * (1.0 - a) + 255.0 * a) as u8;
+                    }
+                    dst.0[3] = dst.0[3].max((a * 255.0) as u8);
+                });
+            }
+        }
+    }
+
+    let scaled = image::imageops::resize(&canvas, SIZE, SIZE, image::imageops::FilterType::Lanczos3);
+    tauri::image::Image::new_owned(scaled.into_raw(), SIZE, SIZE)
+}
+
+#[tauri::command]
+fn next_run(app: AppHandle) -> i64 {
+    let cfg = schedule::load(&app);
+    if !cfg.enabled {
+        return 0;
+    }
+    let from = if cfg.last_run == 0 { schedule::now_secs() } else { cfg.last_run };
+    schedule::next_run_after(from as i64, &cfg)
+}
+
+#[tauri::command]
+fn get_last_check(app: AppHandle) -> schedule::LastCheck {
+    schedule::load_last_check(&app)
+}
+
+// Redraws the icon with the count baked into its badge. Cheap enough to do on
+// every change: it is a 176x176 compose and downscale.
+fn set_tray_count(app: &AppHandle, total: usize) {
+    if let Some(tray) = app.try_state::<Tray>() {
+        let _ = tray.0.set_icon(Some(tray_icon(total)));
+        let tip = match total {
+            0 => "PM Updater — up to date".to_string(),
+            1 => "PM Updater — 1 update available".to_string(),
+            n => format!("PM Updater — {n} updates available"),
+        };
+        let _ = tray.0.set_tooltip(Some(tip));
+    }
+}
+
+fn show_main_window(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
+}
+
+#[tauri::command]
+fn get_schedule(app: AppHandle) -> schedule::ScheduleConfig {
+    schedule::load(&app)
+}
+
+// The window only owns the user's preferences; the run history belongs to
+// whichever run last completed, so it is preserved rather than round-tripped.
+#[tauri::command]
+fn set_schedule(app: AppHandle, config: schedule::ScheduleConfig) -> Result<schedule::ScheduleConfig, String> {
+    let previous = schedule::load(&app);
+    let cfg = schedule::ScheduleConfig {
+        last_run: previous.last_run,
+        last_total: previous.last_total,
+        last_counts: previous.last_counts,
+        snoozed_until: previous.snoozed_until,
+        ..config
+    };
+    let mut cfg = cfg;
+    cfg.last_total = schedule::total_from_counts(&cfg.last_counts, cfg.count_dev_updates);
+    schedule::save(&app, &cfg)?;
+    schedule::sync_agent(&cfg)?;
+    set_tray_count(&app, cfg.last_total);
+    Ok(cfg)
+}
+
+// Re-checks one section, normally straight after installing its updates, so the
+// menu-bar count matches what is really installed.
+#[tauri::command]
+async fn recount_section(app: AppHandle, section: String) -> schedule::ScheduleConfig {
+    let cfg = schedule::recount(&app, &section).await;
+    set_tray_count(&app, cfg.last_total);
+    let _ = app.emit("schedule-updated", cfg.clone());
+    cfg
+}
+
+// Postpones the reminder without touching the count, so the menu bar stays honest
+// about what is outstanding.
+#[tauri::command]
+fn snooze_updates(app: AppHandle, hours: u64) -> Result<schedule::ScheduleConfig, String> {
+    let cfg = schedule::snooze(&app, hours)?;
+    let _ = app.emit("schedule-updated", cfg.clone());
+    Ok(cfg)
+}
+
+#[tauri::command]
+async fn run_schedule_now(app: AppHandle) -> schedule::ScheduleConfig {
+    let cfg = schedule::run_scheduled(&app).await;
+    set_tray_count(&app, cfg.last_total);
+    schedule::notify_result(&app, &cfg);
+    let _ = app.emit("schedule-updated", cfg.clone());
+    cfg
+}
+
 pub fn run() {
+    let headless = std::env::args().any(|a| a == schedule::SCHEDULED_RUN_FLAG);
+
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             None,
         ))
-        .setup(|app| {
-            if let Some(window) = app.get_webview_window("main") {
-                let png = include_bytes!("../icons/128x128@2x.png");
-                let img = image::load_from_memory(png)?;
-                let (w, h) = img.dimensions();
-                let icon = tauri::image::Image::new_owned(img.to_rgba8().into_raw(), w, h);
-                let _ = window.set_icon(icon);
+        .setup(move |app| {
+            let handle = app.handle().clone();
+
+            // Launched by launchd: no window, no Dock icon — check, report, quit.
+            if headless {
+                #[cfg(target_os = "macos")]
+                let _ = handle.set_activation_policy(tauri::ActivationPolicy::Accessory);
+
+                tauri::async_runtime::spawn(async move {
+                    // The open app holds this lock, and it does its own checking on
+                    // a timer, so there is nothing for this run to do.
+                    let _lock = match schedule::try_acquire_run_lock(&handle) {
+                        Some(lock) => lock,
+                        None => {
+                            handle.exit(0);
+                            return;
+                        }
+                    };
+                    let cfg = schedule::run_scheduled(&handle).await;
+                    schedule::notify_result(&handle, &cfg);
+                    // Delivery is handed to the system asynchronously, so quitting
+                    // the instant after posting can lose the notification.
+                    tokio::time::sleep(std::time::Duration::from_millis(750)).await;
+                    handle.exit(0);
+                });
+                return Ok(());
             }
+
+            if let Some(window) = app.get_webview_window("main") {
+                if let Ok(icon) = app_icon() {
+                    let _ = window.set_icon(icon);
+                }
+                let _ = window.show();
+            }
+
+            // Closing the window leaves the app in the menu bar so the schedule
+            // keeps running; Quit in the tray menu is what actually exits.
+            if let Some(window) = app.get_webview_window("main") {
+                let hide_handle = app.handle().clone();
+                window.on_window_event(move |event| {
+                    if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                        api.prevent_close();
+                        if let Some(w) = hide_handle.get_webview_window("main") {
+                            let _ = w.hide();
+                        }
+                    }
+                });
+            }
+
+            let open = tauri::menu::MenuItem::with_id(app, "open", "Open PM Updater", true, None::<&str>)?;
+            let check = tauri::menu::MenuItem::with_id(app, "check", "Check Now", true, None::<&str>)?;
+            let quit = tauri::menu::MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
+            let menu = tauri::menu::Menu::with_items(app, &[&open, &check, &quit])?;
+
+            let mut tray = tauri::tray::TrayIconBuilder::new()
+                .menu(&menu)
+                .show_menu_on_left_click(true)
+                .on_menu_event(|app, event| match event.id.as_ref() {
+                    "open" => show_main_window(app),
+                    "check" => {
+                        let handle = app.clone();
+                        tauri::async_runtime::spawn(async move {
+                            let cfg = schedule::run_scheduled(&handle).await;
+                            set_tray_count(&handle, cfg.last_total);
+                            schedule::notify_result(&handle, &cfg);
+                            let _ = handle.emit("schedule-updated", cfg);
+                        });
+                    }
+                    "quit" => app.exit(0),
+                    _ => {}
+                });
+            // Not a template: a template icon would discard the logo's colour and
+            // the badge along with it.
+            tray = tray.icon(tray_icon(0)).icon_as_template(false);
+            let tray = tray.build(app)?;
+            app.manage(Tray(tray));
+
+            // Whatever the last run found, so the count is right straight away.
+            // Recomputed rather than trusted: a total stored before the counting
+            // rule changed would otherwise sit in the menu bar until the next run.
+            let mut startup_cfg = schedule::load(&handle);
+            startup_cfg.last_total = schedule::total_from_counts(
+                &startup_cfg.last_counts,
+                startup_cfg.count_dev_updates,
+            );
+            let _ = schedule::save(&handle, &startup_cfg);
+            set_tray_count(&handle, startup_cfg.last_total);
+
+            if let Err(e) = schedule::ensure_agent_current(&startup_cfg) {
+                eprintln!("could not refresh the background schedule agent: {e}");
+            }
+
+            if let Some(lock) = schedule::try_acquire_run_lock(&handle) {
+                app.manage(RunLock(lock));
+            }
+
+            if startup_cfg.check_on_launch {
+                let launch_handle = handle.clone();
+                tauri::async_runtime::spawn(async move {
+                    let cfg = schedule::run_scheduled(&launch_handle).await;
+                    set_tray_count(&launch_handle, cfg.last_total);
+                    schedule::notify_result(&launch_handle, &cfg);
+                    let _ = launch_handle.emit("schedule-updated", cfg);
+                });
+            }
+
+            // While the app is open it does the scheduled runs itself.
+            let timer_handle = handle.clone();
+            tauri::async_runtime::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    let cfg = schedule::load(&timer_handle);
+                    if !cfg.enabled {
+                        continue;
+                    }
+                    if !schedule::is_due(&cfg) {
+                        continue;
+                    }
+                    let cfg = schedule::run_scheduled(&timer_handle).await;
+                    set_tray_count(&timer_handle, cfg.last_total);
+                    schedule::notify_result(&timer_handle, &cfg);
+                    let _ = timer_handle.emit("schedule-updated", cfg);
+                }
+            });
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             run_check, run_upgrade, run_upgrade_items, get_platform,
             get_upgrade_history, search_cask, track_app, track_apps,
-            check_app_update, open_release_url
+            check_app_update, open_release_url,
+            get_schedule, set_schedule, run_schedule_now, snooze_updates, get_last_check, recount_section, next_run
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    fn ctty_of(pid: String) -> String {
+        let out = std::process::Command::new("ps")
+            .args(["-o", "tty=", "-p", &pid])
+            .output()
+            .expect("ps");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn field(text: &str, key: &str) -> String {
+        text.lines()
+            .find_map(|l| l.strip_prefix(key))
+            .unwrap_or_else(|| panic!("missing {key} in:\n{text}"))
+            .trim()
+            .to_string()
+    }
+
+    // Writes the menu-bar glyph out so it can be looked at; a mask that reads as a
+    // smudge at 22pt is the whole problem being solved here.
+    #[test]
+    #[ignore = "writes a preview image for eyeballing"]
+    fn dump_tray_icon() {
+        for count in [0usize, 3, 20, 148] {
+            let icon = tray_icon(count);
+            let img = image::RgbaImage::from_raw(icon.width(), icon.height(), icon.rgba().to_vec())
+                .expect("icon buffer");
+            let big = image::imageops::resize(&img, 176, 176, image::imageops::FilterType::Nearest);
+            big.save(format!("/private/tmp/claude-503/-Users-paymon-src-partyman-update-manager/a94671f6-9cb0-4eb7-ab04-937d132c5b29/scratchpad/tray-{count}.png"))
+                .expect("save");
+        }
+        let icon = tray_icon(20);
+        let img = image::RgbaImage::from_raw(icon.width(), icon.height(), icon.rgba().to_vec())
+            .expect("icon buffer");
+        // scale up so the shape is legible in a preview
+        let big = image::imageops::resize(&img, 176, 176, image::imageops::FilterType::Nearest);
+        big.save("/private/tmp/claude-503/-Users-paymon-src-partyman-update-manager/a94671f6-9cb0-4eb7-ab04-937d132c5b29/scratchpad/tray.png")
+            .expect("save");
+    }
+
+    // The batch shell needs a controlling terminal so that a single sudo
+    // authentication covers every sudo call in the run, while stdout/stderr must
+    // stay pipes so Homebrew's output keeps the plain form the line parser and
+    // cask sentinel splitting expect.
+    #[tokio::test]
+    async fn attaches_controlling_pty_but_leaves_stdio_piped() {
+        let script = r#"
+[ -t 1 ] && echo "STDOUT_TTY=yes" || echo "STDOUT_TTY=no"
+[ -t 2 ] && echo "STDERR_TTY=yes" || echo "STDERR_TTY=no"
+echo "CTTY=$(ps -o tty= -p $$ | tr -d ' ')"
+echo "DESCENDANT_CTTY=$(bash -c 'bash -c "ps -o tty= -p \$\$"' | tr -d ' ')"
+"#;
+        let mut cmd = Command::new("bash");
+        cmd.arg("-c")
+            .arg(script)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let pty = attach_controlling_pty(&mut cmd);
+        assert!(pty.is_some(), "openpty failed");
+
+        let out = cmd.output().await.expect("spawn");
+        let text = String::from_utf8_lossy(&out.stdout).to_string();
+
+        // Homebrew must not see a terminal: a tty turns on spinners, colour and
+        // CR line endings, none of which the output parser tolerates.
+        assert_eq!(field(&text, "STDOUT_TTY="), "no", "stdout leaked a tty:\n{text}");
+        assert_eq!(field(&text, "STDERR_TTY="), "no", "stderr leaked a tty:\n{text}");
+        assert!(!text.contains('\r'), "CR line endings appeared:\n{text}");
+
+        // sudo keys its cached credential to this terminal, and every descendant
+        // must share it for one authentication to cover the whole batch.
+        let ctty = field(&text, "CTTY=");
+        assert!(ctty != "??" && !ctty.is_empty(), "no controlling terminal: {ctty:?}");
+        assert_eq!(
+            ctty,
+            field(&text, "DESCENDANT_CTTY="),
+            "descendants must share the terminal:\n{text}"
+        );
+
+        // It must be the pty we allocated, not one inherited from our own process.
+        let ours = ctty_of(std::process::id().to_string());
+        assert_ne!(ctty, ours, "child reused the parent's terminal");
+    }
 }

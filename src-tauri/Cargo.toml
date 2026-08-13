@@ -1,6 +1,6 @@
 [package]
 name = "partyman-update-manager"
-version = "0.2.0"
+version = "1.0.0"
 edition = "2021"
 
 [lib]
@@ -11,7 +11,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
 tauri-plugin-shell = "2"
 tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
@@ -20,6 +20,14 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 image = { version = "0.25", default-features = false, features = ["png"] }
 tokio = { version = "1", features = ["process", "io-util", "macros", "rt"] }
+tauri-plugin-notification = "2.3.3"
+ab_glyph = "0.2.32"
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
+
+# Used to attach a controlling terminal to the upgrade shell so that sudo can
+# cache one authentication for a whole batch — see run_upgrade_shell.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [profile.release]
 panic = "abort"
