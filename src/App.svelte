@@ -29,6 +29,8 @@
   interface CaskCandidate {
     token: string;
     name: string;
+    /** Confirmed to install this exact app, rather than merely a similar name. */
+    exact: boolean;
   }
 
   interface CaskSearchState {
@@ -134,6 +136,29 @@
   let historySearch = "";
   let expandedHistoryEntry: number | null = null;
   let caskSearch: Record<string, CaskSearchState> = {};
+
+  const HIDDEN_APPS_KEY = "hiddenUntrackedApps";
+  let hiddenApps: string[] = [];
+
+  function loadHiddenApps() {
+    try {
+      hiddenApps = JSON.parse(localStorage.getItem(HIDDEN_APPS_KEY) ?? "[]");
+    } catch {
+      hiddenApps = [];
+    }
+  }
+
+  function hideApp(name: string) {
+    if (!hiddenApps.includes(name)) hiddenApps = [...hiddenApps, name];
+    localStorage.setItem(HIDDEN_APPS_KEY, JSON.stringify(hiddenApps));
+  }
+
+  function unhideAll() {
+    hiddenApps = [];
+    localStorage.setItem(HIDDEN_APPS_KEY, "[]");
+  }
+
+
   let showMenu = false;
   let showSettings = false;
   let showAbout = false;
@@ -494,6 +519,7 @@
 
     await checkWhatsNew();
 
+    loadHiddenApps();
     loadLastChecked();
     await loadSchedule();
     await hydrateLastCheck();
@@ -541,7 +567,7 @@
 
     await listen<{ section: string; line: string }>("upgrade-output", ({ payload }) => {
       if (itemSections.has(payload.section)) {
-        upgradeLogs[payload.section] = [...upgradeLogs[payload.section], payload.line];
+        upgradeLogs[payload.section] = appendLine(upgradeLogs[payload.section], payload.line);
         upgradeLogs = upgradeLogs;
       } else {
         outputs[payload.section] = [...outputs[payload.section], payload.line];
@@ -596,14 +622,31 @@
   }
 
   async function trackAllApps() {
+    // Only casks confirmed to install this exact app. brew search matches on name
+    // similarity, so an app with no cask at all still returns something — FileZilla
+    // returns "filefillet", Google Docs returns "google-trends" — and adopting the
+    // first result would install unrelated software. Anything unconfirmed is left
+    // for the user to choose deliberately.
     const items = activeParsedItems
-      .filter(it => caskSearch[it.id]?.status === "found" && (caskSearch[it.id].candidates?.length ?? 0) > 0)
-      .map(it => ({
-        token: caskSearch[it.id].candidates[0].token,
+      .map(it => ({ it, match: caskSearch[it.id]?.candidates?.find(c => c.exact) }))
+      .filter(({ it, match }) => caskSearch[it.id]?.status === "found" && !!match)
+      .map(({ it, match }) => ({
+        token: match!.token,
         name: it.name,
         appdir: it.appDir ?? null,
       }));
-    if (items.length === 0) return;
+    if (items.length === 0) {
+      upgradeLogs["untracked_apps"] = [
+        "→  Nothing to enable: none of these apps has a Homebrew cask that installs it.",
+        "→  Use Find on an individual app if you know which cask it belongs to.",
+      ];
+      upgradeLogs = upgradeLogs;
+      viewMode["untracked_apps"] = "upgrade";
+      viewMode = viewMode;
+      upgradeStatuses["untracked_apps"] = "done";
+      upgradeStatuses = upgradeStatuses;
+      return;
+    }
     upgradeLogs["untracked_apps"] = [];
     upgradeLogs = upgradeLogs;
     viewMode["untracked_apps"] = "upgrade";
@@ -655,6 +698,18 @@
       await runSection(s.id);
     }
     runningAll = false;
+  }
+
+  // Progress ticks replace one another instead of stacking up, so a large
+  // download is a single line that counts upwards rather than forty lines.
+  const PROGRESS_PREFIX = "⬇";
+
+  function appendLine(existing: string[], line: string): string[] {
+    const last = existing[existing.length - 1];
+    if (line.startsWith(PROGRESS_PREFIX) && last?.startsWith(PROGRESS_PREFIX)) {
+      return [...existing.slice(0, -1), line];
+    }
+    return [...existing, line];
   }
 
   async function runUpgrade(id: string) {
@@ -876,8 +931,27 @@
     /not recommended and will be removed/,
   ];
 
+  // Homebrew's untrusted-tap warning is a long block that it rewords between
+  // releases, so matching it line by line keeps going stale — it grew back to
+  // roughly two thirds of the output. Skip from the warning until Homebrew
+  // starts saying something else instead.
+  function dropTapTrustBlock(lines: string[]): string[] {
+    const out: string[] = [];
+    let skipping = false;
+    for (const l of lines) {
+      if (/taps are not trusted/i.test(l)) { skipping = true; continue; }
+      if (skipping) {
+        // Anything that opens a new step, or a real result, ends the block.
+        if (/^\s*(==>|🍺|✖|→|⚠|Error:)/.test(l) && !/tap/i.test(l)) skipping = false;
+        else continue;
+      }
+      out.push(l);
+    }
+    return out;
+  }
+
   function simplifyUntrackedLog(lines: string[]): string[] {
-    return lines
+    return dropTapTrustBlock(lines)
       .filter(l => !skipPatterns.some(p => p.test(l)))
       .map((l): string | null => {
         if (/^==> Fetching downloads for:/.test(l))
@@ -1022,6 +1096,12 @@
         <button class="page-close" onclick={() => { showSchedule = false; }}>✕</button>
       </div>
       <div class="settings-body">
+        <p class="section-note">
+          PartyMAN can check for updates on its own, and keeps doing so after you quit —
+          a background job runs on the schedule below. It only ever <strong>checks</strong>;
+          installing is always something you start, so nothing is changed without you.
+          Found updates appear in the menu bar and, if you like, as a notification.
+        </p>
         {#if scheduleError}
           <div class="schedule-error">{scheduleError}</div>
         {/if}
@@ -1165,6 +1245,11 @@
         <button class="page-close" onclick={() => { showSettings = false; }}>✕</button>
       </div>
       <div class="settings-body">
+        <p class="section-note">
+          Appearance and start-up behaviour. <strong>Start on login</strong> keeps the
+          menu-bar icon available so scheduled checks can report what they find, and the
+          theme applies immediately.
+        </p>
         <div class="settings-section">
           <h3 class="settings-section-title">General</h3>
           <div class="settings-row">
@@ -1298,6 +1383,13 @@
     </div>
   {:else}
 
+  <p class="section-note">
+    Each tab is one place software comes from. <strong>Run Check</strong> asks what is out
+    of date; nothing is installed until you choose to. Select what you want and use
+    <strong>Update Selected</strong> — you'll be asked for your administrator password once
+    per run, and only if it's needed.
+  </p>
+
   <div class="tab-bar">
     {#each tabItems as item (item.id)}
       {#if item.id === "dev"}
@@ -1411,16 +1503,29 @@
       {#if showSelectView}
         <div class="items-list">
           {#if activeSectionId === "untracked_apps"}
+            {@const shown = activeParsedItems.filter(i => !hiddenApps.includes(i.name)).length}
+            <p class="section-note">
+              Nothing updates these automatically — they aren't managed by Homebrew,
+              the App Store or Apple. PartyMAN can hand one to Homebrew when a cask
+              genuinely matches it. Many have no cask at all: company-managed tools,
+              helper apps, or software Homebrew doesn't carry. Mark those
+              <strong>No cask available</strong> to clear them from the list.
+            </p>
             <div class="items-bar">
-              <span class="items-count">{activeParsedItems.length} app{activeParsedItems.length === 1 ? "" : "s"} found</span>
+              <span class="items-count">{shown} app{shown === 1 ? "" : "s"} found</span>
               <button class="items-sel-btn" onclick={findAllCasks}>Check All</button>
+              {#if hiddenApps.length > 0}
+                <button class="items-sel-btn" onclick={unhideAll}>
+                  Show {hiddenApps.length} hidden
+                </button>
+              {/if}
               {#if activeFoundCount > 0}
                 <button class="items-sel-btn" onclick={trackAllApps} disabled={activeUpgradeStatus === "running"}>
                   {activeUpgradeStatus === "running" ? "Enabling…" : `Enable All (${activeFoundCount})`}
                 </button>
               {/if}
             </div>
-            {#each activeParsedItems as item}
+            {#each activeParsedItems.filter(i => !hiddenApps.includes(i.name)) as item}
               <div class="item-row untracked-row">
                 <span class="item-name">{item.name}</span>
                 <div class="cask-search-state">
@@ -1431,12 +1536,24 @@
                   {:else if caskSearch[item.id].status === "none"}
                     <span class="cask-status-text cask-none">Can't be auto-updated</span>
                   {:else if caskSearch[item.id].status === "found"}
-                    <span class="cask-match">✓ Match found</span>
-                    <button
-                      class="track-btn"
-                      onclick={() => trackApp(caskSearch[item.id].candidates[0].token, item.appDir)}
-                      disabled={activeUpgradeStatus === "running"}
-                    >Enable Auto-Updates</button>
+                    {@const confirmed = caskSearch[item.id].candidates.find(c => c.exact)}
+                    {#if confirmed}
+                      <span class="cask-match">✓ {confirmed.token}</span>
+                      <button
+                        class="track-btn"
+                        onclick={() => trackApp(confirmed.token, item.appDir)}
+                        disabled={activeUpgradeStatus === "running"}
+                      >Enable Auto-Updates</button>
+                    {:else}
+                      <!-- Nothing is confirmed to install this app. Offering
+                           guesses is what installed unrelated software before,
+                           so the only option here is to say so and move on.
+                           Choosing a cask by hand is a future TODO. -->
+                      <span class="cask-status-text cask-unsure">No cask found</span>
+                      <button class="cask-link-btn" onclick={() => hideApp(item.name)}>
+                        No cask available
+                      </button>
+                    {/if}
                   {/if}
                 </div>
               </div>
@@ -2324,6 +2441,56 @@
     color: var(--pm-label);
     font-style: italic;
   }
+  .cask-unsure { opacity: 0.85; }
+
+  .cask-input {
+    font: inherit;
+    font-size: 11.5px;
+    padding: 4px 8px;
+    min-width: 15rem;
+    border-radius: var(--pm-radius-sm);
+    border: 1px solid var(--pm-border-strong);
+    background: var(--pm-card);
+    color: var(--pm-text);
+  }
+
+  .cask-input.bad { border-color: var(--pm-err); }
+
+  .items-hint {
+    font-size: 11.5px;
+    color: var(--pm-muted);
+    text-decoration: underline dotted;
+    cursor: help;
+  }
+
+  .section-note {
+    font-size: 11.5px;
+    line-height: 1.55;
+    color: var(--pm-muted);
+    padding: 0.5rem 0.75rem;
+    margin: 0 0 0.5rem;
+    border-left: 2px solid var(--pm-border-strong);
+    background: var(--pm-surface-2);
+    border-radius: 0 var(--pm-radius-sm) var(--pm-radius-sm) 0;
+  }
+
+  .section-note strong { color: var(--pm-text-2); }
+
+  .cask-link-btn {
+    font: inherit;
+    font-size: 11.5px;
+    padding: 3px 8px;
+    border-radius: var(--pm-radius-sm);
+    border: 1px solid transparent;
+    background: none;
+    color: var(--pm-muted);
+    cursor: pointer;
+    white-space: nowrap;
+  }
+
+  .cask-link-btn:hover { color: var(--pm-text); border-color: var(--pm-border-strong); }
+  .cask-picker { max-width: 13rem; }
+
   .cask-none { color: var(--pm-cask-none); }
 
   .cask-match {

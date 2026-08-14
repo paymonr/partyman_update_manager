@@ -25,6 +25,129 @@ struct StatusPayload {
 struct CaskCandidate {
     token: String,
     name: String,
+    /// True only when the cask declares an app artifact matching the app on disk.
+    /// Bulk adoption uses these alone: `brew search` matches on name similarity,
+    /// and for an app with no cask it happily returns something unrelated —
+    /// FileZilla yields "filefillet", Google Docs yields "google-trends" — which
+    /// adopting blind would install over the top of nothing the user asked for.
+    exact: bool,
+}
+
+/// The app's own identity, read from its bundle. Names change and resemble each
+/// other; a bundle identifier does neither.
+async fn app_bundle_id(app_name: &str) -> Option<String> {
+    for base in ["/Applications", "$HOME/Applications"] {
+        let script = format!(
+            r#"/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "{base}/{app_name}.app/Contents/Info.plist" 2>/dev/null"#
+        );
+        if let Ok(out) = Command::new("bash").arg("-c").arg(&script).output().await {
+            let id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !id.is_empty() {
+                return Some(id);
+            }
+        }
+    }
+    None
+}
+
+/// Every string anywhere in a cask's artifacts — where the uninstall stanzas name
+/// the bundle identifiers a cask is responsible for.
+fn artifact_strings(value: &serde_json::Value, out: &mut Vec<String>) {
+    match value {
+        serde_json::Value::String(s) => out.push(s.clone()),
+        serde_json::Value::Array(a) => a.iter().for_each(|v| artifact_strings(v, out)),
+        serde_json::Value::Object(o) => o.values().for_each(|v| artifact_strings(v, out)),
+        _ => {}
+    }
+}
+
+fn cask_norm(s: &str) -> String {
+    s.to_lowercase()
+        .trim_end_matches(".app")
+        .chars()
+        .filter(|c| c.is_alphanumeric())
+        .collect()
+}
+
+/// Decides which candidates genuinely correspond to this app.
+///
+/// Three signals, any one of which is convincing:
+///   * the cask declares an app artifact with this app's name — the strongest,
+///     but pkg-based casks (Parsec, Zoom, the Microsoft apps) declare none;
+///   * the cask token is exactly this app's name normalised;
+///   * the cask's own display name is exactly this app's name normalised.
+///
+/// Anything else is left unconfirmed. Under-matching costs the user a manual
+/// choice; over-matching installs software they never asked for.
+async fn verify_cask_apps(app_name: &str, tokens: &[String]) -> std::collections::HashSet<String> {
+    let mut verified = std::collections::HashSet::new();
+    if tokens.is_empty() {
+        return verified;
+    }
+    let safe: Vec<String> = tokens
+        .iter()
+        .filter(|t| t.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '@' || c == '.'))
+        .cloned()
+        .collect();
+    if safe.is_empty() {
+        return verified;
+    }
+
+    let script = format!(
+        r#"export PATH="/usr/local/bin:/opt/homebrew/bin:$PATH"; brew info --cask --json=v2 {} 2>/dev/null"#,
+        safe.iter().map(|t| format!("'{t}'")).collect::<Vec<_>>().join(" ")
+    );
+    let out = match Command::new("bash").arg("-c").arg(&script).output().await {
+        Ok(o) if o.status.success() => o,
+        _ => return verified,
+    };
+    let json: serde_json::Value = match serde_json::from_slice(&out.stdout) {
+        Ok(j) => j,
+        Err(_) => return verified,
+    };
+
+    let wanted = cask_norm(app_name);
+    let bundle_id = app_bundle_id(app_name).await;
+    let app_file = format!("{app_name}.app");
+
+    for cask in json["casks"].as_array().unwrap_or(&vec![]) {
+        let token = match cask["token"].as_str() {
+            Some(t) => t.to_string(),
+            None => continue,
+        };
+
+        let artifact_match = cask["artifacts"].as_array().map_or(false, |arts| {
+            arts.iter().any(|a| {
+                a["app"].as_array().map_or(false, |apps| {
+                    apps.iter()
+                        .filter_map(|v| v.as_str())
+                        .any(|name| cask_norm(name) == wanted)
+                })
+            })
+        });
+
+        let name_match = cask["name"].as_array().map_or(false, |names| {
+            names.iter()
+                .filter_map(|v| v.as_str())
+                .any(|n| cask_norm(n) == wanted)
+        });
+
+        // The strongest signal by far: the cask's uninstall stanzas name the very
+        // bundle identifier this app carries, or point at its exact path. This is
+        // what connects zoom.us.app to the "zoom" cask, which no amount of name
+        // comparison can — they share no spelling at all.
+        let mut strings = Vec::new();
+        artifact_strings(&cask["artifacts"], &mut strings);
+        let identity_match = bundle_id.as_ref().is_some_and(|id| strings.iter().any(|v| v == id))
+            || strings
+                .iter()
+                .any(|v| v == &app_file || v.ends_with(&format!("/{app_file}")));
+
+        if identity_match || artifact_match || cask_norm(&token) == wanted || name_match {
+            verified.insert(token);
+        }
+    }
+    verified
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -102,10 +225,56 @@ fn protected_bundle_fn() -> &'static str {
 "#
 }
 
+// Live download progress.
+//
+// Homebrew only draws a progress bar when it is talking to a terminal, and we
+// deliberately hand it a pipe so its output stays free of cursor codes and
+// carriage returns. That leaves a multi-hundred-megabyte download looking like a
+// frozen app. Instead of giving brew a terminal back, watch what it is actually
+// doing: it writes to a `.incomplete` file in its download cache, so the size of
+// that file is the real progress.
+fn download_progress_fn() -> &'static str {
+    r#"PM_CACHE_DIR="$(brew --cache 2>/dev/null)/downloads"
+
+pm_progress_start() {
+  (
+    _pm_last=0
+    while :; do
+      _pm_f=$(ls -t "$PM_CACHE_DIR"/*.incomplete 2>/dev/null | head -1)
+      if [ -n "$_pm_f" ]; then
+        _pm_sz=$(stat -f %z "$_pm_f" 2>/dev/null || echo 0)
+        # Only speak up every few megabytes, or a big download becomes a wall of
+        # near-identical lines.
+        if [ "$_pm_sz" -gt 0 ] && [ $(( _pm_sz - _pm_last )) -gt 4194304 ]; then
+          printf '⬇  Downloading… %d MB\n' $(( _pm_sz / 1048576 ))
+          _pm_last=$_pm_sz
+        fi
+      else
+        _pm_last=0
+      fi
+      sleep 2
+    done
+  ) &
+  PM_PROGRESS_PID=$!
+  disown "$PM_PROGRESS_PID" 2>/dev/null
+}
+
+pm_progress_stop() {
+  [ -n "$PM_PROGRESS_PID" ] && kill "$PM_PROGRESS_PID" 2>/dev/null
+  PM_PROGRESS_PID=""
+}
+"#
+}
+
 // The cask helper bundle: the protected-bundle recovery followed by the
 // single-cask upgrade function that depends on it.
 fn cask_fns() -> String {
-    format!("{}\n{}", protected_bundle_fn(), brew_cask_upgrade_fn())
+    format!(
+        "{}\n{}\n{}",
+        protected_bundle_fn(),
+        download_progress_fn(),
+        brew_cask_upgrade_fn()
+    )
 }
 
 fn brew_cask_upgrade_fn() -> &'static str {
@@ -169,37 +338,76 @@ fn brew_cask_upgrade_fn() -> &'static str {
 // Bash function that adopts one app into Homebrew management. $1 is "user" to
 // install into ~/Applications (otherwise /Applications), $2 is the cask token.
 // Depends on pm_fix_protected_bundle (protected_bundle_fn) being defined too.
+/// Printed after every adoption run. Successes scroll past; what the user needs
+/// at the end is which apps did not make it, which cask was tried for each, and
+/// why — none of which is recoverable from a wall of Homebrew output.
+fn adopt_summary() -> &'static str {
+    r#"echo ""
+echo "────────────────────────────"
+if [ -s "$PM_FAILURES" ]; then
+  _pm_n=$(grep -c '' "$PM_FAILURES")
+  echo "✖  $_pm_n app(s) could not be set up:"
+  while IFS=$'	' read -r _app _tok _why; do
+    echo "     • $_app — tried cask "$_tok""
+    echo "         $_why"
+  done < "$PM_FAILURES"
+  echo ""
+  echo "→  Everything else was set up. Run a check to move them to Homebrew Apps."
+else
+  echo "✔  All set! Run a check to move these apps to Homebrew Apps."
+fi
+rm -f "$PM_FAILURES""#
+}
+
 fn adopt_cask_fn() -> &'static str {
-    r#"adopt_cask() {
-  local use_userdir="$1" token="$2"
+    r#"# $3 is the app's own name, so a failure can say which app it was and which
+# cask was tried — the token alone ("filefillet") tells the user nothing.
+pm_note_failure() {
+  [ -n "$PM_FAILURES" ] && printf '%s	%s	%s
+' "$1" "$2" "$3" >> "$PM_FAILURES"
+}
+
+adopt_cask() {
+  local use_userdir="$1" token="$2" appname="${3:-$2}"
   local flag=""
   [ "$use_userdir" = "user" ] && flag="--appdir $HOME/Applications"
   local TMPOUT; TMPOUT=$(mktemp)
   brew install --cask --force $flag "$token" 2>&1 | tee "$TMPOUT"
   local BREW_EXIT=${PIPESTATUS[0]}
+
+  # Homebrew's own words for the common, specific failures. A generic "setup
+  # failed" hides the one thing that tells the user whether they can act.
+  local reason=""
+  if grep -q "different checksum" "$TMPOUT"; then
+    reason="the download no longer matches Homebrew's checksum — the cask needs updating upstream"
+  elif grep -q "has been disabled" "$TMPOUT"; then
+    reason="that cask has been discontinued by Homebrew"
+  elif grep -qE "Running installer for|/usr/sbin/installer|installer -pkg" "$TMPOUT"; then
+    reason="its installer failed — the app may still be running, or is managed by your organisation"
+  elif grep -q "No available Cask" "$TMPOUT"; then
+    reason="no such cask"
+  fi
+
   if grep -q "Permission denied @ apply2files" "$TMPOUT"; then
     if pm_fix_protected_bundle "$TMPOUT"; then
       rm -f "$TMPOUT"
       if brew install --cask --force $flag "$token" 2>&1; then
-        echo "→  Done! $token is now managed by Homebrew."
+        echo "→  Done! $appname is now managed by Homebrew."
       else
-        echo "✖  Setup failed for $token."
+        echo "✖  Setup failed for $appname."
+        pm_note_failure "$appname" "$token" "the app bundle could not be replaced"
       fi
     else
       rm -f "$TMPOUT"
+      pm_note_failure "$appname" "$token" "macOS blocked changing the app bundle"
     fi
   elif [ "$BREW_EXIT" -eq 0 ]; then
     rm -f "$TMPOUT"
-    echo "→  Done! $token is now managed by Homebrew."
-  elif grep -qE "Running installer for|/usr/sbin/installer|installer -pkg" "$TMPOUT"; then
-    rm -f "$TMPOUT"
-    echo "✖  $token couldn't be set up — its installer failed."
-    echo "→  This usually means the app is still running, or it is managed by your organization (MDM)."
-    echo "→  Quit the app completely (check the menu bar) and try again."
-    echo "→  If it keeps failing, it is likely managed by IT and can't be adopted by Homebrew — you can leave it to update on its own."
+    echo "→  Done! $appname is now managed by Homebrew."
   else
     rm -f "$TMPOUT"
-    echo "✖  Setup failed for $token."
+    echo "✖  $appname couldn't be set up${reason:+ — $reason}."
+    pm_note_failure "$appname" "$token" "${reason:-it could not be installed}"
   fi
 }
 "#
@@ -295,11 +503,11 @@ async fn search_cask(app_name: String) -> Vec<CaskCandidate> {
                             .and_then(|v| v.as_str())
                             .unwrap_or(&token)
                             .to_string();
-                        Some(CaskCandidate { token, name })
+                        Some(CaskCandidate { token, name, exact: false })
                     })
                     .collect();
                 if !candidates.is_empty() {
-                    return candidates;
+                    return mark_verified(&app_name, candidates).await;
                 }
             }
         }
@@ -312,15 +520,30 @@ async fn search_cask(app_name: String) -> Vec<CaskCandidate> {
     if let Ok(out) = Command::new("bash").arg("-c").arg(&search_script).output().await {
         if out.status.success() {
             let text = String::from_utf8_lossy(&out.stdout);
-            return text.lines()
+            let fuzzy: Vec<CaskCandidate> = text.lines()
                 .filter(|l| !l.is_empty() && !l.starts_with("==>") && !l.contains("No formulae or casks"))
-                .take(5)
-                .map(|t| CaskCandidate { token: t.trim().to_string(), name: t.trim().to_string() })
+                // Ten, not five: when nothing is confirmed the user picks from these
+                // by hand, and a short list often omits the right one entirely.
+                .take(10)
+                .map(|t| CaskCandidate { token: t.trim().to_string(), name: t.trim().to_string(), exact: false })
                 .collect();
+            return mark_verified(&app_name, fuzzy).await;
         }
     }
 
     vec![]
+}
+
+/// Flags the candidates that genuinely install this app, confirmed ones first, so
+/// a real match is distinguishable from a merely similar-looking name.
+async fn mark_verified(app_name: &str, mut candidates: Vec<CaskCandidate>) -> Vec<CaskCandidate> {
+    let tokens: Vec<String> = candidates.iter().map(|c| c.token.clone()).collect();
+    let verified = verify_cask_apps(app_name, &tokens).await;
+    for c in candidates.iter_mut() {
+        c.exact = verified.contains(&c.token);
+    }
+    candidates.sort_by_key(|c| !c.exact);
+    candidates
 }
 
 #[tauri::command]
@@ -372,7 +595,13 @@ async fn track_apps(app: AppHandle, items: Vec<TrackItem>) {
             continue;
         }
         let ud = if matches!(it.appdir.as_deref(), Some("~/Applications")) { "user" } else { "" };
-        calls.push_str(&format!("adopt_cask '{ud}' '{token}'\n", ud = ud, token = it.token));
+        // The display name goes through too, so a failure can name the app
+        // rather than only the cask that was tried.
+        let name_esc = it.name.replace(['\\', '"'], "").replace('\'', "'\\''");
+        calls.push_str(&format!(
+            "adopt_cask '{ud}' '{token}' '{name}'\n",
+            ud = ud, token = it.token, name = name_esc
+        ));
         tokens.push(it.token.clone());
         names.push(it.name.clone());
     }
@@ -382,11 +611,13 @@ async fn track_apps(app: AppHandle, items: Vec<TrackItem>) {
         return;
     }
     let script = format!(
-        "export PATH=\"/opt/homebrew/bin:/usr/local/bin:$PATH\"\nif command -v brew &>/dev/null; then\nexport PM_ASKPASS_APP='{scope}'\n{helper}\n{adopt}\n{calls}echo '→  All set! Run a check to move these apps to Homebrew Apps.'\nelse\n  echo '✖  brew not found'\nfi",
+        "export PATH=\"/opt/homebrew/bin:/usr/local/bin:$PATH\"\nif command -v brew &>/dev/null; then\nexport PM_ASKPASS_APP='{scope}'\nPM_FAILURES=$(mktemp)\n{helper}\n{progress}\n{adopt}\npm_progress_start\n{calls}pm_progress_stop\n{summary}\nelse\n  echo '✖  brew not found'\nfi",
         scope = askpass_scope(&names),
         helper = protected_bundle_fn(),
+        progress = download_progress_fn(),
         adopt = adopt_cask_fn(),
         calls = calls,
+        summary = adopt_summary(),
     );
     let lines = run_upgrade_shell(&app, section, &script).await;
     let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
@@ -575,17 +806,27 @@ _pm_askpass="$_pm_dir/askpass"
 _pm_fifo="$_pm_dir/pw.fifo"
 mkfifo "$_pm_fifo" && chmod 600 "$_pm_fifo"
 
-cat > "$_pm_askpass" <<'PARTYMAN_ASKPASS'
-#!/bin/bash
+# The paths are written into the helper rather than passed through the
+# environment. Homebrew invokes sudo with a scrubbed environment — SUDO_ASKPASS
+# survives, nothing else does — so a helper that reads its configuration from
+# variables finds none, tries to create its pipe at the filesystem root, and
+# exits empty-handed. sudo reports that as "no password was provided".
+{
+  printf '#!/bin/bash\n'
+  printf 'PM_PW_FIFO=%q\n'   "$_pm_fifo"
+  printf 'PM_PW_DIR=%q\n'    "$_pm_dir"
+  printf 'PM_PW_RETRY=%q\n'  "$_pm_dir/retry"
+  printf 'PM_ASK_STAMP=%q\n' "$_pm_dir/asked"
+  cat <<'PARTYMAN_ASKPASS'
 # sudo calls this whenever it wants a password. It never prompts itself: it asks
 # the server below, which prompts once and then answers from memory.
-_pm_stamp="${PM_ASK_STAMP:-}"
+_pm_stamp="$PM_ASK_STAMP"
 if [ -n "$_pm_stamp" ] && [ -s "$_pm_stamp" ]; then
   _pm_last=$(cat "$_pm_stamp" 2>/dev/null)
   # The same sudo process asking again within seconds means what it was given
   # was rejected, so tell the server to discard it and ask afresh.
   if [ "${_pm_last%% *}" = "$PPID" ] && [ $(( $(date +%s) - ${_pm_last##* } )) -lt 20 ]; then
-    touch "${PM_PW_RETRY:-/dev/null}" 2>/dev/null
+    touch "$PM_PW_RETRY" 2>/dev/null
   fi
 fi
 [ -n "$_pm_stamp" ] && printf '%s %s' "$PPID" "$(date +%s)" > "$_pm_stamp"
@@ -602,13 +843,12 @@ fi
 cat "$_pm_reply"
 rm -f "$_pm_reply"
 PARTYMAN_ASKPASS
+} > "$_pm_askpass"
 chmod 700 "$_pm_askpass"
 
 export SUDO_ASKPASS="$_pm_askpass"
-export PM_PW_FIFO="$_pm_fifo"
-export PM_PW_DIR="$_pm_dir"
-export PM_PW_RETRY="$_pm_dir/retry"
-export PM_ASK_STAMP="$_pm_dir/asked"
+# Used by the server below, which runs in this shell and keeps its environment.
+PM_PW_RETRY="$_pm_dir/retry"
 
 # The password server. It is asked once and answers for the rest of the run, so
 # the number of prompts does not depend on sudo's credential cache surviving —
@@ -892,6 +1132,16 @@ is_tracked() {
   local app="$1"
   local base
   base=$(basename "$app")
+  # Uninstallers, helper stubs and web shortcuts are not applications anyone
+  # updates: an uninstaller ships alongside its app, a Drive shortcut is a
+  # bookmark. Listing them is noise, and worse, it invites adopting an unrelated
+  # cask that merely sounds similar.
+  case "$base" in
+    *[Uu]ninstall*|*"Helper.app"|*"URL Handler.app") return 0 ;;
+  esac
+  case "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist" 2>/dev/null)" in
+    com.google.drivefs.shortcuts.*) return 0 ;;
+  esac
   # PartyMAN updates itself, so it has no business appearing in its own list of
   # apps that lack auto-updates. Matched on bundle identifier so renaming the
   # app or installing it elsewhere does not bring it back.
@@ -1207,7 +1457,7 @@ async fn run_upgrade_items(app: AppHandle, section: String, items: Vec<String>, 
         // the batch rather than per cask.
         let scope = askpass_scope(&pairs.iter().map(|(_, n)| n.clone()).collect::<Vec<_>>());
         let script = format!(
-            "export PATH=\"/opt/homebrew/bin:/usr/local/bin:$PATH\"\nif command -v brew &>/dev/null; then\nexport PM_ASKPASS_APP='{scope}'\n{fn_def}\n{body}else\n  echo '✖  brew not found'\nfi",
+            "export PATH=\"/opt/homebrew/bin:/usr/local/bin:$PATH\"\nif command -v brew &>/dev/null; then\nexport PM_ASKPASS_APP='{scope}'\n{fn_def}\npm_progress_start\n{body}pm_progress_stop\nelse\n  echo '✖  brew not found'\nfi",
             scope = scope,
             fn_def = cask_fns(),
             body = body,
@@ -1345,6 +1595,50 @@ async fn check_app_update(current_version: String) -> AppUpdateInfo {
 // Release notes for one specific version, used to show what changed after an
 // update has already been applied — the pending update's own notes are gone by
 // then, and a fresh download never had them.
+/// Turns whatever the user pasted into a cask token, then checks it really
+/// exists. Accepts a bare token or a formulae.brew.sh link, since looking the
+/// cask up in a browser and copying the address is the natural way to find one.
+#[tauri::command]
+async fn resolve_cask_input(input: String) -> Option<CaskCandidate> {
+    let trimmed = input.trim();
+    let token = match trimmed.split("formulae.brew.sh/cask/").nth(1) {
+        // .../cask/dbeaver-enterprise#default -> dbeaver-enterprise
+        Some(rest) => rest
+            .split(['#', '?', '/'])
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_string(),
+        None => trimmed.trim_start_matches('/').to_string(),
+    };
+
+    if token.is_empty()
+        || token.len() > 64
+        || !token.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '@' || c == '.' || c == '+')
+    {
+        return None;
+    }
+
+    let script = format!(
+        r#"export PATH="/usr/local/bin:/opt/homebrew/bin:$PATH"; brew info --cask --json=v2 '{token}' 2>/dev/null"#
+    );
+    let out = Command::new("bash").arg("-c").arg(&script).output().await.ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    let cask = json["casks"].as_array()?.first()?;
+    let token = cask["token"].as_str()?.to_string();
+    let name = cask["name"]
+        .as_array()
+        .and_then(|a| a.first())
+        .and_then(|v| v.as_str())
+        .unwrap_or(&token)
+        .to_string();
+    // Chosen deliberately by the user, so it counts as confirmed.
+    Some(CaskCandidate { token, name, exact: true })
+}
+
 #[tauri::command]
 async fn get_release_notes(version: String) -> String {
     // Straight into a URL, so keep it to what a version can actually contain.
@@ -1475,8 +1769,6 @@ fn drop_icon_plate(img: &mut image::RgbaImage) {
 // Everything is composed at 4x and scaled down at the end, so the badge circle
 // and the digits come out smooth rather than stepped.
 fn tray_icon(count: usize) -> tauri::image::Image<'static> {
-    use ab_glyph::{Font, FontRef, ScaleFont};
-
     const SIZE: u32 = 44; // 22pt at 2x, the standard menu-bar height
     const SS: u32 = 4;
     let big = SIZE * SS;
@@ -1490,75 +1782,28 @@ fn tray_icon(count: usize) -> tauri::image::Image<'static> {
         .unwrap_or_else(|_| image::RgbaImage::new(big, big));
     let mut canvas = logo;
 
-    if count == 0 {
-        let scaled = image::imageops::resize(&canvas, SIZE, SIZE, image::imageops::FilterType::Lanczos3);
-        return tauri::image::Image::new_owned(scaled.into_raw(), SIZE, SIZE);
-    }
+    if count > 0 {
+        // A plain dot rather than a number. A count large enough to read at 22pt
+        // covered most of the logo, and the exact figure is on the tooltip and in
+        // the app; here it only needs to say "there is something waiting".
+        let r = 7.0_f32;
+        let (cx, cy) = (44.0 - r - 1.5, r + 1.5);
+        let (bx, by, br) = (cx * SS as f32, cy * SS as f32, r * SS as f32);
 
-    // Three digits is the most that stays legible at 22pt; beyond that it is a
-    // "lots" indicator rather than a number anyone reads.
-    let label = if count > 99 { "99+".to_string() } else { count.to_string() };
-
-    // Badge geometry in 44x44 space. The circle grows only slightly with longer
-    // labels — past about half the icon's width it stops reading as a badge and
-    // starts hiding the logo — so the digits shrink to fit instead.
-    let (r, text_scale) = match label.chars().count() {
-        1 => (8.5_f32, 1.30_f32),
-        2 => (10.0, 1.05),
-        _ => (11.0, 0.78),
-    };
-    let cx = 44.0 - r - 1.0;
-    let cy = r + 1.0;
-
-    let (bx, by, br) = (cx * SS as f32, cy * SS as f32, r * SS as f32);
-    for y in 0..big {
-        for x in 0..big {
-            let dx = x as f32 + 0.5 - bx;
-            let dy = y as f32 + 0.5 - by;
-            let d = (dx * dx + dy * dy).sqrt();
-            if d <= br {
-                // A ring of the menu-bar background lifts the badge off the logo.
-                let px = if d > br - 1.6 * SS as f32 {
-                    image::Rgba([255, 255, 255, 255])
-                } else {
-                    image::Rgba([228, 48, 48, 255])
-                };
-                canvas.put_pixel(x, y, px);
-            }
-        }
-    }
-
-    if let Ok(font) = FontRef::try_from_slice(include_bytes!("../assets/Nunito.ttf")) {
-        let scaled = font.as_scaled(r * text_scale * SS as f32);
-
-        let glyphs: Vec<_> = label
-            .chars()
-            .map(|c| scaled.scaled_glyph(c))
-            .collect();
-        let width: f32 = label.chars().map(|c| scaled.h_advance(font.glyph_id(c))).sum();
-
-        let mut pen_x = bx - width / 2.0;
-        // Centre on the digits' own height rather than the line box, or they sit low.
-        let baseline = by + scaled.ascent() * 0.36;
-
-        for mut glyph in glyphs {
-            glyph.position = ab_glyph::point(pen_x, baseline);
-            pen_x += scaled.h_advance(glyph.id);
-            if let Some(outlined) = font.outline_glyph(glyph) {
-                let bounds = outlined.px_bounds();
-                outlined.draw(|gx, gy, coverage| {
-                    let px = bounds.min.x as i32 + gx as i32;
-                    let py = bounds.min.y as i32 + gy as i32;
-                    if px < 0 || py < 0 || px >= big as i32 || py >= big as i32 {
-                        return;
-                    }
-                    let dst = canvas.get_pixel_mut(px as u32, py as u32);
-                    let a = coverage.clamp(0.0, 1.0);
-                    for i in 0..3 {
-                        dst.0[i] = (dst.0[i] as f32 * (1.0 - a) + 255.0 * a) as u8;
-                    }
-                    dst.0[3] = dst.0[3].max((a * 255.0) as u8);
-                });
+        for y in 0..big {
+            for x in 0..big {
+                let dx = x as f32 + 0.5 - bx;
+                let dy = y as f32 + 0.5 - by;
+                let d = (dx * dx + dy * dy).sqrt();
+                if d <= br {
+                    // A light rim keeps the dot distinct from the logo behind it.
+                    let px = if d > br - 1.4 * SS as f32 {
+                        image::Rgba([255, 255, 255, 255])
+                    } else {
+                        image::Rgba([228, 48, 48, 255])
+                    };
+                    canvas.put_pixel(x, y, px);
+                }
             }
         }
     }
@@ -1799,7 +2044,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             run_check, run_upgrade, run_upgrade_items, get_platform,
             get_upgrade_history, search_cask, track_app, track_apps,
-            check_app_update, open_release_url, get_release_notes,
+            check_app_update, open_release_url, get_release_notes, resolve_cask_input,
             get_schedule, set_schedule, run_schedule_now, snooze_updates, get_last_check, recount_section, next_run
         ])
         .run(tauri::generate_context!())
@@ -1824,6 +2069,59 @@ mod tests {
             .unwrap_or_else(|| panic!("missing {key} in:\n{text}"))
             .trim()
             .to_string()
+    }
+
+    // Adoption must never install something merely similarly named. brew search
+    // returns a hit for almost any string, so an app with no cask at all still
+    // produces candidates; only an app-artifact match makes one safe to adopt.
+    #[tokio::test]
+    #[ignore = "queries Homebrew; needs brew and a network"]
+    async fn only_real_matches_are_marked_exact() {
+        // Apps with no cask whatsoever — brew search still returns noise for them.
+        for app in ["FileZilla", "Google Docs", "Google Sheets"] {
+            let found = search_cask(app.to_string()).await;
+            let exact: Vec<_> = found.iter().filter(|c| c.exact).map(|c| &c.token).collect();
+            assert!(
+                exact.is_empty(),
+                "{app}: nothing installs it, yet these were treated as matches: {exact:?} \
+                 (all candidates: {:?})",
+                found.iter().map(|c| &c.token).collect::<Vec<_>>()
+            );
+        }
+
+        // Apps that genuinely have a cask must still be adoptable.
+        // zoom.us.app <-> the "zoom" cask share no spelling; only the bundle
+        // identifier connects them.
+        for (app, want) in [("Parsec", "parsec"), ("Rectangle", "rectangle"), ("zoom.us", "zoom")] {
+            let found = search_cask(app.to_string()).await;
+            let exact: Vec<_> = found.iter().filter(|c| c.exact).map(|c| c.token.as_str()).collect();
+            assert!(
+                exact.contains(&want),
+                "{app}: expected {want} to be recognised, got {exact:?}"
+            );
+        }
+    }
+
+    // Looking a cask up in a browser and copying the address is the natural way
+    // to find one, so the address must be accepted as readily as a bare token.
+    #[tokio::test]
+    #[ignore = "queries Homebrew; needs brew and a network"]
+    async fn accepts_a_pasted_formulae_url_or_a_bare_token() {
+        let from_url = resolve_cask_input(
+            "https://formulae.brew.sh/cask/dbeaver-enterprise#default".to_string(),
+        ).await;
+        assert_eq!(from_url.as_ref().map(|c| c.token.as_str()), Some("dbeaver-enterprise"));
+
+        let bare = resolve_cask_input("dbeaver-enterprise".to_string()).await;
+        assert_eq!(bare.as_ref().map(|c| c.token.as_str()), Some("dbeaver-enterprise"));
+
+        // Whitespace and a trailing slash are what a real copy-paste looks like.
+        let messy = resolve_cask_input("  https://formulae.brew.sh/cask/parsec/  ".to_string()).await;
+        assert_eq!(messy.as_ref().map(|c| c.token.as_str()), Some("parsec"));
+
+        // A cask that does not exist must be refused rather than adopted blindly.
+        assert!(resolve_cask_input("definitely-not-a-real-cask-xyz".to_string()).await.is_none());
+        assert!(resolve_cask_input("../../etc/passwd".to_string()).await.is_none());
     }
 
     // Writes the menu-bar glyph out so it can be looked at; a mask that reads as a

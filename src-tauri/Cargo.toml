@@ -1,6 +1,6 @@
 [package]
 name = "partyman-update-manager"
-version = "1.0.2"
+version = "1.0.3"
 edition = "2021"
 
 [lib]
@@ -21,7 +21,6 @@ serde_json = "1"
 image = { version = "0.25", default-features = false, features = ["png"] }
 tokio = { version = "1", features = ["process", "io-util", "macros", "rt"] }
 tauri-plugin-notification = "2.3.3"
-ab_glyph = "0.2.32"
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 
 # Used to attach a controlling terminal to the upgrade shell so that sudo can
