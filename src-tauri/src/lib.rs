@@ -1183,6 +1183,44 @@ if command -v brew &>/dev/null; then
       echo "$msg"
     done
   fi
+  # Apps installed twice: once from the App Store and again by Homebrew. Each
+  # source checks its own copy, and both counts stand when both copies are
+  # behind, but the user should know there are two. A cask is taken to own an
+  # App Store app when its artifacts name that app's bundle identifier or path,
+  # or its token, display name or app artifact is the app's name. The name test
+  # is needed for pkg casks: microsoft-word never names com.microsoft.Word
+  # outright, only inside its cleanup paths.
+  twice=""
+  if command -v jq &>/dev/null; then
+    mas_apps=$(for app in /Applications/*.app "$HOME/Applications"/*.app; do
+      [ -e "$app/Contents/_MASReceipt/receipt" ] || continue
+      printf '%s|%s\n' \
+        "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist" 2>/dev/null)" \
+        "$(basename "$app" .app)"
+    done)
+    installed=$(brew list --cask 2>/dev/null)
+    if [ -n "$mas_apps" ] && [ -n "$installed" ]; then
+      cask_refs=$(brew info --cask --json=v2 $installed 2>/dev/null \
+        | jq -r '.casks[] | .token as $t
+            | ((.artifacts | .. | strings | "\($t)|s|\(.)"),
+               ((.name[]?, $t, (.artifacts[]?.app[]? | strings)) | "\($t)|n|\(.)"))' 2>/dev/null)
+      twice=$(printf '%s\n' "$mas_apps" | while IFS='|' read -r id name; do
+        [ -z "$name" ] && continue
+        tok=$(printf '%s\n' "$cask_refs" | awk -F'|' -v id="$id" -v app="$name.app" '
+          function norm(x) { x = tolower(x); sub(/\.app$/, "", x); gsub(/[^a-z0-9]/, "", x); return x }
+          BEGIN { want = norm(app) }
+          ($2 == "s" && ((id != "" && $3 == id) || substr($3, length($3) - length(app)) == "/" app)) \
+            || ($2 == "n" && norm($3) == want) { print $1; exit }')
+        [ -n "$tok" ] && printf '%s|%s\n' "$name" "$tok"
+      done)
+    fi
+  fi
+  if [ -n "$twice" ]; then
+    echo "→  Installed twice, from the App Store and by Homebrew. Each copy is checked and counted on its own:"
+    printf '%s\n' "$twice" | while IFS='|' read -r name tok; do
+      echo "   $name: App Store, and Homebrew cask $tok"
+    done
+  fi
 else
   echo "✖  brew not found — install from https://brew.sh"
 fi

@@ -418,6 +418,25 @@
     }
   }
 
+  // Apps installed both from the App Store and by Homebrew, as the Homebrew
+  // check reports them. Each copy is still checked and counted on its own.
+  const TWICE_HEADER = "→  Installed twice";
+
+  function parseInstalledTwice(lines: string[]): string[] {
+    const found: string[] = [];
+    let inBlock = false;
+    for (const line of lines) {
+      if (line.startsWith(TWICE_HEADER)) { inBlock = true; continue; }
+      if (!inBlock) continue;
+      if (line.trim().startsWith("→") || !line.startsWith("   ")) break;
+      found.push(line.trim());
+    }
+    return found;
+  }
+
+  $: installedTwice = parseInstalledTwice(outputs["brew_casks"] ?? []);
+  let installedTwiceDismissed = false;
+
   // The per-section counts that make up the total: apps and system updates.
   function countedEntries(counts: Record<string, number>): [string, number][] {
     return Object.entries(counts).filter(
@@ -1077,6 +1096,21 @@
       <button class="update-prompt-snooze" onclick={() => snoozeUpdates(1)}>1 hour</button>
       <button class="update-prompt-snooze" onclick={() => snoozeUpdates(24)}>1 day</button>
       <button class="update-prompt-snooze" onclick={() => snoozeUpdates(72)}>3 days</button>
+    </div>
+  {/if}
+
+  {#if installedTwice.length > 0 && !installedTwiceDismissed}
+    <div class="twice-banner">
+      <div class="twice-text">
+        <strong>Installed twice.</strong>
+        {installedTwice.length === 1 ? "This app is" : "These apps are"} installed from the App Store
+        and by Homebrew. Each copy is checked for updates and counted on its own, so
+        you may want to keep just one.
+        <ul>
+          {#each installedTwice as entry}<li>{entry}</li>{/each}
+        </ul>
+      </div>
+      <button class="banner-dismiss" onclick={() => { installedTwiceDismissed = true; }}>✕</button>
     </div>
   {/if}
 
@@ -1842,6 +1876,18 @@
   }
 
   .update-prompt-count { font-weight: 600; }
+
+  .twice-banner {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    margin: 0 0 14px;
+    padding: 9px 12px;
+    border-radius: var(--pm-radius);
+    background: var(--pm-info-tint);
+    font-size: 0.82rem;
+  }
+  .twice-text ul { margin: 4px 0 0; padding-left: 18px; }
 
   .update-prompt-later {
     margin-left: 4px;

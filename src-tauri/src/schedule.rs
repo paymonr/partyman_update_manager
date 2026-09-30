@@ -459,7 +459,7 @@ mod tests {
     // `brew upgrade` refuses those, so counting them meant a number that could
     // never reach zero.
     #[test]
-    fn disabled_casks_are_listed_but_not_counted() {
+    fn only_updatable_casks_are_counted() {
         let lines: Vec<String> = [
             "→  Refreshing Homebrew…",
             "⚠  Outdated apps:",
@@ -469,6 +469,9 @@ mod tests {
             "→  Homebrew has disabled these, so it can no longer update them. They are not counted:",
             "   electron (disabled 2026-09-01)",
             "   flameshot (disabled 2026-09-01)",
+            // An app installed twice is a warning, not an extra update.
+            "→  Installed twice, from the App Store and by Homebrew. Each copy is checked and counted on its own:",
+            "   Microsoft Word: App Store, and Homebrew cask microsoft-word",
         ]
         .iter()
         .map(|s| s.to_string())
