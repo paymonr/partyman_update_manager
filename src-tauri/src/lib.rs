@@ -3,11 +3,11 @@ mod schedule;
 use std::fs;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use image::GenericImageView;
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::Command;
+use tokio::process::{Child, Command};
 
 #[derive(Clone, serde::Serialize)]
 struct OutputPayload {
@@ -266,11 +266,46 @@ pm_progress_stop() {
 "#
 }
 
+// Runs `brew "$@"` with its output shown live and also saved to $1, returning
+// brew's own exit status.
+//
+// This replaces `brew … 2>&1 | tee "$out"`. A pipeline lasts until tee sees
+// end-of-file, and tee sees it only once every process holding the pipe has let
+// go — brew *and anything brew started*. A cask that leaves a process running
+// after it installs therefore stalled the batch on that cask indefinitely, long
+// after brew itself had finished. Here only brew is waited on. tee gets a few
+// seconds to copy what is left in the pipe; if it is still going after that, it
+// is left to drain in the background, so whatever holds the pipe is never hit
+// with SIGPIPE.
+fn brew_logged_fn() -> &'static str {
+    r#"pm_brew_logged() {
+  local out="$1"; shift
+  local fifo tee_pid rc i=0
+  fifo=$(mktemp -u "${TMPDIR:-/tmp}/pm-brew.XXXXXX")
+  if ! mkfifo -m 600 "$fifo" 2>/dev/null; then
+    brew "$@" 2>&1 | tee "$out"
+    return "${PIPESTATUS[0]}"
+  fi
+  tee "$out" < "$fifo" &
+  tee_pid=$!
+  brew "$@" > "$fifo" 2>&1
+  rc=$?
+  while kill -0 "$tee_pid" 2>/dev/null && [ "$i" -lt 30 ]; do
+    sleep 0.1
+    i=$((i + 1))
+  done
+  rm -f "$fifo"
+  return "$rc"
+}
+"#
+}
+
 // The cask helper bundle: the protected-bundle recovery followed by the
 // single-cask upgrade function that depends on it.
 fn cask_fns() -> String {
     format!(
-        "{}\n{}\n{}",
+        "{}\n{}\n{}\n{}",
+        brew_logged_fn(),
         protected_bundle_fn(),
         download_progress_fn(),
         brew_cask_upgrade_fn()
@@ -286,14 +321,14 @@ fn brew_cask_upgrade_fn() -> &'static str {
   TMPOUT=$(mktemp)
   local APPDIR_FLAG=""
 
-  brew upgrade --cask "$token" 2>&1 | tee "$TMPOUT"
-  local BREW_EXIT="${PIPESTATUS[0]}"
+  pm_brew_logged "$TMPOUT" upgrade --cask "$token"
+  local BREW_EXIT=$?
 
   if grep -q "It seems there is already an App at" "$TMPOUT"; then
     echo "→  Backup conflict (app may have self-updated) — retrying with --force…"
     rm -f "$TMPOUT"; TMPOUT=$(mktemp)
-    brew upgrade --cask --force $APPDIR_FLAG "$token" 2>&1 | tee "$TMPOUT"
-    BREW_EXIT="${PIPESTATUS[0]}"
+    pm_brew_logged "$TMPOUT" upgrade --cask --force $APPDIR_FLAG "$token"
+    BREW_EXIT=$?
   fi
 
   if grep -q "App source.*is not there" "$TMPOUT"; then
@@ -309,8 +344,8 @@ fn brew_cask_upgrade_fn() -> &'static str {
       APPDIR_FLAG=""
       echo "→  App not found — reinstalling to /Applications…"
     fi
-    brew install --cask --force $APPDIR_FLAG "$token" 2>&1 | tee "$TMPOUT"
-    BREW_EXIT="${PIPESTATUS[0]}"
+    pm_brew_logged "$TMPOUT" install --cask --force $APPDIR_FLAG "$token"
+    BREW_EXIT=$?
   fi
 
   if grep -q "Permission denied @ apply2files" "$TMPOUT"; then
@@ -372,8 +407,8 @@ adopt_cask() {
   local flag=""
   [ "$use_userdir" = "user" ] && flag="--appdir $HOME/Applications"
   local TMPOUT; TMPOUT=$(mktemp)
-  brew install --cask --force $flag "$token" 2>&1 | tee "$TMPOUT"
-  local BREW_EXIT=${PIPESTATUS[0]}
+  pm_brew_logged "$TMPOUT" install --cask --force $flag "$token"
+  local BREW_EXIT=$?
 
   # Homebrew's own words for the common, specific failures. A generic "setup
   # failed" hides the one thing that tells the user whether they can act.
@@ -557,7 +592,8 @@ async fn track_app(app: AppHandle, cask_token: String, appdir: Option<String>) {
     let use_userdir = if matches!(appdir.as_deref(), Some("~/Applications")) { "user" } else { "" };
     let section = "untracked_apps";
     let script = format!(
-        "export PATH=\"/opt/homebrew/bin:/usr/local/bin:$PATH\"\nif command -v brew &>/dev/null; then\n{helper}\n{adopt}\nadopt_cask '{ud}' '{token}'\necho '→  Run a check to see this app move to Homebrew Apps.'\nelse\n  echo '✖  brew not found'\nfi",
+        "export PATH=\"/opt/homebrew/bin:/usr/local/bin:$PATH\"\nif command -v brew &>/dev/null; then\n{logged}\n{helper}\n{adopt}\nadopt_cask '{ud}' '{token}'\necho '→  Run a check to see this app move to Homebrew Apps.'\nelse\n  echo '✖  brew not found'\nfi",
+        logged = brew_logged_fn(),
         helper = protected_bundle_fn(),
         adopt = adopt_cask_fn(),
         ud = use_userdir,
@@ -611,8 +647,9 @@ async fn track_apps(app: AppHandle, items: Vec<TrackItem>) {
         return;
     }
     let script = format!(
-        "export PATH=\"/opt/homebrew/bin:/usr/local/bin:$PATH\"\nif command -v brew &>/dev/null; then\nexport PM_ASKPASS_APP='{scope}'\nPM_FAILURES=$(mktemp)\n{helper}\n{progress}\n{adopt}\npm_progress_start\n{calls}pm_progress_stop\n{summary}\nelse\n  echo '✖  brew not found'\nfi",
+        "export PATH=\"/opt/homebrew/bin:/usr/local/bin:$PATH\"\nif command -v brew &>/dev/null; then\nexport PM_ASKPASS_APP='{scope}'\nPM_FAILURES=$(mktemp)\n{logged}\n{helper}\n{progress}\n{adopt}\npm_progress_start\n{calls}pm_progress_stop\n{summary}\nelse\n  echo '✖  brew not found'\nfi",
         scope = askpass_scope(&names),
+        logged = brew_logged_fn(),
         helper = protected_bundle_fn(),
         progress = download_progress_fn(),
         adopt = adopt_cask_fn(),
@@ -718,6 +755,69 @@ pub(crate) async fn run_check_collect(section: &str) -> Vec<String> {
     }
 }
 
+// How long output may keep arriving after the shell has exited, for the readers
+// to catch up with what is still sitting in the pipe.
+const DRAIN_GRACE: Duration = Duration::from_secs(3);
+
+type LineSink = Arc<Mutex<Option<Vec<String>>>>;
+
+/// Streams a child's stdout and stderr to `on_line` as they arrive, and returns
+/// every line once the child has exited.
+///
+/// The run is over when the shell exits, not when its pipes close. Anything the
+/// script starts inherits those pipes, and a process left running afterwards
+/// keeps them open indefinitely. Waiting for end-of-file waited on that process
+/// instead: the batch finished but never reported done, so the section stayed on
+/// "Updating…", Run Check stayed disabled, and nothing reached the history until
+/// the app was force-quit.
+///
+/// Readers still going after the grace period are left to drain in the
+/// background rather than cancelled, so whatever holds the pipe never has its
+/// writes fail with SIGPIPE. What they read from then on is discarded.
+async fn stream_child<F>(child: &mut Child, on_line: F) -> Vec<String>
+where
+    F: Fn(&str) + Send + Sync + 'static,
+{
+    let sink: LineSink = Arc::new(Mutex::new(Some(Vec::new())));
+    let on_line = Arc::new(on_line);
+    let mut readers = Vec::new();
+    if let Some(out) = child.stdout.take() {
+        readers.push(spawn_line_reader(out, Arc::clone(&sink), Arc::clone(&on_line)));
+    }
+    if let Some(err) = child.stderr.take() {
+        readers.push(spawn_line_reader(err, Arc::clone(&sink), Arc::clone(&on_line)));
+    }
+
+    let _ = child.wait().await;
+    let _ = tokio::time::timeout(DRAIN_GRACE, async {
+        for r in &mut readers {
+            let _ = r.await;
+        }
+    })
+    .await;
+
+    // Dropping the handles detaches any reader still running; it does not stop it.
+    sink.lock().ok().and_then(|mut s| s.take()).unwrap_or_default()
+}
+
+fn spawn_line_reader<R, F>(pipe: R, sink: LineSink, on_line: Arc<F>) -> tokio::task::JoinHandle<()>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    F: Fn(&str) + Send + Sync + 'static,
+{
+    tokio::spawn(async move {
+        let mut reader = BufReader::new(pipe).lines();
+        while let Ok(Some(line)) = reader.next_line().await {
+            if let Ok(mut guard) = sink.lock() {
+                if let Some(lines) = guard.as_mut() {
+                    on_line(&line);
+                    lines.push(line);
+                }
+            }
+        }
+    })
+}
+
 async fn run_shell(app: &AppHandle, section: &str, script: &str) {
     let shell = if cfg!(target_os = "windows") { "powershell" } else { "bash" };
     let flag  = if cfg!(target_os = "windows") { "-Command" } else { "-c" };
@@ -743,34 +843,16 @@ async fn run_shell(app: &AppHandle, section: &str, script: &str) {
         }
     };
 
-    let stdout = child.stdout.take().unwrap();
-    let stderr = child.stderr.take().unwrap();
-
     let app1 = app.clone();
     let sec1 = section.to_string();
-    let t1 = tokio::spawn(async move {
-        let mut reader = BufReader::new(stdout).lines();
-        while let Ok(Some(line)) = reader.next_line().await {
-            emit_line(&app1, &sec1, &line).await;
-        }
-    });
-
-    let app2 = app.clone();
-    let sec2 = section.to_string();
-    let t2 = tokio::spawn(async move {
-        let mut reader = BufReader::new(stderr).lines();
-        while let Ok(Some(line)) = reader.next_line().await {
-            emit_line(&app2, &sec2, &line).await;
-        }
-    });
-
-    let _ = tokio::join!(t1, t2);
-    let status = child.wait().await;
-    let final_status = match status {
-        Ok(s) if s.success() => "done",
-        _ => "done",
-    };
-    emit_status(app, section, final_status).await;
+    stream_child(&mut child, move |line| {
+        let _ = app1.emit(
+            "check-output",
+            OutputPayload { section: sec1.clone(), line: line.to_string() },
+        );
+    })
+    .await;
+    emit_status(app, section, "done").await;
 }
 
 // Sentinel lines emitted around each cask so the single-shell batch output can be
@@ -1035,43 +1117,19 @@ async fn run_upgrade_shell(app: &AppHandle, section: &str, script: &str) -> Vec<
         }
     };
 
-    let stdout = child.stdout.take().unwrap();
-    let stderr = child.stderr.take().unwrap();
-    let collected = Arc::new(Mutex::new(Vec::<String>::new()));
-
     let app1 = app.clone();
     let sec1 = section.to_string();
-    let coll1 = Arc::clone(&collected);
-    let t1 = tokio::spawn(async move {
-        let mut reader = BufReader::new(stdout).lines();
-        while let Ok(Some(line)) = reader.next_line().await {
-            if !line.starts_with(CASK_MARKER_PREFIX) {
-                emit_upgrade_line(&app1, &sec1, &line).await;
-            }
-            if let Ok(mut v) = coll1.lock() { v.push(line); }
+    let lines = stream_child(&mut child, move |line| {
+        if !line.starts_with(CASK_MARKER_PREFIX) {
+            let _ = app1.emit(
+                "upgrade-output",
+                OutputPayload { section: sec1.clone(), line: line.to_string() },
+            );
         }
-    });
-
-    let app2 = app.clone();
-    let sec2 = section.to_string();
-    let coll2 = Arc::clone(&collected);
-    let t2 = tokio::spawn(async move {
-        let mut reader = BufReader::new(stderr).lines();
-        while let Ok(Some(line)) = reader.next_line().await {
-            if !line.starts_with(CASK_MARKER_PREFIX) {
-                emit_upgrade_line(&app2, &sec2, &line).await;
-            }
-            if let Ok(mut v) = coll2.lock() { v.push(line); }
-        }
-    });
-
-    let _ = tokio::join!(t1, t2);
-    let _ = child.wait().await;
+    })
+    .await;
     emit_upgrade_status(app, section, "done").await;
-
-    Arc::try_unwrap(collected)
-        .map(|m| m.into_inner().unwrap_or_default())
-        .unwrap_or_default()
+    lines
 }
 
 fn check_script(section: &str) -> Option<&'static str> {
@@ -1328,7 +1386,7 @@ export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
 if command -v brew &>/dev/null; then
   {fn_def}
   TMPOUT=$(mktemp)
-  brew upgrade --cask --greedy 2>&1 | tee "$TMPOUT"
+  pm_brew_logged "$TMPOUT" upgrade --cask --greedy
   grep "It seems the App source" "$TMPOUT" 2>/dev/null \
     | sed 's/Error: //;s/:.*//' | tr -d ' ' | while IFS= read -r tok; do
     [ -z "$tok" ] && continue
@@ -2150,6 +2208,89 @@ mod tests {
     // authentication covers every sudo call in the run, while stdout/stderr must
     // stay pipes so Homebrew's output keeps the plain form the line parser and
     // cask sentinel splitting expect.
+    // A process the batch leaves behind — here one that, like a daemon, shrugs
+    // off the hangup sent when the shell exits — holds the output pipe open for
+    // far longer than the run. The run must still end when the shell does.
+    #[tokio::test]
+    async fn run_ends_when_the_shell_exits_not_when_its_pipes_close() {
+        let script = r#"
+echo before
+( trap '' HUP; exec sleep 60 ) &
+echo "HOLDER=$!"
+echo after >&2
+"#;
+        let mut cmd = Command::new("bash");
+        cmd.arg("-c")
+            .arg(script)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let _pty = attach_controlling_pty(&mut cmd);
+        let mut child = cmd.spawn().expect("spawn");
+
+        let started = std::time::Instant::now();
+        let lines = stream_child(&mut child, |_| {}).await;
+        let took = started.elapsed();
+
+        let holder = lines.iter().find_map(|l| l.strip_prefix("HOLDER=")).map(str::to_string);
+        if let Some(pid) = &holder {
+            let _ = std::process::Command::new("kill").arg(pid).status();
+        }
+        assert!(took < DRAIN_GRACE + Duration::from_secs(2), "waited on the holder: {took:?}");
+        assert!(holder.is_some(), "holder never started: {lines:?}");
+        for want in ["before", "after"] {
+            assert!(lines.iter().any(|l| l == want), "lost {want:?}: {lines:?}");
+        }
+    }
+
+    // The same, one level down: a cask that leaves a process holding brew's
+    // output used to stall `brew … | tee` — and with it the rest of the batch —
+    // though brew itself had finished.
+    #[tokio::test]
+    async fn brew_logged_returns_with_brew_despite_a_lingering_child() {
+        let dir = std::env::temp_dir().join(format!("pm-brew-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let fake_brew = dir.join("brew");
+        fs::write(
+            &fake_brew,
+            "#!/bin/bash\necho \"brew $*\"\n( trap '' HUP; exec sleep 60 ) &\necho \"HOLDER=$!\"\necho 'Warning: to stderr' >&2\nexit 3\n",
+        )
+        .unwrap();
+        std::process::Command::new("chmod").arg("+x").arg(&fake_brew).status().unwrap();
+
+        let script = format!(
+            "export PATH=\"{dir}:$PATH\"\n{f}\nout=$(mktemp)\npm_brew_logged \"$out\" upgrade --cask demo\necho \"RC=$?\"\necho \"SAVED=$(grep -c . \"$out\")\"\nrm -f \"$out\"\n",
+            dir = dir.display(),
+            f = brew_logged_fn(),
+        );
+        // Run it the way the app does: a pty attached, streamed until the shell exits.
+        let mut cmd = Command::new("bash");
+        cmd.arg("-c")
+            .arg(&script)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let _pty = attach_controlling_pty(&mut cmd);
+        let mut child = cmd.spawn().expect("spawn");
+        let started = std::time::Instant::now();
+        let lines = tokio::time::timeout(Duration::from_secs(30), stream_child(&mut child, |_| {})).await;
+        let took = started.elapsed();
+
+        // The holder is in the output whichever way this went; clean it up first.
+        let text = lines.as_ref().map(|l| l.join("\n")).unwrap_or_default();
+        if let Some(pid) = text.lines().find_map(|l| l.strip_prefix("HOLDER=")) {
+            let _ = std::process::Command::new("kill").arg(pid).status();
+        }
+        let _ = fs::remove_dir_all(&dir);
+
+        assert!(lines.is_ok(), "the run waited on brew's child");
+        assert!(took < Duration::from_secs(10), "took {took:?}:\n{text}");
+        assert!(text.contains("brew upgrade --cask demo"), "output not streamed:\n{text}");
+        assert!(text.contains("Warning: to stderr"), "stderr not streamed:\n{text}");
+        assert_eq!(field(&text, "RC="), "3", "brew's exit status lost:\n{text}");
+        assert_eq!(field(&text, "SAVED="), "3", "output not saved for the retry checks:\n{text}");
+    }
+
     #[tokio::test]
     async fn attaches_controlling_pty_but_leaves_stdio_piped() {
         let script = r#"
