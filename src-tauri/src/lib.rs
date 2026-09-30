@@ -1178,11 +1178,21 @@ fi
         "untracked_apps" => Some(r#"
 cask_tokens=""
 cask_apps=""
+cask_strings=""
 if command -v brew &>/dev/null; then
   cask_tokens=$(brew list --cask 2>/dev/null)
   if [ -n "$cask_tokens" ] && command -v jq &>/dev/null; then
-    cask_apps=$(brew info --cask --json=v2 $cask_tokens 2>/dev/null \
+    cask_json=$(brew info --cask --json=v2 $cask_tokens 2>/dev/null)
+    cask_apps=$(printf '%s' "$cask_json" \
       | jq -r '.casks[].artifacts[]?.app[]? | select(type=="string")' 2>/dev/null)
+    # Every string anywhere in an installed cask's artifacts. The uninstall
+    # stanzas name the bundle identifiers a cask is responsible for, and for a
+    # cask that installs from a .pkg that is the only thing tying it to its app:
+    # tailscale-app declares no app artifact and shares no spelling with
+    # Tailscale.app, and zoom does not look like zoom.us.app. It is the same
+    # evidence the cask search uses to offer that cask in the first place.
+    cask_strings=$(printf '%s' "$cask_json" \
+      | jq -r '.casks[].artifacts | .. | strings' 2>/dev/null)
   fi
 fi
 
@@ -1197,13 +1207,15 @@ is_tracked() {
   case "$base" in
     *[Uu]ninstall*|*"Helper.app"|*"URL Handler.app") return 0 ;;
   esac
-  case "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist" 2>/dev/null)" in
+  local bundle_id
+  bundle_id=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist" 2>/dev/null)
+  case "$bundle_id" in
     com.google.drivefs.shortcuts.*) return 0 ;;
   esac
   # PartyMAN updates itself, so it has no business appearing in its own list of
   # apps that lack auto-updates. Matched on bundle identifier so renaming the
   # app or installing it elsewhere does not bring it back.
-  [ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist" 2>/dev/null)" = "com.partyman.updater" ] && return 0
+  [ "$bundle_id" = "com.partyman.updater" ] && return 0
   # Apple ships its own apps under two different leaf certificates: older ones
   # say "Software Signing", current ones "macOS Software Signing". Matching only
   # the former let Apple's own apps — Safari among them — fall through as
@@ -1212,6 +1224,10 @@ is_tracked() {
   codesign -dvv "$app" 2>&1 | grep -qE "^Authority=(macOS )?Software Signing" && return 0
   [ -e "$app/Contents/_MASReceipt/receipt" ] && return 0
   [ -n "$cask_apps" ] && echo "$cask_apps" | grep -qxF "$base" && return 0
+  if [ -n "$cask_strings" ]; then
+    [ -n "$bundle_id" ] && echo "$cask_strings" | grep -qxF "$bundle_id" && return 0
+    echo "$cask_strings" | grep -qxF "$app" && return 0
+  fi
   local norm
   norm=$(echo "${base%.app}" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9')
   local tok
