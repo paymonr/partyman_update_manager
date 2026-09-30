@@ -1953,7 +1953,7 @@ fn snooze_updates(app: AppHandle, hours: u64) -> Result<schedule::ScheduleConfig
 
 #[tauri::command]
 async fn run_schedule_now(app: AppHandle) -> schedule::ScheduleConfig {
-    let cfg = schedule::run_scheduled(&app).await;
+    let cfg = schedule::run_checks(&app, schedule::CheckScope::AppsOnly).await;
     set_tray_count(&app, cfg.last_total);
     schedule::notify_result(&app, &cfg);
     let _ = app.emit("schedule-updated", cfg.clone());
@@ -2034,7 +2034,7 @@ pub fn run() {
                     "check" => {
                         let handle = app.clone();
                         tauri::async_runtime::spawn(async move {
-                            let cfg = schedule::run_scheduled(&handle).await;
+                            let cfg = schedule::run_checks(&handle, schedule::CheckScope::AppsOnly).await;
                             set_tray_count(&handle, cfg.last_total);
                             schedule::notify_result(&handle, &cfg);
                             let _ = handle.emit("schedule-updated", cfg);
@@ -2071,7 +2071,7 @@ pub fn run() {
             if startup_cfg.check_on_launch {
                 let launch_handle = handle.clone();
                 tauri::async_runtime::spawn(async move {
-                    let cfg = schedule::run_scheduled(&launch_handle).await;
+                    let cfg = schedule::run_checks(&launch_handle, schedule::CheckScope::AppsOnly).await;
                     set_tray_count(&launch_handle, cfg.last_total);
                     schedule::notify_result(&launch_handle, &cfg);
                     let _ = launch_handle.emit("schedule-updated", cfg);

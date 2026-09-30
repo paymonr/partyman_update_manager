@@ -349,6 +349,9 @@ pub fn total_from_counts(counts: &BTreeMap<String, usize>, include_dev: bool) ->
 pub struct LastCheck {
     pub ts: u64,
     pub sections: BTreeMap<String, Vec<String>>,
+    /// When each section was checked. A manual run leaves developer tooling
+    /// alone, so those sections can be older than `ts`.
+    pub section_ts: BTreeMap<String, u64>,
 }
 
 fn last_check_path(app: &AppHandle) -> Option<PathBuf> {
@@ -359,10 +362,15 @@ fn last_check_path(app: &AppHandle) -> Option<PathBuf> {
 }
 
 pub fn load_last_check(app: &AppHandle) -> LastCheck {
-    last_check_path(app)
+    let mut last: LastCheck = last_check_path(app)
         .and_then(|p| fs::read_to_string(p).ok())
         .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    // Files written before per-section times existed checked everything at once.
+    for id in last.sections.keys() {
+        last.section_ts.entry(id.clone()).or_insert(last.ts);
+    }
+    last
 }
 
 fn save_last_check(app: &AppHandle, last: &LastCheck) {
@@ -452,6 +460,18 @@ mod tests {
         assert_eq!(items.len(), 2);
         assert_eq!(items[1].name, "Figma");
         assert_eq!(items[1].app_dir.as_deref(), Some("~/Applications"));
+    }
+
+    #[test]
+    fn a_manual_check_leaves_developer_tooling_out() {
+        let apps: Vec<_> = sections_for(CheckScope::AppsOnly).collect();
+        assert_eq!(apps, ["macos_updates", "app_store", "brew_casks"]);
+        let all: Vec<_> = sections_for(CheckScope::All).collect();
+        assert_eq!(all, CHECKED_SECTIONS);
+        // Every checked section is either an app section or developer tooling.
+        for s in CHECKED_SECTIONS {
+            assert!(BADGE_SECTIONS.contains(s) != DEV_SECTIONS.contains(s), "{s}");
+        }
     }
 
     #[test]
@@ -579,21 +599,54 @@ pub fn try_acquire_run_lock(_app: &AppHandle) -> Option<fs::File> {
     None
 }
 
-/// Runs every counted section, records what it found, and returns the new config.
-/// Untracked apps are skipped: that scan runs `codesign` over every app in
-/// /Applications, which is far too slow for a background job, and it is not an
-/// update count anyway.
-pub async fn run_checks(app: &AppHandle) -> ScheduleConfig {
-    let mut counts = BTreeMap::new();
-    let mut last = LastCheck { ts: now_secs(), sections: BTreeMap::new() };
-    for section in CHECKED_SECTIONS {
+// Developer tooling: brew formulae, npm, pip and gems.
+pub const DEV_SECTIONS: &[&str] = &[
+    "brew_formulae",
+    "npm_globals",
+    "pip_packages",
+    "ruby_rvm",
+    "ruby_rbenv",
+];
+
+/// Which sections a run covers.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum CheckScope {
+    /// Everything in CHECKED_SECTIONS: the scheduled run.
+    All,
+    /// Apps and system updates only: Run Now, the menu bar's Check Now, and the
+    /// check at launch. Developer tooling is slow to check and runs to hundreds
+    /// of packages, so it is checked from its own tab or on the schedule.
+    AppsOnly,
+}
+
+pub fn sections_for(scope: CheckScope) -> impl Iterator<Item = &'static str> {
+    CHECKED_SECTIONS
+        .iter()
+        .copied()
+        .filter(move |s| scope == CheckScope::All || !DEV_SECTIONS.contains(s))
+}
+
+/// Runs the counted sections in `scope`, records what it found, and returns the
+/// new config. Sections outside the scope keep what the last run found for them.
+/// Untracked apps are never included: that scan runs `codesign` over every app
+/// in /Applications, which is far too slow for a background job, and it is not
+/// an update count anyway.
+pub async fn run_checks(app: &AppHandle, scope: CheckScope) -> ScheduleConfig {
+    let now = now_secs();
+    let (mut counts, mut last) = match scope {
+        CheckScope::All => (BTreeMap::new(), LastCheck::default()),
+        CheckScope::AppsOnly => (load(app).last_counts, load_last_check(app)),
+    };
+    last.ts = now;
+    for section in sections_for(scope) {
         let lines = crate::run_check_collect(section).await;
         counts.insert(section.to_string(), count_for(section, &lines));
         last.sections.insert(section.to_string(), lines);
+        last.section_ts.insert(section.to_string(), now);
     }
     save_last_check(app, &last);
     let mut cfg = load(app);
-    cfg.last_run = now_secs();
+    cfg.last_run = now;
     cfg.last_total = total_from_counts(&counts, cfg.count_dev_updates);
     cfg.last_counts = counts;
     let _ = save(app, &cfg);
@@ -772,7 +825,7 @@ pub fn sync_agent(cfg: &ScheduleConfig) -> Result<(), String> {
 /// for the administrator password and to decide what actually gets upgraded, so a
 /// run reports what it found and the app offers to install it.
 pub async fn run_scheduled(app: &AppHandle) -> ScheduleConfig {
-    run_checks(app).await
+    run_checks(app, CheckScope::All).await
 }
 
 /// Re-checks a single section after it has been upgraded, so the count reflects
@@ -795,6 +848,7 @@ pub async fn recount(app: &AppHandle, section: &str) -> ScheduleConfig {
     if last.ts == 0 {
         last.ts = now_secs();
     }
+    last.section_ts.insert(section.to_string(), now_secs());
     last.sections.insert(section.to_string(), lines);
     save_last_check(app, &last);
 

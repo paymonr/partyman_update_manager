@@ -359,12 +359,18 @@
   // filled in rather than eight empty tabs and a Check button.
   async function hydrateLastCheck() {
     try {
-      const last = await invoke<{ ts: number; sections: Record<string, string[]> }>("get_last_check");
+      const last = await invoke<{
+        ts: number;
+        sections: Record<string, string[]>;
+        sectionTs?: Record<string, number>;
+      }>("get_last_check");
       if (!last?.ts) return;
-      const when = new Date(last.ts * 1000);
       for (const [id, lines] of Object.entries(last.sections ?? {})) {
         if (!sections.some((sec) => sec.id === id)) continue;
         if (outputs[id]?.length) continue; // anything checked live this session wins
+        // A manual run skips developer tooling, so those sections keep their own,
+        // older time rather than the time of the run.
+        const when = new Date((last.sectionTs?.[id] ?? last.ts) * 1000);
         outputs[id] = lines;
         parsedItems[id] = parseItems(id, lines);
         statuses[id] = "done";
@@ -685,16 +691,13 @@
     }
   }
 
+  // Developer tooling is left out: brew formulae, npm, pip and gems are slow to
+  // check and run to hundreds of packages, so they are checked from their own tab.
   async function runAll() {
     runningAll = true;
-    const visible = sections.filter(platformVisible);
+    const visible = sections.filter(s => platformVisible(s) && !s.dev);
     for (const s of visible) {
-      if (s.dev) {
-        activeTab = "dev";
-        activeDevTab = s.id;
-      } else {
-        activeTab = s.id;
-      }
+      activeTab = s.id;
       await runSection(s.id);
     }
     runningAll = false;
@@ -1175,7 +1178,7 @@
           <label class="settings-row">
             <div class="settings-row-info">
               <span class="settings-row-label">Check when PM Updater opens</span>
-              <span class="settings-row-desc">Runs a check on launch instead of waiting for the next interval</span>
+              <span class="settings-row-desc">Checks apps and system updates on launch instead of waiting for the next interval. Developer tools are left to the schedule and their own tab.</span>
             </div>
             <input type="checkbox" bind:checked={schedule.checkOnLaunch}
               onchange={saveSchedule} disabled={scheduleSaving} />
@@ -1198,6 +1201,7 @@
               <span class="settings-row-desc">
                 Counts brew formulae, npm, pip and gems too. They often run to hundreds of
                 packages, so by default the count sticks to apps and system updates.
+                Developer tools are counted as of the last scheduled check.
               </span>
             </div>
             <input type="checkbox" bind:checked={schedule.countDevUpdates}
