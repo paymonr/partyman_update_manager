@@ -1,6 +1,6 @@
 {
   "productName": "PartyMAN-Update-Manager",
-  "version": "1.0.4",
+  "version": "1.1.0",
   "identifier": "com.partyman.updater",
   "build": {
     "beforeDevCommand": "npm run dev",

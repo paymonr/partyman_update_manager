@@ -818,7 +818,7 @@ where
     })
 }
 
-async fn run_shell(app: &AppHandle, section: &str, script: &str) {
+async fn run_shell(app: &AppHandle, section: &str, script: &str) -> Vec<String> {
     let shell = if cfg!(target_os = "windows") { "powershell" } else { "bash" };
     let flag  = if cfg!(target_os = "windows") { "-Command" } else { "-c" };
 
@@ -839,13 +839,13 @@ async fn run_shell(app: &AppHandle, section: &str, script: &str) {
         Err(e) => {
             emit_line(app, section, &format!("Failed to spawn: {e}")).await;
             emit_status(app, section, "error").await;
-            return;
+            return vec![];
         }
     };
 
     let app1 = app.clone();
     let sec1 = section.to_string();
-    stream_child(&mut child, move |line| {
+    let lines = stream_child(&mut child, move |line| {
         let _ = app1.emit(
             "check-output",
             OutputPayload { section: sec1.clone(), line: line.to_string() },
@@ -853,6 +853,7 @@ async fn run_shell(app: &AppHandle, section: &str, script: &str) {
     })
     .await;
     emit_status(app, section, "done").await;
+    lines
 }
 
 // Sentinel lines emitted around each cask so the single-shell batch output can be
@@ -1150,12 +1151,75 @@ fi
 if command -v brew &>/dev/null; then
   echo "→  Refreshing Homebrew…"
   brew update --quiet 2>/dev/null
-  outdated=$(brew outdated --cask --greedy 2>/dev/null)
-  if [ -z "$outdated" ]; then
+  outdated=$(brew outdated --cask --greedy 2>/dev/null | awk 'NF { print $1 }')
+  # Casks Homebrew has disabled still show as outdated, but `brew upgrade`
+  # refuses them, so they could never clear. They are listed after the "→" line,
+  # where the item parsers stop, so they are neither counted nor offered.
+  disabled=""
+  if [ -n "$outdated" ] && command -v jq &>/dev/null; then
+    disabled=$(brew info --cask --json=v2 $outdated 2>/dev/null \
+      | jq -r '.casks[] | select(.disabled == true)
+          | [.token, (.disable_date // ""), (.disable_replacement_cask // "")] | join("|")' 2>/dev/null)
+  fi
+  updatable=""
+  while IFS= read -r tok; do
+    [ -z "$tok" ] && continue
+    printf '%s\n' "$disabled" | cut -d'|' -f1 | grep -qxF "$tok" && continue
+    updatable="$updatable$tok
+"
+  done <<< "$outdated"
+  if [ -z "$updatable" ]; then
     echo "✔  All Homebrew cask apps are up to date."
   else
     echo "⚠  Outdated apps:"
-    echo "$outdated" | while read -r line; do echo "   $line"; done
+    printf '%s' "$updatable" | while read -r line; do echo "   $line"; done
+  fi
+  if [ -n "$disabled" ]; then
+    echo "→  Homebrew has disabled these, so it can no longer update them. They are not counted:"
+    printf '%s\n' "$disabled" | while IFS='|' read -r tok date repl; do
+      msg="   $tok"
+      [ -n "$date" ] && msg="$msg (disabled $date)"
+      [ -n "$repl" ] && msg="$msg: replaced by $repl, install it with: brew install --cask $repl"
+      echo "$msg"
+    done
+  fi
+  # Apps installed twice: once from the App Store and again by Homebrew. Each
+  # source checks its own copy, and both counts stand when both copies are
+  # behind, but the user should know there are two. A cask is taken to own an
+  # App Store app when its artifacts name that app's bundle identifier or path,
+  # or its token, display name or app artifact is the app's name. The name test
+  # is needed for pkg casks: microsoft-word never names com.microsoft.Word
+  # outright, only inside its cleanup paths.
+  twice=""
+  if command -v jq &>/dev/null; then
+    mas_apps=$(for app in /Applications/*.app "$HOME/Applications"/*.app; do
+      [ -e "$app/Contents/_MASReceipt/receipt" ] || continue
+      printf '%s|%s\n' \
+        "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist" 2>/dev/null)" \
+        "$(basename "$app" .app)"
+    done)
+    installed=$(brew list --cask 2>/dev/null)
+    if [ -n "$mas_apps" ] && [ -n "$installed" ]; then
+      cask_refs=$(brew info --cask --json=v2 $installed 2>/dev/null \
+        | jq -r '.casks[] | .token as $t
+            | ((.artifacts | .. | strings | "\($t)|s|\(.)"),
+               ((.name[]?, $t, (.artifacts[]?.app[]? | strings)) | "\($t)|n|\(.)"))' 2>/dev/null)
+      twice=$(printf '%s\n' "$mas_apps" | while IFS='|' read -r id name; do
+        [ -z "$name" ] && continue
+        tok=$(printf '%s\n' "$cask_refs" | awk -F'|' -v id="$id" -v app="$name.app" '
+          function norm(x) { x = tolower(x); sub(/\.app$/, "", x); gsub(/[^a-z0-9]/, "", x); return x }
+          BEGIN { want = norm(app) }
+          ($2 == "s" && ((id != "" && $3 == id) || substr($3, length($3) - length(app)) == "/" app)) \
+            || ($2 == "n" && norm($3) == want) { print $1; exit }')
+        [ -n "$tok" ] && printf '%s|%s\n' "$name" "$tok"
+      done)
+    fi
+  fi
+  if [ -n "$twice" ]; then
+    echo "→  Installed twice, from the App Store and by Homebrew. Each copy is checked and counted on its own:"
+    printf '%s\n' "$twice" | while IFS='|' read -r name tok; do
+      echo "   $name: App Store, and Homebrew cask $tok"
+    done
   fi
 else
   echo "✖  brew not found — install from https://brew.sh"
@@ -1178,11 +1242,21 @@ fi
         "untracked_apps" => Some(r#"
 cask_tokens=""
 cask_apps=""
+cask_strings=""
 if command -v brew &>/dev/null; then
   cask_tokens=$(brew list --cask 2>/dev/null)
   if [ -n "$cask_tokens" ] && command -v jq &>/dev/null; then
-    cask_apps=$(brew info --cask --json=v2 $cask_tokens 2>/dev/null \
+    cask_json=$(brew info --cask --json=v2 $cask_tokens 2>/dev/null)
+    cask_apps=$(printf '%s' "$cask_json" \
       | jq -r '.casks[].artifacts[]?.app[]? | select(type=="string")' 2>/dev/null)
+    # Every string anywhere in an installed cask's artifacts. The uninstall
+    # stanzas name the bundle identifiers a cask is responsible for, and for a
+    # cask that installs from a .pkg that is the only thing tying it to its app:
+    # tailscale-app declares no app artifact and shares no spelling with
+    # Tailscale.app, and zoom does not look like zoom.us.app. It is the same
+    # evidence the cask search uses to offer that cask in the first place.
+    cask_strings=$(printf '%s' "$cask_json" \
+      | jq -r '.casks[].artifacts | .. | strings' 2>/dev/null)
   fi
 fi
 
@@ -1197,13 +1271,15 @@ is_tracked() {
   case "$base" in
     *[Uu]ninstall*|*"Helper.app"|*"URL Handler.app") return 0 ;;
   esac
-  case "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist" 2>/dev/null)" in
+  local bundle_id
+  bundle_id=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist" 2>/dev/null)
+  case "$bundle_id" in
     com.google.drivefs.shortcuts.*) return 0 ;;
   esac
   # PartyMAN updates itself, so it has no business appearing in its own list of
   # apps that lack auto-updates. Matched on bundle identifier so renaming the
   # app or installing it elsewhere does not bring it back.
-  [ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist" 2>/dev/null)" = "com.partyman.updater" ] && return 0
+  [ "$bundle_id" = "com.partyman.updater" ] && return 0
   # Apple ships its own apps under two different leaf certificates: older ones
   # say "Software Signing", current ones "macOS Software Signing". Matching only
   # the former let Apple's own apps — Safari among them — fall through as
@@ -1212,6 +1288,10 @@ is_tracked() {
   codesign -dvv "$app" 2>&1 | grep -qE "^Authority=(macOS )?Software Signing" && return 0
   [ -e "$app/Contents/_MASReceipt/receipt" ] && return 0
   [ -n "$cask_apps" ] && echo "$cask_apps" | grep -qxF "$base" && return 0
+  if [ -n "$cask_strings" ]; then
+    [ -n "$bundle_id" ] && echo "$cask_strings" | grep -qxF "$bundle_id" && return 0
+    echo "$cask_strings" | grep -qxF "$app" && return 0
+  fi
   local norm
   norm=$(echo "${base%.app}" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9')
   local tok
@@ -1350,7 +1430,15 @@ fi
 #[tauri::command]
 async fn run_check(app: AppHandle, section: String) {
     match check_script(&section) {
-        Some(script) => run_shell(&app, &section, script).await,
+        Some(script) => {
+            let lines = run_shell(&app, &section, script).await;
+            // A check the user runs updates the count too, not only a scheduled one.
+            if schedule::CHECKED_SECTIONS.contains(&section.as_str()) {
+                let cfg = schedule::record_section(&app, &section, lines);
+                set_tray_count(&app, cfg.last_total);
+                let _ = app.emit("schedule-updated", cfg);
+            }
+        }
         None => {
             emit_line(&app, &section, &format!("Unknown section: {section}")).await;
             emit_status(&app, &section, "error").await;
@@ -1925,7 +2013,7 @@ fn set_schedule(app: AppHandle, config: schedule::ScheduleConfig) -> Result<sche
         ..config
     };
     let mut cfg = cfg;
-    cfg.last_total = schedule::total_from_counts(&cfg.last_counts, cfg.count_dev_updates);
+    cfg.last_total = schedule::total_from_counts(&cfg.last_counts);
     schedule::save(&app, &cfg)?;
     schedule::sync_agent(&cfg)?;
     set_tray_count(&app, cfg.last_total);
@@ -2053,10 +2141,7 @@ pub fn run() {
             // Recomputed rather than trusted: a total stored before the counting
             // rule changed would otherwise sit in the menu bar until the next run.
             let mut startup_cfg = schedule::load(&handle);
-            startup_cfg.last_total = schedule::total_from_counts(
-                &startup_cfg.last_counts,
-                startup_cfg.count_dev_updates,
-            );
+            startup_cfg.last_total = schedule::total_from_counts(&startup_cfg.last_counts);
             let _ = schedule::save(&handle, &startup_cfg);
             set_tray_count(&handle, startup_cfg.last_total);
 

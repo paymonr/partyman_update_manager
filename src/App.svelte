@@ -255,14 +255,13 @@
     lastTotal: number;
     lastCounts: Record<string, number>;
     snoozedUntil: number;
-    countDevUpdates: boolean;
     checkOnLaunch: boolean;
   };
 
   let schedule: ScheduleConfig = {
     enabled: false, frequency: "daily", minute: 0, hour: 10, weekday: 1, notify: true,
     lastRun: 0, lastTotal: 0, lastCounts: {}, snoozedUntil: 0,
-    countDevUpdates: false, checkOnLaunch: false,
+    checkOnLaunch: false,
   };
   let scheduleSaving = false;
   let scheduleRunning = false;
@@ -407,14 +406,42 @@
     showSettings = false;
     showHistory = false;
     showAbout = false;
-    const pending = Object.entries(schedule.lastCounts)
-      .filter(([, n]) => n > 0)
+    // Only what the count reports. Developer tooling is never installed from
+    // here: it is not part of the count, and "Install Now" must not run
+    // `brew upgrade`, `npm update -g` or pip across hundreds of packages.
+    const pending = countedEntries(schedule.lastCounts)
       .map(([id]) => id)
       .filter((id) => sections.some((sec) => sec.id === id && platformVisible(sec)));
     for (const id of pending) {
       activeTab = id;
       await runUpgrade(id);
     }
+  }
+
+  // Apps installed both from the App Store and by Homebrew, as the Homebrew
+  // check reports them. Each copy is still checked and counted on its own.
+  const TWICE_HEADER = "→  Installed twice";
+
+  function parseInstalledTwice(lines: string[]): string[] {
+    const found: string[] = [];
+    let inBlock = false;
+    for (const line of lines) {
+      if (line.startsWith(TWICE_HEADER)) { inBlock = true; continue; }
+      if (!inBlock) continue;
+      if (line.trim().startsWith("→") || !line.startsWith("   ")) break;
+      found.push(line.trim());
+    }
+    return found;
+  }
+
+  $: installedTwice = parseInstalledTwice(outputs["brew_casks"] ?? []);
+  let installedTwiceDismissed = false;
+
+  // The per-section counts that make up the total: apps and system updates.
+  function countedEntries(counts: Record<string, number>): [string, number][] {
+    return Object.entries(counts).filter(
+      ([id, n]) => n > 0 && sections.some((sec) => sec.id === id && !sec.dev),
+    );
   }
 
   function formatWhen(ts: number): string {
@@ -585,8 +612,11 @@
       upgradeStatuses[payload.section] = payload.status as Status;
       upgradeStatuses = upgradeStatuses;
       // Re-check what is left so the menu-bar count matches what is now installed
-      // instead of what was outstanding before the upgrade ran.
-      if (payload.status === "done") {
+      // instead of what was outstanding before the upgrade ran. Not for the App
+      // Store: "updating" there only opens the App Store, so a recount now would
+      // record the updates as still outstanding before the user has installed
+      // anything. Its count moves on its next check.
+      if (payload.status === "done" && payload.section !== "app_store") {
         invoke("recount_section", { section: payload.section }).catch((e) =>
           console.error("Failed to recount after upgrade:", e),
         );
@@ -1069,6 +1099,21 @@
     </div>
   {/if}
 
+  {#if installedTwice.length > 0 && !installedTwiceDismissed}
+    <div class="twice-banner">
+      <div class="twice-text">
+        <strong>Installed twice.</strong>
+        {installedTwice.length === 1 ? "This app is" : "These apps are"} installed from the App Store
+        and by Homebrew. Each copy is checked for updates and counted on its own, so
+        you may want to keep just one.
+        <ul>
+          {#each installedTwice as entry}<li>{entry}</li>{/each}
+        </ul>
+      </div>
+      <button class="banner-dismiss" onclick={() => { installedTwiceDismissed = true; }}>✕</button>
+    </div>
+  {/if}
+
   {#if showWhatsNew}
     <div class="settings-panel">
       <div class="page-header">
@@ -1195,18 +1240,6 @@
             <input type="checkbox" bind:checked={schedule.notify}
               onchange={saveSchedule} disabled={scheduleSaving} />
           </label>
-          <label class="settings-row">
-            <div class="settings-row-info">
-              <span class="settings-row-label">Include developer tools in the count</span>
-              <span class="settings-row-desc">
-                Counts brew formulae, npm, pip and gems too. They often run to hundreds of
-                packages, so by default the count sticks to apps and system updates.
-                Developer tools are counted as of the last scheduled check.
-              </span>
-            </div>
-            <input type="checkbox" bind:checked={schedule.countDevUpdates}
-              onchange={saveSchedule} disabled={scheduleSaving} />
-          </label>
           {#if isSnoozed()}
             <div class="settings-row">
               <div class="settings-row-info">
@@ -1231,9 +1264,9 @@
               {scheduleRunning ? "Checking…" : "Run Now"}
             </button>
           </div>
-          {#if Object.values(schedule.lastCounts).some((n) => n > 0)}
+          {#if countedEntries(schedule.lastCounts).length > 0}
             <div class="schedule-breakdown">
-              {#each Object.entries(schedule.lastCounts).filter(([, n]) => n > 0) as [sec, n]}
+              {#each countedEntries(schedule.lastCounts) as [sec, n]}
                 <span class="schedule-chip">{sectionLabel(sec)} <strong>{n}</strong></span>
               {/each}
             </div>
@@ -1843,6 +1876,18 @@
   }
 
   .update-prompt-count { font-weight: 600; }
+
+  .twice-banner {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    margin: 0 0 14px;
+    padding: 9px 12px;
+    border-radius: var(--pm-radius);
+    background: var(--pm-info-tint);
+    font-size: 0.82rem;
+  }
+  .twice-text ul { margin: 4px 0 0; padding-left: 18px; }
 
   .update-prompt-later {
     margin-left: 4px;
