@@ -88,6 +88,7 @@ html.km[data-theme="night"] { color-scheme: dark; }
   --pm-ok-fg: #0d1a0d;
   --pm-err: #ef4444;
   --pm-err-border: #ef444444;
+  --pm-err-bg: #2d1a1a;
   --pm-cask-none: #4a3030;
 
   --pm-shadow: #00000055;
@@ -146,6 +147,7 @@ html.km {
   --pm-ok-fg: var(--state-ok-text);
   --pm-err: var(--state-error);
   --pm-err-border: var(--state-error-border);
+  --pm-err-bg: var(--state-error-surface);
   --pm-cask-none: var(--fg-faint);
 
   --pm-shadow: rgba(0, 0, 0, 0.45);
