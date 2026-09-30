@@ -134,11 +134,11 @@ machine (the askpass flow), so a server cannot install silently. A server
 *requests*; the app shows the request as pending until someone at the Mac clicks.
 That matches the app's stance today — it only ever checks; a person starts installs.
 
-- [ ] One structured inventory in Rust — `{source, name, installed, available,
+- [x] One structured inventory in Rust — `{source, name, installed, available,
       updatable}` — read by the UI, the menu-bar count and the server alike.
-      Today what is outdated is parsed from shell output twice, by regex
-      (`schedule.rs` → `parse_items()` / `count_for()`, `App.svelte` →
-      `parseItems()`); a server would be a third copy.
+      *(The check scripts emit one `__PM_ITEM__` line per item; `schedule.rs` →
+      `parse_items()` is the only parser, and the window receives items rather
+      than output.)*
 - [ ] Decide the direction (app posts on each check, or server polls the app),
       identity (which Mac is this), and auth.
 - [ ] A "requested by your admin" state in the UI: a highlighted group with an
@@ -156,5 +156,4 @@ If it comes back, the natural shape is an "All updates" row at the top of the
 sidebar that shows the dashboard cards, rather than a layout switch.
 
 - [ ] Build the dashboard as the overview page behind an "All updates" row.
-- [ ] Show real app names and versions in lists ("Docker Desktop · 4.86 → 4.93")
-      — Homebrew reports both; needs the structured inventory above.
+- [x] Show real app names and versions in lists ("Docker Desktop · 4.86 → 4.93").

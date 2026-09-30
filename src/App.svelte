@@ -24,6 +24,24 @@
     id: string;
     name: string;
     appDir?: string;
+    installed?: string;
+    available?: string;
+    /** "restart" when installing it restarts the Mac. */
+    note?: string;
+    /** Set aside by the user until a newer version is available. */
+    ignored?: boolean;
+  }
+
+  // Homebrew appends a build number after a comma; the version is enough here.
+  function shortVersion(v?: string): string {
+    return (v ?? "").split(",")[0];
+  }
+
+  function versionLabel(item: CheckItem): string {
+    const to = shortVersion(item.available);
+    if (!to) return "";
+    const from = shortVersion(item.installed);
+    return from ? `${from} → ${to}` : to;
   }
 
   interface CaskCandidate {
@@ -45,6 +63,25 @@
     items: string[];
     item_names: string[];
     lines: string[];
+    run_id: string;
+    kind: "update" | "adopt" | string;
+    outcome: "ok" | "partial" | "failed" | string;
+    duration_secs: number;
+    exit_code: number | null;
+    versions: { item: string; from: string; to: string }[];
+  }
+
+  // One run of the app — a batch of casks, an adoption, a section upgrade —
+  // as the history shows it: its entries, and the tally across them.
+  interface HistoryRun {
+    id: string;
+    ts: number;
+    section: string;
+    kind: string;
+    entries: HistoryEntry[];
+    ok: number;
+    failed: number;
+    duration: number;
   }
 
   const sections: Section[] = [
@@ -132,7 +169,72 @@
   let appVersion = "";
   let historyEntries: HistoryEntry[] = [];
   let historySearch = "";
-  let expandedHistoryEntry: number | null = null;
+  let historyFailedOnly = false;
+  let expandedRun: string | null = null;
+  let expandedEntry: string | null = null;
+  // Entries whose full, uncleaned output is showing.
+  let rawFor: Record<string, boolean> = {};
+
+  function groupRuns(entries: HistoryEntry[]): HistoryRun[] {
+    const runs: HistoryRun[] = [];
+    for (const e of entries) {
+      const last = runs[runs.length - 1];
+      if (last && last.id === e.run_id) {
+        // The list is newest first, so a run's entries arrive last-to-first;
+        // within the run, keep the order the apps were done in.
+        last.entries.unshift(e);
+      } else {
+        runs.push({ id: e.run_id, ts: e.ts, section: e.section, kind: e.kind, entries: [e], ok: 0, failed: 0, duration: 0 });
+      }
+      const run = runs[runs.length - 1];
+      if (e.outcome === "ok") run.ok += 1; else run.failed += 1;
+      run.duration = Math.max(run.duration, e.duration_secs);
+    }
+    return runs;
+  }
+
+  function runSummary(run: HistoryRun): string {
+    // A section-wide upgrade is one entry with no items; count it as "everything".
+    const things = run.entries.reduce((n, e) => n + Math.max(1, e.items.length), 0);
+    const noun = run.kind === "adopt"
+      ? (things === 1 ? "app handed to Homebrew" : "apps handed to Homebrew")
+      : run.entries.length === 1 && run.entries[0].items.length === 0
+        ? "everything"
+        : (things === 1 ? "update" : "updates");
+    const count = noun === "everything" ? "everything" : `${things} ${noun}`;
+    const tally = run.failed === 0
+      ? "done"
+      : run.ok === 0 ? "failed" : `${run.ok} done, ${run.failed} failed`;
+    return `${count} · ${tally}${run.duration ? ` · ${fmtDuration(run.duration)}` : ""}`;
+  }
+
+  function fmtDuration(secs: number): string {
+    if (secs < 60) return `${secs}s`;
+    const m = Math.floor(secs / 60), s = secs % 60;
+    return s ? `${m}m ${s}s` : `${m}m`;
+  }
+
+  function outcomeMark(outcome: string): string {
+    return outcome === "ok" ? "✓" : outcome === "partial" ? "◐" : "✖";
+  }
+
+  function entryNames(e: HistoryEntry): string {
+    return e.item_names.length ? e.item_names.join(", ") : "Everything";
+  }
+
+  // Homebrew appends a build number after a comma; the version is enough here.
+  function versionText(e: HistoryEntry): string {
+    return e.versions.map((v) => `${v.from.split(",")[0]} → ${v.to.split(",")[0]}`).join(", ");
+  }
+
+  function toggleRun(id: string) {
+    expandedRun = expandedRun === id ? null : id;
+    expandedEntry = null;
+  }
+
+  function toggleEntry(key: string) {
+    expandedEntry = expandedEntry === key ? null : key;
+  }
   let caskSearch: Record<string, CaskSearchState> = {};
 
   const HIDDEN_APPS_KEY = "hiddenUntrackedApps";
@@ -264,12 +366,13 @@
     snoozedUntil: number;
     checkOnLaunch: boolean;
     showDevTools: boolean;
+    ignored: { section: string; id: string; name: string; available: string; since: number }[];
   };
 
   let schedule: ScheduleConfig = {
     enabled: false, frequency: "daily", minute: 0, hour: 10, weekday: 1, notify: true,
     lastRun: 0, lastTotal: 0, lastCounts: {}, snoozedUntil: 0,
-    checkOnLaunch: false, showDevTools: false,
+    checkOnLaunch: false, showDevTools: false, ignored: [],
   };
   let scheduleSaving = false;
   let scheduleRunning = false;
@@ -377,6 +480,7 @@
         ts: number;
         sections: Record<string, string[]>;
         sectionTs?: Record<string, number>;
+        items?: Record<string, CheckItem[]>;
       }>("get_last_check");
       if (!last?.ts) return;
       for (const [id, lines] of Object.entries(last.sections ?? {})) {
@@ -385,9 +489,9 @@
         // A manual run skips developer tooling, so those sections keep their own,
         // older time rather than the time of the run.
         const when = new Date((last.sectionTs?.[id] ?? last.ts) * 1000);
-        outputs[id] = lines;
-        parsedItems[id] = parseItems(id, lines);
-        selectedItems[id] = parsedItems[id].map((i) => i.id);
+        outputs[id] = lines.filter((l) => !l.startsWith("__PM_"));
+        parsedItems[id] = last.items?.[id] ?? [];
+        selectedItems[id] = parsedItems[id].filter((i) => !i.ignored).map((i) => i.id);
         viewMode[id] = parsedItems[id].length > 0 ? "select" : "readonly";
         statuses[id] = "done";
         if (!lastChecked[id] || lastChecked[id]!.getTime() < when.getTime()) {
@@ -433,7 +537,7 @@
       activeTab = id;
       // The parsed list already leaves out what cannot be updated (casks
       // Homebrew has disabled), so prefer it to a blanket section upgrade.
-      const items = (parsedItems[id] ?? []).map((i) => i.id);
+      const items = (parsedItems[id] ?? []).filter((i) => !i.ignored).map((i) => i.id);
       if (items.length > 0) await runUpgradeItems(id, items);
       else await runUpgrade(id);
     }
@@ -505,61 +609,6 @@
     } catch {}
   }
 
-  function parseItems(section: string, lines: string[]): CheckItem[] {
-    if (section === "brew_casks") {
-      const items: CheckItem[] = [];
-      let inBlock = false;
-      for (const line of lines) {
-        if (line.includes("Outdated apps:")) { inBlock = true; continue; }
-        if (inBlock && line.trim().startsWith("→")) break;
-        if (inBlock && line.trim()) {
-          const name = line.trim().split(/\s+/)[0];
-          if (name) items.push({ id: name, name });
-        }
-      }
-      return items;
-    }
-    if (section === "app_store") {
-      const items: CheckItem[] = [];
-      let inBlock = false;
-      for (const line of lines) {
-        if (line.includes("Outdated App Store apps:")) { inBlock = true; continue; }
-        if (inBlock && line.trim().startsWith("→")) break;
-        if (inBlock && line.trim()) {
-          const parts = line.trim().split(/\s+/);
-          const id = parts[0];
-          const name = parts.slice(1).join(" ").replace(/\s*\([^)]+\)\s*$/, "").trim();
-          if (id && /^\d+$/.test(id)) items.push({ id, name: name || id });
-        }
-      }
-      return items;
-    }
-    if (section === "macos_updates") {
-      const items: CheckItem[] = [];
-      for (const line of lines) {
-        const m = line.match(/\*\s*Label:\s*(.+)/);
-        if (m) {
-          const label = m[1].trim();
-          items.push({ id: label, name: label });
-        }
-      }
-      return items;
-    }
-    if (section === "untracked_apps") {
-      const items: CheckItem[] = [];
-      for (const line of lines) {
-        const m = line.match(/⚠\s+(.+?)(\s+\[~\/Applications\])?$/);
-        if (m) {
-          const name = m[1].trim();
-          const appDir = m[2] ? "~/Applications" : undefined;
-          items.push({ id: name, name, appDir });
-        }
-      }
-      return items;
-    }
-    return [];
-  }
-
   onMount(async () => {
     currentPlatform = await invoke<string>("get_platform");
     appVersion = await getVersion();
@@ -595,7 +644,7 @@
       outputs = outputs;
     });
 
-    await listen<{ section: string; status: string }>("check-status", ({ payload }) => {
+    await listen<{ section: string; status: string; items?: CheckItem[] }>("check-status", ({ payload }) => {
       statuses[payload.section] = payload.status as Status;
       statuses = statuses;
       if (payload.status === "done" || payload.status === "error") {
@@ -603,12 +652,12 @@
         lastChecked = lastChecked;
         saveLastChecked();
         if (itemSections.has(payload.section)) {
-          const items = parseItems(payload.section, outputs[payload.section]);
+          const items = payload.items ?? [];
           parsedItems[payload.section] = items;
           parsedItems = parsedItems;
           // Everything starts selected: updating what is outdated is the
           // common case, and unticking one is easier than ticking sixteen.
-          selectedItems[payload.section] = items.map((i) => i.id);
+          selectedItems[payload.section] = items.filter((i) => !i.ignored).map((i) => i.id);
           selectedItems = selectedItems;
           viewMode[payload.section] = items.length > 0 ? "select" : "readonly";
           viewMode = viewMode;
@@ -811,7 +860,7 @@
   }
 
   function selectAll(sectionId: string) {
-    selectedItems[sectionId] = parsedItems[sectionId].map(i => i.id);
+    selectedItems[sectionId] = parsedItems[sectionId].filter(i => !i.ignored).map(i => i.id);
     selectedItems = selectedItems;
   }
 
@@ -843,7 +892,7 @@
           ? (items[s.id] ?? []).filter((i) => !hidden.includes(i.name)).length
           : null;
       } else if (itemSections.has(s.id) && st[s.id] === "done") {
-        out[s.id] = (items[s.id] ?? []).length;
+        out[s.id] = (items[s.id] ?? []).filter((i) => !i.ignored).length;
       } else if (s.id in recorded) {
         out[s.id] = recorded[s.id];
       } else {
@@ -908,16 +957,51 @@
   $: activeFoundCount = activeSectionId === "untracked_apps"
     ? activeParsedItems.filter(it => caskSearch[it.id]?.status === "found").length
     : 0;
+  $: activeVisibleItems = activeParsedItems.filter((i) => !i.ignored);
+  $: activeIgnoredItems = activeParsedItems.filter((i) => i.ignored);
+  let showIgnored = false;
+
+  // Ignoring is per version: the item comes back when something newer turns up.
+  async function ignoreItem(item: CheckItem) {
+    const section = activeSectionId;
+    try {
+      schedule = await invoke<ScheduleConfig>("ignore_item", {
+        section, id: item.id, name: item.name, available: item.available ?? null,
+      });
+      parsedItems[section] = (parsedItems[section] ?? []).map((i) => i.id === item.id ? { ...i, ignored: true } : i);
+      parsedItems = parsedItems;
+      selectedItems[section] = (selectedItems[section] ?? []).filter((id) => id !== item.id);
+      selectedItems = selectedItems;
+    } catch (e) {
+      console.error("Failed to ignore:", e);
+    }
+  }
+
+  async function unignoreItem(item: CheckItem) {
+    const section = activeSectionId;
+    try {
+      schedule = await invoke<ScheduleConfig>("unignore_item", { section, id: item.id });
+      parsedItems[section] = (parsedItems[section] ?? []).map((i) => i.id === item.id ? { ...i, ignored: false } : i);
+      parsedItems = parsedItems;
+      selectedItems[section] = [...(selectedItems[section] ?? []), item.id];
+      selectedItems = selectedItems;
+    } catch (e) {
+      console.error("Failed to stop ignoring:", e);
+    }
+  }
+
   $: showSelectView = activeHasItemSelection && activeStatus === "done" && activeParsedItems.length > 0 && activeViewMode === "select";
 
   $: filteredHistory = historySearch.trim()
     ? historyEntries.filter(e => {
         const q = historySearch.toLowerCase();
         return e.label.toLowerCase().includes(q)
+          || sectionLabel(e.section).toLowerCase().includes(q)
           || e.item_names.some(n => n.toLowerCase().includes(q))
           || e.lines.some(l => l.toLowerCase().includes(q));
       })
     : historyEntries;
+  $: historyRuns = groupRuns(filteredHistory).filter((r) => !historyFailedOnly || r.failed > 0);
 
   type AppUpdateStatus = "idle" | "checking" | "up-to-date" | "available" | "error";
   interface AppUpdateInfo { version: string; url: string; notes: string; }
@@ -1032,9 +1116,28 @@
     return out;
   }
 
+  // The short version of a recorded run, by one rule for every kind of run:
+  // the app's own status lines, Homebrew's errors and warnings, and version
+  // changes. Nothing else, so two entries read alike. The full text is one
+  // click away. When nothing matches, the first few lines stand in.
+  function cleanLog(lines: string[]): string[] {
+    const out: string[] = [];
+    for (const raw of dropTapTrustBlock(lines)) {
+      const l = raw.trim();
+      if (!l) continue;
+      const keep =
+        /^(→|✔|✖|⚠|🍺)/.test(l)
+        || (/^(Error|Warning):/.test(l) && !/tap|quarantine approval|already downloaded/i.test(l))
+        || /^\S+ \S+ -> \S+$/.test(l) || /^\S+ -> \S+$/.test(l);
+      if (keep && out[out.length - 1] !== l) out.push(l);
+    }
+    return out.length > 0 ? out : lines.slice(0, 6);
+  }
+
   function simplifyUntrackedLog(lines: string[]): string[] {
     return dropTapTrustBlock(lines)
       .filter(l => !skipPatterns.some(p => p.test(l)))
+      .filter((l, i, all) => !/^==> Would install \d+ casks?:/.test(l) && !/^==> Would install \d+ casks?:/.test(all[i - 1] ?? ""))
       .map((l): string | null => {
         if (/^==> Fetching downloads for:/.test(l))
           return `Downloading ${l.replace(/^==> Fetching downloads for:\s*/, "")}…`;
@@ -1226,29 +1329,56 @@
     <div class="page">
       <div class="page-head">
         <h2>History <span class="page-sub">last 180 days</span></h2>
+        <button class="btn btn-small" class:btn-primary={historyFailedOnly}
+          onclick={() => { historyFailedOnly = !historyFailedOnly; }} aria-pressed={historyFailedOnly}>Failed only</button>
         <input class="search" type="search" placeholder="Search" bind:value={historySearch} />
       </div>
       <div class="page-body history">
-        {#if filteredHistory.length === 0}
-          <p class="empty">{historyEntries.length === 0 ? "Nothing has been updated from here yet." : "Nothing matches that search."}</p>
+        {#if historyRuns.length === 0}
+          <p class="empty">
+            {#if historyEntries.length === 0}Nothing has been updated from here yet.
+            {:else if historyFailedOnly && !historySearch.trim()}Nothing has failed. Good.
+            {:else}Nothing matches.{/if}
+          </p>
         {:else}
-          {#each filteredHistory as entry, i}
-            <div class="history-entry" class:open={expandedHistoryEntry === i}>
-              <button class="history-row" onclick={() => expandedHistoryEntry = expandedHistoryEntry === i ? null : i}>
-                <span class="history-when">{formatShort(new Date(entry.ts * 1000))}</span>
-                <span class="history-what">
-                  <span class="history-source">{sectionLabel(entry.section)}</span>
-                  {#if entry.item_names.length > 0}
-                    {#each entry.item_names as name}<span class="chip">{name}</span>{/each}
-                  {:else}
-                    <span class="chip chip-quiet">everything</span>
-                  {/if}
+          {#each historyRuns as run (run.id)}
+            <div class="run" class:open={expandedRun === run.id}>
+              <button class="run-row" onclick={() => toggleRun(run.id)} aria-expanded={expandedRun === run.id}>
+                <span class="history-when">{formatShort(new Date(run.ts * 1000))}</span>
+                <span class="run-what">
+                  <span class="history-source">{sectionLabel(run.section)}</span>
+                  <span class="run-summary">{runSummary(run)}</span>
                 </span>
-                <span class="history-caret" aria-hidden="true">{expandedHistoryEntry === i ? "▾" : "▸"}</span>
+                <span class="mark" class:ok={run.failed === 0} class:bad={run.failed > 0 && run.ok === 0} class:mixed={run.failed > 0 && run.ok > 0}>
+                  {run.failed === 0 ? "✓" : run.ok === 0 ? "✖" : "◐"}
+                </span>
+                <span class="history-caret" aria-hidden="true">{expandedRun === run.id ? "▾" : "▸"}</span>
               </button>
-              {#if expandedHistoryEntry === i}
-                <div class="output history-output">
-                  {#each entry.lines as line}<div class="line">{line}</div>{/each}
+              {#if expandedRun === run.id}
+                <div class="run-body">
+                  {#each run.entries as entry, j}
+                    {@const key = `${run.id}:${j}`}
+                    <div class="run-item">
+                      <button class="run-item-row" onclick={() => toggleEntry(key)} aria-expanded={expandedEntry === key}>
+                        <span class="mark" class:ok={entry.outcome === "ok"} class:bad={entry.outcome === "failed"} class:mixed={entry.outcome === "partial"}>{outcomeMark(entry.outcome)}</span>
+                        <span class="run-item-name">{entryNames(entry)}</span>
+                        {#if entry.versions.length > 0}<span class="run-item-ver">{versionText(entry)}</span>{/if}
+                        {#if entry.outcome === "failed"}<span class="run-item-note">failed</span>{/if}
+                        <span class="history-caret" aria-hidden="true">{expandedEntry === key ? "▾" : "▸"}</span>
+                      </button>
+                      {#if expandedEntry === key}
+                        <div class="output history-output">
+                          {#each (rawFor[key] ? entry.lines : cleanLog(entry.lines)) as line}
+                            <div class="line" class:ok={line.startsWith("✔") || line.startsWith("🍺") || line.startsWith("→  Done")} class:bad={line.startsWith("✖")}>{line}</div>
+                          {/each}
+                          {#if entry.lines.length === 0}<p class="empty">No output was recorded.</p>{/if}
+                          <button class="btn btn-plain btn-small raw-toggle" onclick={() => { rawFor[key] = !rawFor[key]; rawFor = rawFor; }}>
+                            {rawFor[key] ? "Show the short version" : "Show everything Homebrew said"}
+                          </button>
+                        </div>
+                      {/if}
+                    </div>
+                  {/each}
                 </div>
               {/if}
             </div>
@@ -1415,6 +1545,13 @@
             <input type="checkbox" bind:checked={autoCheckUpdates}
               onchange={() => localStorage.setItem("autoCheckUpdates", String(autoCheckUpdates))} />
           </label>
+          <div class="row">
+            <span class="row-text">
+              <span class="row-label">Logs</span>
+              <span class="row-desc">What was updated (updates.log) and what the app itself did (partyman.log)</span>
+            </span>
+            <button class="btn" onclick={() => invoke("open_logs_folder")}>Show in Finder</button>
+          </div>
           <div class="about">
             <img src={iconUrl} alt="" class="about-icon" />
             <div>
@@ -1506,13 +1643,36 @@
               </footer>
             {:else}
               <div class="list">
-                {#each activeParsedItems as item}
+                {#each activeVisibleItems as item (item.id)}
                   <label class="item">
                     <input type="checkbox" checked={activeSelectedItems.includes(item.id)}
                       onchange={(e) => toggleItem(activeSectionId, item.id, (e.target as HTMLInputElement).checked)} />
                     <span class="item-name">{item.name}</span>
+                    {#if item.note === "restart"}<span class="item-tag">Restart required</span>{/if}
+                    {#if versionLabel(item)}<span class="item-ver">{versionLabel(item)}</span>{/if}
+                    <button class="btn btn-plain btn-small item-ignore" title="Leave this out of the count until a newer version is available"
+                      onclick={(e) => { e.preventDefault(); e.stopPropagation(); ignoreItem(item); }}>Ignore</button>
                   </label>
                 {/each}
+                {#if activeVisibleItems.length === 0}
+                  <p class="empty">Nothing to update here.</p>
+                {/if}
+                {#if activeIgnoredItems.length > 0}
+                  <div class="ignored-group">
+                    <button class="btn btn-plain btn-small" onclick={() => { showIgnored = !showIgnored; }} aria-expanded={showIgnored}>
+                      {showIgnored ? "▾" : "▸"} {activeIgnoredItems.length} ignored until a newer version
+                    </button>
+                    {#if showIgnored}
+                      {#each activeIgnoredItems as item (item.id)}
+                        <div class="item item-ignored">
+                          <span class="item-name">{item.name}</span>
+                          {#if versionLabel(item)}<span class="item-ver">{versionLabel(item)}</span>{/if}
+                          <button class="btn btn-plain btn-small" onclick={() => unignoreItem(item)}>Stop ignoring</button>
+                        </div>
+                      {/each}
+                    {/if}
+                  </div>
+                {/if}
               </div>
               <footer class="source-foot">
                 <button class="btn btn-primary" onclick={() => runUpgradeItems(activeSectionId, activeSelectedItems)}
@@ -1526,7 +1686,7 @@
                 <button class="btn btn-plain" onclick={() => selectNone(activeSectionId)}
                   disabled={activeSelectedItems.length === 0}>Deselect all</button>
                 {#if activeSectionId !== "app_store"}
-                  <span class="foot-note">You'll be asked for your password once, if it's needed.</span>
+                  <span class="foot-note">You may be asked for your password.</span>
                 {/if}
               </footer>
             {/if}
@@ -1746,6 +1906,13 @@
   .item:hover { background: var(--pm-card); }
   .item input[type="checkbox"] { accent-color: var(--pm-accent); width: 14px; height: 14px; flex-shrink: 0; cursor: pointer; }
   .item-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--pm-text); }
+  .item-ver { flex-shrink: 0; color: var(--pm-muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+  .item-tag { flex-shrink: 0; font-size: 11px; padding: 1px 7px; border-radius: 999px; background: var(--pm-border); color: var(--pm-text-2); }
+  .item-ignore { opacity: 0; }
+  .item:hover .item-ignore, .item-ignore:focus-visible { opacity: 1; }
+  .item-ignored { cursor: default; color: var(--pm-muted); }
+  .item-ignored .item-name { color: var(--pm-muted); }
+  .ignored-group { margin-top: 8px; padding-top: 6px; border-top: 1px dashed var(--pm-border); }
   .item-untracked { cursor: default; }
   .item-side { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
   .item-note { font-size: 12px; color: var(--pm-muted); }
@@ -1792,19 +1959,29 @@
   .search::placeholder { color: var(--pm-faint); }
 
   .history { padding: 4px 0; }
-  .history-entry { border-bottom: 1px solid var(--pm-border); }
-  .history-row {
-    display: flex; align-items: flex-start; gap: 14px; width: 100%;
-    padding: 9px 18px; border: none; background: transparent; text-align: left; cursor: pointer;
+  .run { border-bottom: 1px solid var(--pm-border); }
+  .run-row, .run-item-row {
+    display: flex; align-items: center; gap: 12px; width: 100%;
+    border: none; background: transparent; text-align: left; cursor: pointer; color: inherit;
   }
-  .history-row:hover { background: var(--pm-card); }
-  .history-when { width: 128px; flex-shrink: 0; color: var(--pm-muted); font-size: 12px; padding-top: 2px; font-variant-numeric: tabular-nums; }
-  .history-what { flex: 1; display: flex; flex-wrap: wrap; align-items: center; gap: 5px; }
-  .history-source { color: var(--pm-text); font-weight: 500; margin-right: 4px; }
-  .chip { padding: 1px 7px; border-radius: 999px; background: var(--pm-card); border: 1px solid var(--pm-border); font-size: 12px; color: var(--pm-text-2); }
-  .chip-quiet { color: var(--pm-muted); border-style: dashed; }
-  .history-caret { color: var(--pm-faint); font-size: 11px; padding-top: 3px; }
-  .history-output { flex: none; padding: 8px 18px 12px 160px; border-top: 1px solid var(--pm-border); }
+  .run-row { padding: 9px 18px; }
+  .run-row:hover, .run-item-row:hover { background: var(--pm-card); }
+  .history-when { width: 128px; flex-shrink: 0; color: var(--pm-muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+  .run-what { flex: 1; min-width: 0; display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px; }
+  .history-source { color: var(--pm-text); font-weight: 500; }
+  .run-summary { color: var(--pm-muted); font-size: 12px; }
+  .mark { width: 16px; flex-shrink: 0; text-align: center; font-weight: 700; color: var(--pm-muted); }
+  .mark.ok { color: var(--pm-ok); }
+  .mark.bad { color: var(--pm-err); }
+  .mark.mixed { color: var(--pm-accent); }
+  .history-caret { color: var(--pm-muted); font-size: 13px; flex-shrink: 0; width: 12px; text-align: center; }
+  .run-body { padding: 0 0 6px 146px; background: var(--pm-surface-2); border-top: 1px solid var(--pm-border); }
+  .run-item-row { padding: 6px 18px 6px 6px; font-size: 12.5px; }
+  .run-item-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--pm-text); }
+  .run-item-ver { color: var(--pm-muted); font-variant-numeric: tabular-nums; }
+  .run-item-note { color: var(--pm-err); font-size: 12px; }
+  .history-output { flex: none; margin: 0 18px 6px 0; border-radius: var(--pm-radius-sm); border: 1px solid var(--pm-border); padding: 8px 12px; }
+  .raw-toggle { margin-top: 6px; font-family: var(--pm-font); }
 
   .settings { padding: 6px 18px 24px; }
   .settings section { padding: 14px 0 6px; }

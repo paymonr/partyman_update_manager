@@ -21,6 +21,15 @@ struct StatusPayload {
     status: String,
 }
 
+// A finished check: its status and, for the sections that list items, what it
+// found — parsed once here rather than again from the output by the window.
+#[derive(Clone, serde::Serialize)]
+struct CheckDonePayload {
+    section: String,
+    status: String,
+    items: Vec<schedule::CheckItem>,
+}
+
 #[derive(Clone, serde::Serialize)]
 struct CaskCandidate {
     token: String,
@@ -150,7 +159,17 @@ async fn verify_cask_apps(app_name: &str, tokens: &[String]) -> std::collections
     verified
 }
 
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+struct VersionChange {
+    item: String,
+    from: String,
+    to: String,
+}
+
+// `default` at the container level so entries written before a field existed
+// still load; get_upgrade_history fills in what can be worked out for them.
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 struct HistoryEntry {
     ts: u64,
     section: String,
@@ -158,6 +177,100 @@ struct HistoryEntry {
     items: Vec<String>,
     item_names: Vec<String>,
     lines: Vec<String>,
+    /// Shared by every entry one run wrote, so a batch shows as one thing.
+    run_id: String,
+    /// "update", or "adopt" for an app handed to Homebrew.
+    kind: String,
+    /// "ok", "partial" or "failed". See outcome_from_lines.
+    outcome: String,
+    duration_secs: u64,
+    exit_code: Option<i32>,
+    versions: Vec<VersionChange>,
+}
+
+/// What a run's output says happened. The scripts mark each step with "→  Done"
+/// on success and "✖" on failure, and Homebrew prints "🍺 … was successfully
+/// upgraded!", so those are the signals — not "Error:" lines, which Homebrew
+/// also prints on a first attempt that a retry then rescues.
+fn outcome_from_lines(lines: &[String], exit_code: Option<i32>) -> &'static str {
+    let done = lines.iter().filter(|l| {
+        let t = l.trim_start();
+        t.starts_with("→  Done") || t.starts_with('✔') || (t.starts_with('🍺') && t.contains("successfully"))
+    }).count();
+    let failed = lines.iter().filter(|l| l.trim_start().starts_with('✖')).count();
+    if failed > 0 && done > 0 {
+        "partial"
+    } else if failed > 0 || (matches!(exit_code, Some(c) if c != 0) && done == 0) {
+        "failed"
+    } else {
+        "ok"
+    }
+}
+
+/// Version changes Homebrew reports, in either of its two shapes:
+///   ==> Upgrading docker-desktop
+///     4.86.0,236216 -> 4.93.0,240920
+/// and the closing summary line "docker-desktop 4.86.0,236216 -> 4.93.0,240920".
+fn versions_from_lines(lines: &[String], only_item: Option<&str>) -> Vec<VersionChange> {
+    let mut out: Vec<VersionChange> = Vec::new();
+    let mut current: Option<String> = only_item.map(|s| s.to_string());
+    for line in lines {
+        let t = line.trim();
+        if let Some(rest) = t.strip_prefix("==> Upgrading ") {
+            current = rest.split_whitespace().next().map(|s| s.to_string());
+            continue;
+        }
+        let parts: Vec<&str> = t.split_whitespace().collect();
+        let (item, from, to) = match parts.as_slice() {
+            [from, "->", to] => (current.clone(), *from, *to),
+            [name, from, "->", to] => (Some(name.to_string()), *from, *to),
+            _ => continue,
+        };
+        let Some(item) = item else { continue };
+        if !from.chars().next().is_some_and(|c| c.is_ascii_digit()) { continue; }
+        if out.iter().any(|v| v.item == item) { continue; }
+        out.push(VersionChange { item, from: from.to_string(), to: to.to_string() });
+    }
+    out
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
+}
+
+static RUN_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn new_run_id(section: &str) -> String {
+    let n = RUN_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{}-{}-{}", now_secs(), std::process::id(), n) + "-" + section
+}
+
+// The diagnostic log: what the app itself did and when, as opposed to the
+// history, which is what the user did. One line per event, local time, kept to
+// about 2 MB with one older file behind it. This is what to read when a run
+// misbehaves; the history holds the run's own output.
+fn diag_path(app: &AppHandle) -> Option<std::path::PathBuf> {
+    app.path().app_data_dir().ok().map(|d| d.join("partyman.log"))
+}
+
+pub(crate) fn diag(app: &AppHandle, msg: &str) {
+    use std::io::Write;
+    let Some(path) = diag_path(app) else { return };
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    const ROTATE_AT: u64 = 2 * 1024 * 1024;
+    if fs::metadata(&path).map(|m| m.len() > ROTATE_AT).unwrap_or(false) {
+        let _ = fs::rename(&path, path.with_extension("log.1"));
+    }
+    let stamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %z");
+    if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = writeln!(f, "[{stamp}] {msg}");
+    }
+}
+
+fn secs_since(start: std::time::Instant) -> u64 {
+    start.elapsed().as_secs()
 }
 
 // Returns a bash function definition for upgrading a single cask.
@@ -361,6 +474,7 @@ fn brew_cask_upgrade_fn() -> &'static str {
     rm -f "$TMPOUT"
   fi
 
+  echo "__PM_CASK_EXIT__:$token:$BREW_EXIT"
   if [ "$BREW_EXIT" -eq 0 ]; then
     echo "→  Done."
   else
@@ -599,15 +713,26 @@ async fn track_app(app: AppHandle, cask_token: String, appdir: Option<String>) {
         ud = use_userdir,
         token = cask_token,
     );
-    let lines = run_upgrade_shell(&app, section, &script).await;
-    let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    let ts = now_secs();
+    let run_id = new_run_id(section);
+    diag(&app, &format!("adopt {cask_token} ({run_id})"));
+    let started = std::time::Instant::now();
+    let result = run_upgrade_shell(&app, section, &script).await;
+    let outcome = outcome_from_lines(&result.lines, result.exit_code).to_string();
+    diag(&app, &format!("adopt {cask_token}: {outcome} ({run_id})"));
     append_upgrade_log(&app, HistoryEntry {
         ts,
         label: section_label(section).to_string(),
         section: section.to_string(),
         items: vec![cask_token.clone()],
         item_names: vec![cask_token],
-        lines,
+        versions: Vec::new(),
+        run_id,
+        kind: "adopt".to_string(),
+        outcome,
+        duration_secs: secs_since(started),
+        exit_code: result.exit_code,
+        lines: result.lines,
     });
 }
 
@@ -635,7 +760,7 @@ async fn track_apps(app: AppHandle, items: Vec<TrackItem>) {
         // rather than only the cask that was tried.
         let name_esc = it.name.replace(['\\', '"'], "").replace('\'', "'\\''");
         calls.push_str(&format!(
-            "adopt_cask '{ud}' '{token}' '{name}'\n",
+            "echo '{CASK_START}{token}'\nadopt_cask '{ud}' '{token}' '{name}'\necho '{CASK_END}{token}'\n",
             ud = ud, token = it.token, name = name_esc
         ));
         tokens.push(it.token.clone());
@@ -656,16 +781,113 @@ async fn track_apps(app: AppHandle, items: Vec<TrackItem>) {
         calls = calls,
         summary = adopt_summary(),
     );
-    let lines = run_upgrade_shell(&app, section, &script).await;
-    let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-    append_upgrade_log(&app, HistoryEntry {
-        ts,
-        label: section_label(section).to_string(),
-        section: section.to_string(),
-        items: tokens,
-        item_names: names,
-        lines,
+    let ts = now_secs();
+    let run_id = new_run_id(section);
+    diag(&app, &format!("adopt {} apps ({run_id}): {}", tokens.len(), tokens.join(", ")));
+    let started = std::time::Instant::now();
+    let result = run_upgrade_shell(&app, section, &script).await;
+    let duration_secs = secs_since(started);
+    let mut summary: Vec<String> = Vec::new();
+    for (token, body_lines, _) in split_by_item(&result.lines) {
+        let name = tokens.iter().position(|t| *t == token)
+            .and_then(|i| names.get(i).cloned())
+            .unwrap_or_else(|| token.clone());
+        let outcome = outcome_from_lines(&body_lines, None).to_string();
+        summary.push(format!("{token} {outcome}"));
+        append_upgrade_log(&app, HistoryEntry {
+            ts,
+            label: section_label(section).to_string(),
+            section: section.to_string(),
+            items: vec![token],
+            item_names: vec![name],
+            versions: Vec::new(),
+            run_id: run_id.clone(),
+            kind: "adopt".to_string(),
+            outcome,
+            duration_secs,
+            exit_code: result.exit_code,
+            lines: body_lines,
+        });
+    }
+    diag(&app, &format!("adopt: {} ({run_id})", summary.join(", ")));
+}
+
+// Sets an item aside until a newer version is available, then re-derives the
+// count from what the last check found; nothing is re-checked.
+#[tauri::command]
+fn ignore_item(app: AppHandle, section: String, id: String, name: String, available: Option<String>) -> schedule::ScheduleConfig {
+    let mut cfg = schedule::load(&app);
+    cfg.ignored.retain(|g| !(g.section == section && g.id == id));
+    cfg.ignored.push(schedule::IgnoredItem {
+        section: section.clone(),
+        id: id.clone(),
+        name,
+        available: available.unwrap_or_default(),
+        since: now_secs(),
     });
+    let _ = schedule::save(&app, &cfg);
+    diag(&app, &format!("ignore {section}/{id} at {}", cfg.ignored.last().map(|g| g.available.as_str()).unwrap_or("")));
+    let cfg = schedule::recount_stored(&app, &section);
+    set_tray_count(&app, cfg.last_total);
+    let _ = app.emit("schedule-updated", cfg.clone());
+    cfg
+}
+
+#[tauri::command]
+fn unignore_item(app: AppHandle, section: String, id: String) -> schedule::ScheduleConfig {
+    let mut cfg = schedule::load(&app);
+    cfg.ignored.retain(|g| !(g.section == section && g.id == id));
+    let _ = schedule::save(&app, &cfg);
+    diag(&app, &format!("stop ignoring {section}/{id}"));
+    let cfg = schedule::recount_stored(&app, &section);
+    set_tray_count(&app, cfg.last_total);
+    let _ = app.emit("schedule-updated", cfg.clone());
+    cfg
+}
+
+/// Batch adoptions recorded before runs were split wrote one entry for the whole
+/// batch. Each app's part of the output ends with the line adopt_cask prints
+/// for it, in the order the apps were listed, so the entry can be split the
+/// way a new one would be — as long as every app has such a line.
+fn split_legacy_adoption(e: HistoryEntry) -> Vec<HistoryEntry> {
+    if e.kind != "adopt" || e.items.len() < 2 || e.run_id != format!("{}-{}", e.ts, e.section) {
+        return vec![e];
+    }
+    let mut groups: Vec<Vec<String>> = Vec::new();
+    let mut cur: Vec<String> = Vec::new();
+    for line in &e.lines {
+        cur.push(line.clone());
+        let t = line.trim_start();
+        let closes = t.starts_with("→  Done!")
+            || t.starts_with("✖  Setup failed")
+            || (t.starts_with('✖') && t.contains("couldn't be set up"));
+        if closes {
+            groups.push(std::mem::take(&mut cur));
+        }
+    }
+    if groups.len() != e.items.len() {
+        return vec![e];
+    }
+    groups
+        .into_iter()
+        .enumerate()
+        .map(|(i, lines)| HistoryEntry {
+            outcome: outcome_from_lines(&lines, None).to_string(),
+            items: vec![e.items[i].clone()],
+            item_names: vec![e.item_names.get(i).cloned().unwrap_or_else(|| e.items[i].clone())],
+            lines,
+            versions: Vec::new(),
+            ..e.clone()
+        })
+        .collect()
+}
+
+// Reveals the folder holding updates.log and partyman.log in the Finder.
+#[tauri::command]
+fn open_logs_folder(app: AppHandle) {
+    if let Ok(dir) = app.path().app_data_dir() {
+        let _ = std::process::Command::new("open").arg(dir).spawn();
+    }
 }
 
 #[tauri::command]
@@ -682,6 +904,25 @@ fn get_upgrade_history(app: AppHandle) -> Vec<HistoryEntry> {
         .lines()
         .filter(|l| !l.is_empty())
         .filter_map(|l| serde_json::from_str::<HistoryEntry>(l).ok())
+        .map(|mut e| {
+            // Entries from before these fields existed: the outcome and the
+            // versions can still be read off the output, and a batch written
+            // in one second by one section was one run.
+            if e.outcome.is_empty() {
+                e.outcome = outcome_from_lines(&e.lines, e.exit_code).to_string();
+            }
+            if e.kind.is_empty() {
+                e.kind = if e.section == "untracked_apps" { "adopt" } else { "update" }.to_string();
+            }
+            if e.run_id.is_empty() {
+                e.run_id = format!("{}-{}", e.ts, e.section);
+            }
+            if e.versions.is_empty() && e.kind == "update" {
+                e.versions = versions_from_lines(&e.lines, e.items.first().map(|s| s.as_str()));
+            }
+            e
+        })
+        .flat_map(split_legacy_adoption)
         .collect();
     entries.reverse(); // newest first
     entries
@@ -774,7 +1015,16 @@ type LineSink = Arc<Mutex<Option<Vec<String>>>>;
 /// Readers still going after the grace period are left to drain in the
 /// background rather than cancelled, so whatever holds the pipe never has its
 /// writes fail with SIGPIPE. What they read from then on is discarded.
-async fn stream_child<F>(child: &mut Child, on_line: F) -> Vec<String>
+struct RunResult {
+    lines: Vec<String>,
+    exit_code: Option<i32>,
+    /// False when something still held the output pipe after the shell exited
+    /// and the readers were left behind: a sign of a process the run started
+    /// and did not wait for.
+    drained: bool,
+}
+
+async fn stream_child<F>(child: &mut Child, on_line: F) -> RunResult
 where
     F: Fn(&str) + Send + Sync + 'static,
 {
@@ -788,16 +1038,18 @@ where
         readers.push(spawn_line_reader(err, Arc::clone(&sink), Arc::clone(&on_line)));
     }
 
-    let _ = child.wait().await;
-    let _ = tokio::time::timeout(DRAIN_GRACE, async {
+    let exit_code = child.wait().await.ok().and_then(|st| st.code());
+    let drained = tokio::time::timeout(DRAIN_GRACE, async {
         for r in &mut readers {
             let _ = r.await;
         }
     })
-    .await;
+    .await
+    .is_ok();
 
     // Dropping the handles detaches any reader still running; it does not stop it.
-    sink.lock().ok().and_then(|mut s| s.take()).unwrap_or_default()
+    let lines = sink.lock().ok().and_then(|mut s| s.take()).unwrap_or_default();
+    RunResult { lines, exit_code, drained }
 }
 
 fn spawn_line_reader<R, F>(pipe: R, sink: LineSink, on_line: Arc<F>) -> tokio::task::JoinHandle<()>
@@ -818,7 +1070,7 @@ where
     })
 }
 
-async fn run_shell(app: &AppHandle, section: &str, script: &str) -> Vec<String> {
+async fn run_shell(app: &AppHandle, section: &str, script: &str) -> RunResult {
     let shell = if cfg!(target_os = "windows") { "powershell" } else { "bash" };
     let flag  = if cfg!(target_os = "windows") { "-Command" } else { "-c" };
 
@@ -837,23 +1089,34 @@ async fn run_shell(app: &AppHandle, section: &str, script: &str) -> Vec<String> 
     {
         Ok(c) => c,
         Err(e) => {
+            diag(app, &format!("check {section}: failed to start the shell: {e}"));
             emit_line(app, section, &format!("Failed to spawn: {e}")).await;
             emit_status(app, section, "error").await;
-            return vec![];
+            return RunResult { lines: vec![], exit_code: None, drained: true };
         }
     };
 
+    let started = std::time::Instant::now();
     let app1 = app.clone();
     let sec1 = section.to_string();
-    let lines = stream_child(&mut child, move |line| {
+    let result = stream_child(&mut child, move |line| {
+        if line.starts_with("__PM_") {
+            return;
+        }
         let _ = app1.emit(
             "check-output",
             OutputPayload { section: sec1.clone(), line: line.to_string() },
         );
     })
     .await;
-    emit_status(app, section, "done").await;
-    lines
+    diag(app, &format!(
+        "check {section}: exit {} after {}s, {} lines{}",
+        result.exit_code.map_or("none".to_string(), |c| c.to_string()),
+        secs_since(started),
+        result.lines.len(),
+        if result.drained { "" } else { " — output still open after exit; readers detached" },
+    ));
+    result
 }
 
 // Sentinel lines emitted around each cask so the single-shell batch output can be
@@ -861,6 +1124,31 @@ async fn run_shell(app: &AppHandle, section: &str, script: &str) -> Vec<String> 
 const CASK_MARKER_PREFIX: &str = "__PM_CASK_";
 const CASK_START: &str = "__PM_CASK_START__:";
 const CASK_END: &str = "__PM_CASK_END__:";
+const CASK_EXIT: &str = "__PM_CASK_EXIT__:";
+
+/// Splits one shell's output back into the per-item groups the sentinels mark,
+/// each with the exit status its brew call reported (when the script emits one).
+/// Lines outside any group — the batch summary, for instance — are dropped.
+fn split_by_item(lines: &[String]) -> Vec<(String, Vec<String>, Option<i32>)> {
+    let mut groups: Vec<(String, Vec<String>, Option<i32>)> = Vec::new();
+    let mut cur: Option<(String, Vec<String>, Option<i32>)> = None;
+    for line in lines {
+        if let Some(token) = line.strip_prefix(CASK_START) {
+            if let Some(g) = cur.take() { groups.push(g); }
+            cur = Some((token.to_string(), Vec::new(), None));
+        } else if line.strip_prefix(CASK_END).is_some() {
+            if let Some(g) = cur.take() { groups.push(g); }
+        } else if let Some(rest) = line.strip_prefix(CASK_EXIT) {
+            if let Some((_, _, exit)) = cur.as_mut() {
+                *exit = rest.rsplit(':').next().and_then(|c| c.parse().ok());
+            }
+        } else if let Some((_, body_lines, _)) = cur.as_mut() {
+            body_lines.push(line.clone());
+        }
+    }
+    if let Some(g) = cur.take() { groups.push(g); }
+    groups
+}
 
 // Askpass preamble: sets SUDO_ASKPASS to a helper that pops a native password
 // dialog whenever a child process (e.g. Homebrew) shells out to `sudo -A`.
@@ -1088,7 +1376,7 @@ fn attach_controlling_pty(cmd: &mut Command) -> Option<PtyMaster> {
 }
 
 // Returns collected output lines for logging (including any cask sentinels).
-async fn run_upgrade_shell(app: &AppHandle, section: &str, script: &str) -> Vec<String> {
+async fn run_upgrade_shell(app: &AppHandle, section: &str, script: &str) -> RunResult {
     let shell = if cfg!(target_os = "windows") { "powershell" } else { "bash" };
     let flag  = if cfg!(target_os = "windows") { "-Command" } else { "-c" };
 
@@ -1112,15 +1400,17 @@ async fn run_upgrade_shell(app: &AppHandle, section: &str, script: &str) -> Vec<
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
+            diag(app, &format!("update {section}: failed to start the shell: {e}"));
             emit_upgrade_line(app, section, &format!("Failed to spawn: {e}")).await;
             emit_upgrade_status(app, section, "error").await;
-            return vec![];
+            return RunResult { lines: vec![], exit_code: None, drained: true };
         }
     };
 
+    let started = std::time::Instant::now();
     let app1 = app.clone();
     let sec1 = section.to_string();
-    let lines = stream_child(&mut child, move |line| {
+    let result = stream_child(&mut child, move |line| {
         if !line.starts_with(CASK_MARKER_PREFIX) {
             let _ = app1.emit(
                 "upgrade-output",
@@ -1129,8 +1419,15 @@ async fn run_upgrade_shell(app: &AppHandle, section: &str, script: &str) -> Vec<
         }
     })
     .await;
+    diag(app, &format!(
+        "update {section}: exit {} after {}s, {} lines{}",
+        result.exit_code.map_or("none".to_string(), |c| c.to_string()),
+        secs_since(started),
+        result.lines.len(),
+        if result.drained { "" } else { " — output still open after exit; readers detached" },
+    ));
     emit_upgrade_status(app, section, "done").await;
-    lines
+    result
 }
 
 fn check_script(section: &str) -> Option<&'static str> {
@@ -1141,7 +1438,18 @@ if command -v softwareupdate &>/dev/null; then
   if echo "$updates" | grep -q "No new software available"; then
     echo "✔  macOS is up to date."
   else
-    echo "$updates" | grep -E "^\s*\*|\bLabel\b|Title:" || echo "$updates" | grep -v "^Software Update Tool" | grep -v "^$"
+    # Each update is a "* Label: …" line followed by a "Title: …, Version: …,
+    # … Action: restart," line; the item line carries what the app needs.
+    echo "$updates" | awk '
+      /^[ \t]*\*[ \t]*Label:/ { label = $0; sub(/^[ \t]*\*[ \t]*Label:[ \t]*/, "", label); print; next }
+      /Title:/ && label != "" {
+        title = $0; sub(/.*Title:[ \t]*/, "", title); sub(/,.*/, "", title)
+        ver = ""; if (match($0, /Version:[ \t]*[^,]+/)) { ver = substr($0, RSTART + 8, RLENGTH - 8); gsub(/^[ \t]+/, "", ver) }
+        note = ""; if ($0 ~ /Action:[ \t]*restart/) note = "restart"
+        printf "__PM_ITEM__\t%s\t%s\t\t%s\t%s\n", label, title, ver, note
+        print; label = ""; next }
+      /^Software Update Tool/ || /^$/ || /^Finding available software/ { next }
+      { print }'
   fi
 else
   echo "✖  softwareupdate not found — not running on macOS"
@@ -1156,8 +1464,10 @@ if command -v brew &>/dev/null; then
   # refuses them, so they could never clear. They are listed after the "→" line,
   # where the item parsers stop, so they are neither counted nor offered.
   disabled=""
+  info=""
   if [ -n "$outdated" ] && command -v jq &>/dev/null; then
-    disabled=$(brew info --cask --json=v2 $outdated 2>/dev/null \
+    info=$(brew info --cask --json=v2 $outdated 2>/dev/null)
+    disabled=$(printf '%s' "$info" \
       | jq -r '.casks[] | select(.disabled == true)
           | [.token, (.disable_date // ""), (.disable_replacement_cask // "")] | join("|")' 2>/dev/null)
   fi
@@ -1172,7 +1482,24 @@ if command -v brew &>/dev/null; then
     echo "✔  All Homebrew cask apps are up to date."
   else
     echo "⚠  Outdated apps:"
-    printf '%s' "$updatable" | while read -r line; do echo "   $line"; done
+    if [ -n "$info" ]; then
+      # One item line per updatable cask — token to act on, name to show,
+      # installed and available versions — and a readable line beside it.
+      printf '%s' "$info" \
+        | jq -r '.casks[] | select(.disabled != true)
+            | [.token, (.name[0] // .token), (.installed // ""), (.version // "")] | @tsv' 2>/dev/null \
+        | while IFS=$'\t' read -r tok name inst ver; do
+          [ -z "$tok" ] && continue
+          printf '__PM_ITEM__\t%s\t%s\t%s\t%s\t\n' "$tok" "$name" "$inst" "$ver"
+          if [ -n "$inst" ]; then
+            printf '   %s  %s → %s  (%s)\n' "$name" "${inst%%,*}" "${ver%%,*}" "$tok"
+          else
+            printf '   %s  → %s  (%s)\n' "$name" "${ver%%,*}" "$tok"
+          fi
+        done
+    else
+      printf '%s' "$updatable" | while read -r line; do echo "   $line"; done
+    fi
   fi
   if [ -n "$disabled" ]; then
     echo "→  Homebrew has disabled these, so it can no longer update them. They are not counted:"
@@ -1232,7 +1559,18 @@ if command -v mas &>/dev/null; then
     echo "✔  All App Store apps are up to date."
   else
     echo "⚠  Outdated App Store apps:"
-    echo "$outdated" | while read -r line; do echo "   $line"; done
+    echo "$outdated" | while IFS= read -r line; do
+      [ -z "$line" ] && continue
+      id=${line%% *}; rest=${line#* }
+      case "$rest" in
+        *" ("*" -> "*")")
+          name=${rest% (*}; vers=${rest##*(}; vers=${vers%)}
+          inst=${vers%% -> *}; avail=${vers##* -> } ;;
+        *) name=$rest; inst=""; avail="" ;;
+      esac
+      printf '__PM_ITEM__\t%s\t%s\t%s\t%s\t\n' "$id" "$name" "$inst" "$avail"
+      echo "   $line"
+    done
   fi
 else
   echo "✖  mas not installed."
@@ -1431,7 +1769,13 @@ fi
 async fn run_check(app: AppHandle, section: String) {
     match check_script(&section) {
         Some(script) => {
-            let lines = run_shell(&app, &section, script).await;
+            let lines = run_shell(&app, &section, script).await.lines;
+            let items = schedule::items_for(&app, &section, &lines);
+            let _ = app.emit("check-status", CheckDonePayload {
+                section: section.clone(),
+                status: "done".to_string(),
+                items,
+            });
             // A check the user runs updates the count too, not only a scheduled one.
             if schedule::CHECKED_SECTIONS.contains(&section.as_str()) {
                 let cfg = schedule::record_section(&app, &section, lines);
@@ -1549,18 +1893,26 @@ fi
 async fn run_upgrade(app: AppHandle, section: String) {
     match upgrade_script(&section) {
         Some(script) => {
-            let lines = run_upgrade_shell(&app, &section, &script).await;
-            let ts = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
+            let ts = now_secs();
+            let run_id = new_run_id(&section);
+            diag(&app, &format!("update {section}: everything ({run_id})"));
+            let started = std::time::Instant::now();
+            let result = run_upgrade_shell(&app, &section, &script).await;
+            let outcome = outcome_from_lines(&result.lines, result.exit_code).to_string();
+            diag(&app, &format!("update {section}: {outcome} ({run_id})"));
             append_upgrade_log(&app, HistoryEntry {
                 ts,
                 label: section_label(&section).to_string(),
                 section: section.clone(),
                 items: vec![],
                 item_names: vec![],
-                lines,
+                versions: versions_from_lines(&result.lines, None),
+                run_id,
+                kind: "update".to_string(),
+                outcome,
+                duration_secs: secs_since(started),
+                exit_code: result.exit_code,
+                lines: result.lines,
             });
         }
         None => {
@@ -1608,38 +1960,38 @@ async fn run_upgrade_items(app: AppHandle, section: String, items: Vec<String>, 
             fn_def = cask_fns(),
             body = body,
         );
-        let lines = run_upgrade_shell(&app, &section, &script).await;
+        let ts = now_secs();
+        let run_id = new_run_id(&section);
+        diag(&app, &format!("update {section}: {} items ({run_id}): {}", pairs.len(),
+            pairs.iter().map(|(t, _)| t.as_str()).collect::<Vec<_>>().join(", ")));
+        let started = std::time::Instant::now();
+        let result = run_upgrade_shell(&app, &section, &script).await;
+        let duration_secs = secs_since(started);
 
-        // Split the combined output into per-cask groups on the sentinels.
-        let mut groups: Vec<(String, Vec<String>)> = Vec::new();
-        let mut cur: Option<(String, Vec<String>)> = None;
-        for line in &lines {
-            if let Some(token) = line.strip_prefix(CASK_START) {
-                if let Some(g) = cur.take() { groups.push(g); }
-                cur = Some((token.to_string(), Vec::new()));
-            } else if line.strip_prefix(CASK_END).is_some() {
-                if let Some(g) = cur.take() { groups.push(g); }
-            } else if let Some((_, body_lines)) = cur.as_mut() {
-                body_lines.push(line.clone());
-            }
-        }
-        if let Some(g) = cur.take() { groups.push(g); }
-
-        let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-        for (token, body_lines) in groups {
+        let mut summary: Vec<String> = Vec::new();
+        for (token, body_lines, exit_code) in split_by_item(&result.lines) {
             let display_name = pairs.iter()
                 .find(|(t, _)| *t == token)
                 .map(|(_, n)| n.clone())
                 .unwrap_or_else(|| token.clone());
+            let outcome = outcome_from_lines(&body_lines, exit_code).to_string();
+            summary.push(format!("{token} {outcome}"));
             append_upgrade_log(&app, HistoryEntry {
                 ts,
                 label: section_label(&section).to_string(),
                 section: section.clone(),
                 items: vec![token.clone()],
                 item_names: vec![display_name],
+                versions: versions_from_lines(&body_lines, Some(&token)),
+                run_id: run_id.clone(),
+                kind: "update".to_string(),
+                outcome,
+                duration_secs,
+                exit_code,
                 lines: body_lines,
             });
         }
+        diag(&app, &format!("update {section}: {} ({run_id})", summary.join(", ")));
         return;
     }
 
@@ -1670,19 +2022,27 @@ async fn run_upgrade_items(app: AppHandle, section: String, items: Vec<String>, 
         }
     };
 
-    let lines = run_upgrade_shell(&app, &section, &script).await;
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+    let ts = now_secs();
+    let run_id = new_run_id(&section);
+    diag(&app, &format!("update {section}: {} items ({run_id})", items.len()));
+    let started = std::time::Instant::now();
+    let result = run_upgrade_shell(&app, &section, &script).await;
     let display_names = if item_names.is_empty() { items.clone() } else { item_names };
+    let outcome = outcome_from_lines(&result.lines, result.exit_code).to_string();
+    diag(&app, &format!("update {section}: {outcome} ({run_id})"));
     append_upgrade_log(&app, HistoryEntry {
         ts,
         label: section_label(&section).to_string(),
         section: section.clone(),
         items: items.clone(),
         item_names: display_names,
-        lines,
+        versions: versions_from_lines(&result.lines, None),
+        run_id,
+        kind: "update".to_string(),
+        outcome,
+        duration_secs: secs_since(started),
+        exit_code: result.exit_code,
+        lines: result.lines,
     });
 }
 
@@ -1969,8 +2329,25 @@ fn next_run(app: AppHandle) -> i64 {
 }
 
 #[tauri::command]
-fn get_last_check(app: AppHandle) -> schedule::LastCheck {
-    schedule::load_last_check(&app)
+fn get_last_check(app: AppHandle) -> LastCheckView {
+    let last = schedule::load_last_check(&app);
+    let items = last
+        .sections
+        .iter()
+        .map(|(id, lines)| (id.clone(), schedule::items_for(&app, id, lines)))
+        .collect();
+    LastCheckView { ts: last.ts, sections: last.sections, section_ts: last.section_ts, items }
+}
+
+// The last run as the window preloads it: the output per section plus the
+// items already parsed from it.
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LastCheckView {
+    ts: u64,
+    sections: std::collections::BTreeMap<String, Vec<String>>,
+    section_ts: std::collections::BTreeMap<String, u64>,
+    items: std::collections::BTreeMap<String, Vec<schedule::CheckItem>>,
 }
 
 // Redraws the icon with the count baked into its badge. Cheap enough to do on
@@ -2062,6 +2439,11 @@ pub fn run() {
         ))
         .setup(move |app| {
             let handle = app.handle().clone();
+            diag(&handle, &format!(
+                "launch v{}{}",
+                app.package_info().version,
+                if headless { " (scheduled run, no window)" } else { "" },
+            ));
 
             // Launched by launchd: no window, no Dock icon — check, report, quit.
             if headless {
@@ -2074,6 +2456,7 @@ pub fn run() {
                     let _lock = match schedule::try_acquire_run_lock(&handle) {
                         Some(lock) => lock,
                         None => {
+                            diag(&handle, "scheduled run: the app is open and checks on its own timer; nothing to do");
                             handle.exit(0);
                             return;
                         }
@@ -2120,6 +2503,7 @@ pub fn run() {
                 .on_menu_event(|app, event| match event.id.as_ref() {
                     "open" => show_main_window(app),
                     "check" => {
+                        diag(app, "menu bar: Check Now");
                         let handle = app.clone();
                         tauri::async_runtime::spawn(async move {
                             let cfg = schedule::run_checks(&handle, schedule::CheckScope::AppsOnly).await;
@@ -2128,7 +2512,10 @@ pub fn run() {
                             let _ = handle.emit("schedule-updated", cfg);
                         });
                     }
-                    "quit" => app.exit(0),
+                    "quit" => {
+                        diag(app, "menu bar: Quit");
+                        app.exit(0)
+                    }
                     _ => {}
                 });
             // Not a template: a template icon would discard the logo's colour and
@@ -2155,6 +2542,7 @@ pub fn run() {
 
             if startup_cfg.check_on_launch {
                 let launch_handle = handle.clone();
+                diag(&handle, "check on launch");
                 tauri::async_runtime::spawn(async move {
                     let cfg = schedule::run_checks(&launch_handle, schedule::CheckScope::AppsOnly).await;
                     set_tray_count(&launch_handle, cfg.last_total);
@@ -2188,7 +2576,8 @@ pub fn run() {
             run_check, run_upgrade, run_upgrade_items, get_platform,
             get_upgrade_history, search_cask, track_app, track_apps,
             check_app_update, open_release_url, get_release_notes, resolve_cask_input,
-            get_schedule, set_schedule, run_schedule_now, snooze_updates, get_last_check, recount_section, next_run
+            get_schedule, set_schedule, run_schedule_now, snooze_updates, get_last_check, recount_section, next_run,
+            open_logs_folder, ignore_item, unignore_item
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -2314,7 +2703,7 @@ echo after >&2
         let mut child = cmd.spawn().expect("spawn");
 
         let started = std::time::Instant::now();
-        let lines = stream_child(&mut child, |_| {}).await;
+        let lines = stream_child(&mut child, |_| {}).await.lines;
         let took = started.elapsed();
 
         let holder = lines.iter().find_map(|l| l.strip_prefix("HOLDER=")).map(str::to_string);
@@ -2362,7 +2751,7 @@ echo after >&2
         let took = started.elapsed();
 
         // The holder is in the output whichever way this went; clean it up first.
-        let text = lines.as_ref().map(|l| l.join("\n")).unwrap_or_default();
+        let text = lines.as_ref().map(|r| r.lines.join("\n")).unwrap_or_default();
         if let Some(pid) = text.lines().find_map(|l| l.strip_prefix("HOLDER=")) {
             let _ = std::process::Command::new("kill").arg(pid).status();
         }
@@ -2374,6 +2763,58 @@ echo after >&2
         assert!(text.contains("Warning: to stderr"), "stderr not streamed:\n{text}");
         assert_eq!(field(&text, "RC="), "3", "brew's exit status lost:\n{text}");
         assert_eq!(field(&text, "SAVED="), "3", "output not saved for the retry checks:\n{text}");
+    }
+
+    #[test]
+    fn outcome_reads_the_scripts_own_markers_not_homebrews_first_try() {
+        let l = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // A first attempt that a retry rescues still ends with Done.
+        assert_eq!(outcome_from_lines(&l(&["Error: firefox: Failure while executing", "→  Backup conflict — retrying with --force…", "→  Done."]), Some(0)), "ok");
+        assert_eq!(outcome_from_lines(&l(&["✖  Update failed for zoom."]), Some(1)), "failed");
+        assert_eq!(outcome_from_lines(&l(&["→  Done! Ghostty is now managed by Homebrew.", "✖  zoom.us couldn't be set up — no such cask."]), Some(0)), "partial");
+        // No markers at all: the exit status decides.
+        assert_eq!(outcome_from_lines(&l(&["brew: command not found"]), Some(127)), "failed");
+        assert_eq!(outcome_from_lines(&l(&["✔  App Store opened"]), None), "ok");
+    }
+
+    #[test]
+    fn versions_come_from_either_of_homebrews_shapes() {
+        let l = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let v = versions_from_lines(&l(&["==> Upgrading docker-desktop", "  4.86.0,236216 -> 4.93.0,240920", "🍺  docker-desktop was successfully upgraded!"]), Some("docker-desktop"));
+        assert_eq!(v.len(), 1);
+        assert_eq!((v[0].item.as_str(), v[0].from.as_str(), v[0].to.as_str()), ("docker-desktop", "4.86.0,236216", "4.93.0,240920"));
+        let v = versions_from_lines(&l(&["==> Upgraded 2 outdated packages:", "slack 4.51.191 -> 4.52.162", "postman 12.23.7 -> 12.30.0"]), None);
+        assert_eq!(v.iter().map(|x| x.item.as_str()).collect::<Vec<_>>(), ["slack", "postman"]);
+        // Prose with an arrow in it is not a version line.
+        assert!(versions_from_lines(&l(&["→  Retrying zoom in ~/Applications…", "a -> b"]), None).is_empty());
+    }
+
+    #[test]
+    fn a_batch_adoption_recorded_as_one_entry_is_read_as_one_per_app() {
+        let l = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let e = HistoryEntry {
+            ts: 100, section: "untracked_apps".into(), label: "Untracked Apps".into(),
+            items: l(&["ghostty", "tailscale-app", "zoom"]),
+            item_names: l(&["Ghostty", "Tailscale", "zoom.us"]),
+            lines: l(&[
+                "→  Done! Ghostty is now managed by Homebrew.",
+                "==> Running installer for tailscale-app",
+                "→  Done! Tailscale is now managed by Homebrew.",
+                "✖  zoom.us couldn't be set up — no such cask.",
+                "────", "✖  1 app(s) could not be set up:",
+            ]),
+            run_id: "100-untracked_apps".into(), kind: "adopt".into(),
+            ..Default::default()
+        };
+        let split = split_legacy_adoption(e.clone());
+        assert_eq!(split.len(), 3);
+        assert_eq!(split[1].item_names, vec!["Tailscale"]);
+        assert_eq!(split[1].lines.len(), 2);
+        assert_eq!(split[2].outcome, "failed");
+        assert!(split.iter().all(|s| s.run_id == e.run_id));
+        // A run written with a proper run id is already split; leave it alone.
+        let mut fresh = e.clone(); fresh.run_id = "100-123-4-untracked_apps".into();
+        assert_eq!(split_legacy_adoption(fresh).len(), 1);
     }
 
     #[tokio::test]
