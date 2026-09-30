@@ -255,14 +255,13 @@
     lastTotal: number;
     lastCounts: Record<string, number>;
     snoozedUntil: number;
-    countDevUpdates: boolean;
     checkOnLaunch: boolean;
   };
 
   let schedule: ScheduleConfig = {
     enabled: false, frequency: "daily", minute: 0, hour: 10, weekday: 1, notify: true,
     lastRun: 0, lastTotal: 0, lastCounts: {}, snoozedUntil: 0,
-    countDevUpdates: false, checkOnLaunch: false,
+    checkOnLaunch: false,
   };
   let scheduleSaving = false;
   let scheduleRunning = false;
@@ -407,14 +406,23 @@
     showSettings = false;
     showHistory = false;
     showAbout = false;
-    const pending = Object.entries(schedule.lastCounts)
-      .filter(([, n]) => n > 0)
+    // Only what the count reports. Developer tooling is never installed from
+    // here: it is not part of the count, and "Install Now" must not run
+    // `brew upgrade`, `npm update -g` or pip across hundreds of packages.
+    const pending = countedEntries(schedule.lastCounts)
       .map(([id]) => id)
       .filter((id) => sections.some((sec) => sec.id === id && platformVisible(sec)));
     for (const id of pending) {
       activeTab = id;
       await runUpgrade(id);
     }
+  }
+
+  // The per-section counts that make up the total: apps and system updates.
+  function countedEntries(counts: Record<string, number>): [string, number][] {
+    return Object.entries(counts).filter(
+      ([id, n]) => n > 0 && sections.some((sec) => sec.id === id && !sec.dev),
+    );
   }
 
   function formatWhen(ts: number): string {
@@ -585,8 +593,11 @@
       upgradeStatuses[payload.section] = payload.status as Status;
       upgradeStatuses = upgradeStatuses;
       // Re-check what is left so the menu-bar count matches what is now installed
-      // instead of what was outstanding before the upgrade ran.
-      if (payload.status === "done") {
+      // instead of what was outstanding before the upgrade ran. Not for the App
+      // Store: "updating" there only opens the App Store, so a recount now would
+      // record the updates as still outstanding before the user has installed
+      // anything. Its count moves on its next check.
+      if (payload.status === "done" && payload.section !== "app_store") {
         invoke("recount_section", { section: payload.section }).catch((e) =>
           console.error("Failed to recount after upgrade:", e),
         );
@@ -1195,18 +1206,6 @@
             <input type="checkbox" bind:checked={schedule.notify}
               onchange={saveSchedule} disabled={scheduleSaving} />
           </label>
-          <label class="settings-row">
-            <div class="settings-row-info">
-              <span class="settings-row-label">Include developer tools in the count</span>
-              <span class="settings-row-desc">
-                Counts brew formulae, npm, pip and gems too. They often run to hundreds of
-                packages, so by default the count sticks to apps and system updates.
-                Developer tools are counted as of the last scheduled check.
-              </span>
-            </div>
-            <input type="checkbox" bind:checked={schedule.countDevUpdates}
-              onchange={saveSchedule} disabled={scheduleSaving} />
-          </label>
           {#if isSnoozed()}
             <div class="settings-row">
               <div class="settings-row-info">
@@ -1231,9 +1230,9 @@
               {scheduleRunning ? "Checking…" : "Run Now"}
             </button>
           </div>
-          {#if Object.values(schedule.lastCounts).some((n) => n > 0)}
+          {#if countedEntries(schedule.lastCounts).length > 0}
             <div class="schedule-breakdown">
-              {#each Object.entries(schedule.lastCounts).filter(([, n]) => n > 0) as [sec, n]}
+              {#each countedEntries(schedule.lastCounts) as [sec, n]}
                 <span class="schedule-chip">{sectionLabel(sec)} <strong>{n}</strong></span>
               {/each}
             </div>

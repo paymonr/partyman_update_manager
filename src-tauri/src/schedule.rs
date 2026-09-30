@@ -50,9 +50,6 @@ pub struct ScheduleConfig {
     pub last_counts: BTreeMap<String, usize>,
     /// Reminders stay quiet until this time; the count still updates underneath.
     pub snoozed_until: u64,
-    /// Fold brew formulae, npm, pip and gems into the count as well. Off by
-    /// default because they run to hundreds and drown out app updates.
-    pub count_dev_updates: bool,
     /// Run a check as soon as the app opens, rather than waiting for the interval.
     pub check_on_launch: bool,
 }
@@ -70,7 +67,6 @@ impl Default for ScheduleConfig {
             last_total: 0,
             last_counts: BTreeMap::new(),
             snoozed_until: 0,
-            count_dev_updates: false,
             check_on_launch: false,
         }
     }
@@ -324,19 +320,16 @@ pub fn count_for(section: &str, lines: &[String]) -> usize {
     }
 }
 
-// What the menu-bar count reports. Developer tooling — brew formulae, npm, pip,
-// gems — is deliberately excluded: those run to hundreds of packages and would
-// bury the handful of app and system updates actually worth acting on. They are
-// still checked, and still shown on the page.
+// What the update count reports: apps and system updates, nothing else.
+// Developer tooling (brew formulae, npm, pip, gems) never counts. It runs to
+// hundreds of packages and would bury the handful of updates worth acting on.
+// It is still checked, and still shown on its own tab.
 pub const BADGE_SECTIONS: &[&str] = &["macos_updates", "app_store", "brew_casks"];
 
-pub fn total_from_counts(counts: &BTreeMap<String, usize>, include_dev: bool) -> usize {
+pub fn total_from_counts(counts: &BTreeMap<String, usize>) -> usize {
     counts
         .iter()
-        .filter(|(section, _)| {
-            BADGE_SECTIONS.contains(&section.as_str())
-                || (include_dev && section.as_str() != "untracked_apps")
-        })
+        .filter(|(section, _)| BADGE_SECTIONS.contains(&section.as_str()))
         .map(|(_, n)| n)
         .sum()
 }
@@ -462,6 +455,29 @@ mod tests {
         assert_eq!(items[1].app_dir.as_deref(), Some("~/Applications"));
     }
 
+    // Real output from a machine where Homebrew had disabled two outdated casks.
+    // `brew upgrade` refuses those, so counting them meant a number that could
+    // never reach zero.
+    #[test]
+    fn disabled_casks_are_listed_but_not_counted() {
+        let lines: Vec<String> = [
+            "→  Refreshing Homebrew…",
+            "⚠  Outdated apps:",
+            "   claude",
+            "   claude-code@latest",
+            "   visual-studio-code",
+            "→  Homebrew has disabled these, so it can no longer update them. They are not counted:",
+            "   electron (disabled 2026-09-01)",
+            "   flameshot (disabled 2026-09-01)",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let ids: Vec<_> = parse_items("brew_casks", &lines).into_iter().map(|i| i.id).collect();
+        assert_eq!(ids, ["claude", "claude-code@latest", "visual-studio-code"]);
+        assert_eq!(count_for("brew_casks", &lines), 3);
+    }
+
     #[test]
     fn a_manual_check_leaves_developer_tooling_out() {
         let apps: Vec<_> = sections_for(CheckScope::AppsOnly).collect();
@@ -486,9 +502,7 @@ mod tests {
         counts.insert("ruby_rvm".to_string(), 265);
         counts.insert("npm_globals".to_string(), 2);
         counts.insert("pip_packages".to_string(), 7);
-        assert_eq!(total_from_counts(&counts, false), 6);
-        // opting in adds the package managers but never untracked apps
-        assert_eq!(total_from_counts(&counts, true), 6 + 137 + 265 + 2 + 7);
+        assert_eq!(total_from_counts(&counts), 6);
     }
 
     #[test]
@@ -647,7 +661,7 @@ pub async fn run_checks(app: &AppHandle, scope: CheckScope) -> ScheduleConfig {
     save_last_check(app, &last);
     let mut cfg = load(app);
     cfg.last_run = now;
-    cfg.last_total = total_from_counts(&counts, cfg.count_dev_updates);
+    cfg.last_total = total_from_counts(&counts);
     cfg.last_counts = counts;
     let _ = save(app, &cfg);
     cfg
@@ -832,18 +846,28 @@ pub async fn run_scheduled(app: &AppHandle) -> ScheduleConfig {
 /// what is now installed rather than what was outstanding before. Cheaper than a
 /// full run, which is why it can happen after every install.
 pub async fn recount(app: &AppHandle, section: &str) -> ScheduleConfig {
+    if !CHECKED_SECTIONS.contains(&section) {
+        return load(app);
+    }
+    let lines = crate::run_check_collect(section).await;
+    record_section(app, section, lines)
+}
+
+/// Records what one section's check found: its count, the total, and the output
+/// the app preloads next time. Used after an upgrade and whenever the user runs a
+/// check, so Check All and Run Check move the count as well as a scheduled run.
+pub fn record_section(app: &AppHandle, section: &str, lines: Vec<String>) -> ScheduleConfig {
     let mut cfg = load(app);
     if !CHECKED_SECTIONS.contains(&section) {
         return cfg;
     }
-    let lines = crate::run_check_collect(section).await;
     cfg.last_counts
         .insert(section.to_string(), count_for(section, &lines));
-    cfg.last_total = total_from_counts(&cfg.last_counts, cfg.count_dev_updates);
+    cfg.last_total = total_from_counts(&cfg.last_counts);
     let _ = save(app, &cfg);
 
     // Keep the preloaded view in step, or reopening the app would show the
-    // section's pre-upgrade contents.
+    // section's earlier contents.
     let mut last = load_last_check(app);
     if last.ts == 0 {
         last.ts = now_secs();
