@@ -5,6 +5,7 @@
   import { check as checkUpdate } from "@tauri-apps/plugin-updater";
   import { relaunch } from "@tauri-apps/plugin-process";
   import { enable as enableAutostart, disable as disableAutostart, isEnabled as isAutostartEnabled } from "@tauri-apps/plugin-autostart";
+  import { THEMES, applyTheme, loadTheme, saveTheme, type ThemeId } from "./themes/theme";
   import { onMount, afterUpdate } from "svelte";
   import iconUrl from "./assets/icon.png";
 
@@ -175,6 +176,13 @@
 
   let whatsNewVersion = "";
   let whatsNewNotes = "";
+
+  let theme: ThemeId = loadTheme();
+
+  function changeTheme() {
+    saveTheme(theme);
+    applyTheme(theme);
+  }
 
   const SEEN_VERSION_KEY = "lastSeenVersion";
   const PENDING_NOTES_KEY = "pendingUpdateNotes";
@@ -1065,7 +1073,6 @@
       <img src={iconUrl} alt="" class="brand-icon" />
       <span class="brand-name"><span class="brand-accent">PartyMAN</span> Update Manager</span>
     </div>
-    <div class="toolbar-space" data-tauri-drag-region></div>
   </div>
 
   {#if appUpdateStatus === "available" && appUpdateInfo}
@@ -1257,7 +1264,38 @@
         {#if scheduleError}<div class="strip strip-err">{scheduleError}</div>{/if}
 
         <section>
-          <h3>Checking for updates</h3>
+          <h3>General</h3>
+          <label class="row">
+            <span class="row-text">
+              <span class="row-label">Open at login</span>
+              <span class="row-desc">Keeps the menu bar icon available for scheduled checks</span>
+            </span>
+            <input type="checkbox" bind:checked={startOnLogin} onchange={toggleStartOnLogin} />
+          </label>
+          <label class="row">
+            <span class="row-text">
+              <span class="row-label">Show developer tools</span>
+              <span class="row-desc">Homebrew formulae, npm, pip, rbenv and rvm. They never count towards the total, and are only checked from their own page or by the schedule while shown.</span>
+            </span>
+            <input type="checkbox" bind:checked={schedule.showDevTools} onchange={toggleDevTools} disabled={scheduleSaving} />
+          </label>
+        </section>
+
+        <section>
+          <h3>Appearance</h3>
+          <div class="row">
+            <span class="row-text">
+              <span class="row-label">Theme</span>
+              <span class="row-desc">{THEMES.find((t) => t.id === theme)?.note ?? ""}</span>
+            </span>
+            <select class="select" bind:value={theme} onchange={changeTheme}>
+              {#each THEMES as choice}<option value={choice.id}>{choice.label}</option>{/each}
+            </select>
+          </div>
+        </section>
+
+        <section>
+          <h3>Automatic checks</h3>
           <p class="section-hint">
             Checks run in the background, even when PartyMAN is closed, and only ever look.
             Installing is always something you start.
@@ -1312,6 +1350,22 @@
             </span>
             <input type="checkbox" bind:checked={schedule.checkOnLaunch} onchange={saveSchedule} disabled={scheduleSaving} />
           </label>
+          <label class="row">
+            <span class="row-text">
+              <span class="row-label">Notify me when updates are found</span>
+              <span class="row-desc">The menu bar shows the count either way</span>
+            </span>
+            <input type="checkbox" bind:checked={schedule.notify} onchange={saveSchedule} disabled={scheduleSaving} />
+          </label>
+          {#if isSnoozed()}
+            <div class="row">
+              <span class="row-text">
+                <span class="row-label">Reminders snoozed</span>
+                <span class="row-desc">Until {formatWhen(schedule.snoozedUntil)}</span>
+              </span>
+              <button class="btn" onclick={() => snoozeUpdates(0)}>Resume</button>
+            </div>
+          {/if}
           <div class="row">
             <span class="row-text">
               <span class="row-label">Last check</span>
@@ -1333,49 +1387,7 @@
         </section>
 
         <section>
-          <h3>Notifications</h3>
-          <label class="row">
-            <span class="row-text">
-              <span class="row-label">Notify me when updates are found</span>
-              <span class="row-desc">The menu bar shows the count either way</span>
-            </span>
-            <input type="checkbox" bind:checked={schedule.notify} onchange={saveSchedule} disabled={scheduleSaving} />
-          </label>
-          {#if isSnoozed()}
-            <div class="row">
-              <span class="row-text">
-                <span class="row-label">Reminders paused</span>
-                <span class="row-desc">Until {formatWhen(schedule.snoozedUntil)}</span>
-              </span>
-              <button class="btn" onclick={() => snoozeUpdates(0)}>Resume</button>
-            </div>
-          {/if}
-        </section>
-
-        <section>
-          <h3>Developer tools</h3>
-          <label class="row">
-            <span class="row-text">
-              <span class="row-label">Show developer tools</span>
-              <span class="row-desc">Homebrew formulae, npm, pip, rbenv and rvm. They never count towards the total, and are only checked from their own page or by the schedule while shown.</span>
-            </span>
-            <input type="checkbox" bind:checked={schedule.showDevTools} onchange={toggleDevTools} disabled={scheduleSaving} />
-          </label>
-        </section>
-
-        <section>
-          <h3>Start-up</h3>
-          <label class="row">
-            <span class="row-text">
-              <span class="row-label">Open at login</span>
-              <span class="row-desc">Keeps the menu bar icon available for scheduled checks</span>
-            </span>
-            <input type="checkbox" bind:checked={startOnLogin} onchange={toggleStartOnLogin} />
-          </label>
-        </section>
-
-        <section>
-          <h3>PartyMAN itself</h3>
+          <h3>About PartyMAN</h3>
           <div class="row">
             <span class="row-text">
               <span class="row-label">Version {appVersion}</span>
@@ -1397,7 +1409,7 @@
           </div>
           <label class="row">
             <span class="row-text">
-              <span class="row-label">Check for a new PartyMAN daily</span>
+              <span class="row-label">Check for new versions daily</span>
               <span class="row-desc">Once a day, when the app opens</span>
             </span>
             <input type="checkbox" bind:checked={autoCheckUpdates}
@@ -1584,18 +1596,19 @@
   .toolbar {
     display: flex;
     align-items: center;
+    justify-content: center;
     gap: 12px;
     /* The standard unified-toolbar height; the traffic lights are moved to sit
        centred in it (trafficLightPosition in tauri.conf.json). */
     height: 52px;
     flex-shrink: 0;
-    /* Room for the traffic lights, which macOS draws over this strip. */
-    padding: 0 14px 0 86px;
+    /* Room for the traffic lights, which macOS draws over this strip; the same
+       on the right so the brand sits on the window's centre line. */
+    padding: 0 86px;
     border-bottom: 1px solid var(--pm-border);
     background: var(--pm-surface-2);
     user-select: none;
   }
-  .toolbar-space { flex: 1; align-self: stretch; }
   .brand { display: flex; align-items: center; gap: 10px; }
   .brand-icon { width: 28px; height: 28px; border-radius: 7px; }
   .brand-name { font-size: 15px; font-weight: 600; color: var(--pm-text-bright); letter-spacing: -0.01em; }
@@ -1694,7 +1707,7 @@
   .count.quiet { background: var(--pm-border); color: var(--pm-text-2); }
   .count.zero { background: transparent; color: var(--pm-ok); }
   .count.none { background: transparent; color: var(--pm-faint); font-weight: 400; }
-  .count.err { background: var(--pm-err); color: #fff; }
+  .count.err { background: var(--pm-err); color: var(--pm-text-bright); }
   .spinner {
     width: 12px; height: 12px; border-radius: 50%;
     border: 2px solid var(--pm-border-strong); border-top-color: var(--pm-accent);

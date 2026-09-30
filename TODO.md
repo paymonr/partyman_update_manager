@@ -144,14 +144,17 @@ That matches the app's stance today — it only ever checks; a person starts ins
 - [ ] A "requested by your admin" state in the UI: a highlighted group with an
       Install button, not something that looks already in progress.
 
-## Let the user choose between the sidebar and dashboard layouts
+## Dashboard layout (parked 2026-09-30)
 
 The `design/simpler-layout` branch builds the sidebar (every source and its count
-in one column). The mockups at the "PartyMAN layout options" canvas show a
-dashboard alternative (one card per source, drill in for the list). The plan is to
-offer both, chosen in Settings; both are views over the same data.
+in one column). A dashboard alternative — one card per source with its count and
+one action, drill in for the list — was mocked up and prototyped, and is parked
+for now. The mockups and the clickable prototype are in `docs/dashboard-idea/`
+(see its README); the live versions are on the "PartyMAN layout options" canvas.
 
-- [ ] Build the dashboard view.
-- [ ] A Layout setting (Sidebar / Dashboard) persisted with the other settings.
+If it comes back, the natural shape is an "All updates" row at the top of the
+sidebar that shows the dashboard cards, rather than a layout switch.
+
+- [ ] Build the dashboard as the overview page behind an "All updates" row.
 - [ ] Show real app names and versions in lists ("Docker Desktop · 4.86 → 4.93")
       — Homebrew reports both; needs the structured inventory above.
