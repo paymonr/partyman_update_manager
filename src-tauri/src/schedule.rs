@@ -52,6 +52,10 @@ pub struct ScheduleConfig {
     pub snoozed_until: u64,
     /// Run a check as soon as the app opens, rather than waiting for the interval.
     pub check_on_launch: bool,
+    /// Show brew formulae, npm, pip, rbenv and rvm in the app and include them
+    /// in scheduled runs. Off by default: most people never touch them, and the
+    /// formulae check alone can take a minute.
+    pub show_dev_tools: bool,
 }
 
 impl Default for ScheduleConfig {
@@ -68,6 +72,7 @@ impl Default for ScheduleConfig {
             last_counts: BTreeMap::new(),
             snoozed_until: 0,
             check_on_launch: false,
+            show_dev_tools: false,
         }
     }
 }
@@ -650,12 +655,15 @@ pub fn sections_for(scope: CheckScope) -> impl Iterator<Item = &'static str> {
 /// an update count anyway.
 pub async fn run_checks(app: &AppHandle, scope: CheckScope) -> ScheduleConfig {
     let now = now_secs();
+    // Developer tools hidden in Settings are not worth a scheduled check either:
+    // nothing shows their result, and the formulae check is the slowest of all.
+    let show_dev = load(app).show_dev_tools;
     let (mut counts, mut last) = match scope {
-        CheckScope::All => (BTreeMap::new(), LastCheck::default()),
-        CheckScope::AppsOnly => (load(app).last_counts, load_last_check(app)),
+        CheckScope::All if show_dev => (BTreeMap::new(), LastCheck::default()),
+        _ => (load(app).last_counts, load_last_check(app)),
     };
     last.ts = now;
-    for section in sections_for(scope) {
+    for section in sections_for(scope).filter(|s| show_dev || !DEV_SECTIONS.contains(s)) {
         let lines = crate::run_check_collect(section).await;
         counts.insert(section.to_string(), count_for(section, &lines));
         last.sections.insert(section.to_string(), lines);

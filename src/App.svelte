@@ -4,7 +4,6 @@
   import { getVersion } from "@tauri-apps/api/app";
   import { check as checkUpdate } from "@tauri-apps/plugin-updater";
   import { relaunch } from "@tauri-apps/plugin-process";
-  import { THEMES, applyTheme, loadTheme, saveTheme, watchSystemTheme, type ThemeId } from "./themes/theme";
   import { enable as enableAutostart, disable as disableAutostart, isEnabled as isAutostartEnabled } from "@tauri-apps/plugin-autostart";
   import { onMount, afterUpdate } from "svelte";
   import iconUrl from "./assets/icon.png";
@@ -161,6 +160,12 @@
   let view: View = "updates";
   let snoozeOpen = false;
 
+  function pick(id: string) {
+    activeTab = id;
+    view = "updates";
+    snoozeOpen = false;
+  }
+
   function go(next: View) {
     view = next;
     snoozeOpen = false;
@@ -170,7 +175,6 @@
 
   let whatsNewVersion = "";
   let whatsNewNotes = "";
-  let theme: ThemeId = loadTheme();
 
   const SEEN_VERSION_KEY = "lastSeenVersion";
   const PENDING_NOTES_KEY = "pendingUpdateNotes";
@@ -239,11 +243,6 @@
     if (notes.trim()) openWhatsNew(appVersion, notes);
   }
 
-  function changeTheme() {
-    saveTheme(theme);
-    applyTheme(theme);
-  }
-
   type ScheduleConfig = {
     enabled: boolean;
     frequency: "hourly" | "daily" | "weekly";
@@ -256,12 +255,13 @@
     lastCounts: Record<string, number>;
     snoozedUntil: number;
     checkOnLaunch: boolean;
+    showDevTools: boolean;
   };
 
   let schedule: ScheduleConfig = {
     enabled: false, frequency: "daily", minute: 0, hour: 10, weekday: 1, notify: true,
     lastRun: 0, lastTotal: 0, lastCounts: {}, snoozedUntil: 0,
-    checkOnLaunch: false,
+    checkOnLaunch: false, showDevTools: false,
   };
   let scheduleSaving = false;
   let scheduleRunning = false;
@@ -324,6 +324,13 @@
     } catch (e) {
       console.error("Failed to read schedule:", e);
     }
+  }
+
+  async function toggleDevTools() {
+    if (!schedule.showDevTools && sections.find((s) => s.id === activeTab)?.dev) {
+      activeTab = appSections[0]?.id ?? "";
+    }
+    await saveSchedule();
   }
 
   async function saveSchedule() {
@@ -553,8 +560,6 @@
     autoCheckUpdates = savedAutoCheck === null ? true : savedAutoCheck === "true";
 
     try { startOnLogin = await isAutostartEnabled(); } catch (e) { console.error("Failed to read start-on-login state:", e); }
-
-    watchSystemTheme(() => theme);
 
     await checkWhatsNew();
 
@@ -840,6 +845,15 @@
     return out;
   }
   $: counts = computeCounts(statuses, parsedItems, schedule.lastCounts, hiddenApps);
+  $: newestCheck = newestOf(appSections.map((s) => lastChecked[s.id]), schedule.lastRun);
+
+  function newestOf(dates: (Date | null | undefined)[], fallbackTs: number): Date | null {
+    let best: Date | null = fallbackTs ? new Date(fallbackTs * 1000) : null;
+    for (const d of dates) {
+      if (d && (!best || d.getTime() > best.getTime())) best = d;
+    }
+    return best;
+  }
 
   function relTime(d: Date | null): string {
     if (!d) return "";
@@ -1049,19 +1063,9 @@
   <div class="toolbar" data-tauri-drag-region>
     <div class="brand" data-tauri-drag-region>
       <img src={iconUrl} alt="" class="brand-icon" />
-      <span class="brand-name">PartyMAN</span>
+      <span class="brand-name"><span class="brand-accent">PartyMAN</span> Update Manager</span>
     </div>
-    <nav class="views" aria-label="View">
-      <button class:active={view === "updates"} onclick={() => go("updates")}>Updates</button>
-      <button class:active={view === "history"} onclick={() => go("history")}>History</button>
-      <button class:active={view === "settings" || view === "whatsnew"} onclick={() => go("settings")}>Settings</button>
-    </nav>
     <div class="toolbar-space" data-tauri-drag-region></div>
-    {#if view === "updates"}
-      <button class="btn" onclick={runAll} disabled={runningAll}>
-        {runningAll ? "Checking…" : "Check all"}
-      </button>
-    {/if}
   </div>
 
   {#if appUpdateStatus === "available" && appUpdateInfo}
@@ -1088,6 +1092,109 @@
       <button class="dismiss" aria-label="Dismiss" onclick={() => { installedTwiceDismissed = true; }}>✕</button>
     </div>
   {/if}
+
+  <div class="split">
+      <aside class="sidebar">
+        <div class="summary">
+          {#if schedule.lastTotal > 0}
+            <div class="summary-count">
+              <span class="num">{schedule.lastTotal}</span>
+              <span class="num-label">update{schedule.lastTotal === 1 ? "" : "s"}</span>
+            </div>
+          {:else if newestCheck}
+            <div class="summary-count ok">
+              <span class="tick">✓</span>
+              <span class="num-label">Up to date</span>
+            </div>
+          {:else}
+            <div class="summary-count">
+              <span class="num-label">Not checked yet</span>
+            </div>
+          {/if}
+          {#if newestCheck}
+            <p class="summary-note">{runningAll ? "Checking…" : `Checked ${relTime(newestCheck)}`}</p>
+          {/if}
+          <div class="summary-actions">
+            <button class="btn" onclick={runAll} disabled={runningAll}>{runningAll ? "Checking…" : "Check all"}</button>
+            {#if schedule.lastTotal > 0}
+              <button class="btn btn-primary" onclick={installOutstanding}>Install all</button>
+            {/if}
+          </div>
+          {#if schedule.lastTotal > 0}
+            <div class="snooze">
+              <button class="btn btn-plain btn-small" onclick={() => { snoozeOpen = !snoozeOpen; }} aria-expanded={snoozeOpen}>
+                {isSnoozed() ? "Reminders snoozed" : "Snooze reminders"}
+              </button>
+              {#if snoozeOpen}
+                <div class="snooze-backdrop" onclick={() => { snoozeOpen = false; }} role="presentation"></div>
+                <div class="snooze-menu" role="menu">
+                  <span class="snooze-title">Remind me in</span>
+                  <button role="menuitem" onclick={() => { snoozeUpdates(1); snoozeOpen = false; }}>1 hour</button>
+                  <button role="menuitem" onclick={() => { snoozeUpdates(24); snoozeOpen = false; }}>1 day</button>
+                  <button role="menuitem" onclick={() => { snoozeUpdates(72); snoozeOpen = false; }}>3 days</button>
+                  {#if isSnoozed()}
+                    <button role="menuitem" onclick={() => { snoozeUpdates(0); snoozeOpen = false; }}>Resume reminders</button>
+                  {/if}
+                </div>
+              {/if}
+            </div>
+          {/if}
+        </div>
+
+        <ul class="sources">
+          {#each appSections as s (s.id)}
+            {@const st = statuses[s.id]}
+            {@const n = counts[s.id]}
+            <li>
+              <button class="source" class:active={view === "updates" && activeTab === s.id} onclick={() => pick(s.id)}>
+                <span class="source-name">{s.label}</span>
+                {#if st === "running"}
+                  <span class="spinner" aria-label="Checking"></span>
+                {:else if st === "error"}
+                  <span class="count err" title="The check failed">!</span>
+                {:else if n === null}
+                  <span class="count none">–</span>
+                {:else if n === 0}
+                  <span class="count zero" title="Up to date">✓</span>
+                {:else}
+                  <span class="count" class:quiet={s.id === "untracked_apps"}>{n}</span>
+                {/if}
+              </button>
+            </li>
+          {/each}
+        </ul>
+
+        {#if schedule.showDevTools && devSections.length > 0}
+          <p class="group-title">Developer tools</p>
+          <ul class="sources">
+            {#each devSections as s (s.id)}
+              {@const st = statuses[s.id]}
+              {@const n = counts[s.id]}
+              <li>
+                <button class="source" class:active={view === "updates" && activeTab === s.id} onclick={() => pick(s.id)}>
+                  <span class="source-name">{s.label}</span>
+                  {#if st === "running"}
+                    <span class="spinner" aria-label="Checking"></span>
+                  {:else if st === "error"}
+                    <span class="count err" title="The check failed">!</span>
+                  {:else if n === null}
+                    <span class="count none">–</span>
+                  {:else if n === 0}
+                    <span class="count zero" title="Up to date">✓</span>
+                  {:else}
+                    <span class="count quiet">{n}</span>
+                  {/if}
+                </button>
+              </li>
+            {/each}
+          </ul>
+        {/if}
+
+        <div class="sidebar-foot">
+          <button class="source" class:active={view === "history"} onclick={() => go("history")}>History</button>
+          <button class="source" class:active={view === "settings" || view === "whatsnew"} onclick={() => go("settings")}>Settings</button>
+        </div>
+      </aside>
 
   {#if view === "whatsnew"}
     <div class="page">
@@ -1246,16 +1353,18 @@
         </section>
 
         <section>
-          <h3>Appearance and start-up</h3>
-          <div class="row">
+          <h3>Developer tools</h3>
+          <label class="row">
             <span class="row-text">
-              <span class="row-label">Theme</span>
-              <span class="row-desc">{THEMES.find((t) => t.id === theme)?.note ?? ""}</span>
+              <span class="row-label">Show developer tools</span>
+              <span class="row-desc">Homebrew formulae, npm, pip, rbenv and rvm. They never count towards the total, and are only checked from their own page or by the schedule while shown.</span>
             </span>
-            <select class="select" bind:value={theme} onchange={changeTheme}>
-              {#each THEMES as choice}<option value={choice.id}>{choice.label}</option>{/each}
-            </select>
-          </div>
+            <input type="checkbox" bind:checked={schedule.showDevTools} onchange={toggleDevTools} disabled={scheduleSaving} />
+          </label>
+        </section>
+
+        <section>
+          <h3>Start-up</h3>
           <label class="row">
             <span class="row-text">
               <span class="row-label">Open at login</span>
@@ -1302,108 +1411,14 @@
                 <button class="link" onclick={() => openReleaseUrl("https://github.com/paymonr/partyman_update_manager/releases")}>Release notes</button>
                 <button class="link" onclick={() => openReleaseUrl("https://github.com/paymonr/partyman_update_manager")}>Source on GitHub</button>
               </p>
-              <p class="about-fine">
-                Apache License 2.0. Kawaii Meadow themes use
-                <button class="link" onclick={() => openReleaseUrl("https://github.com/paymonr/kawaii-meadow")}>kawaii-meadow</button>
-                (MIT) and Nunito (SIL Open Font License).
-              </p>
+              <p class="about-fine">Apache License 2.0.</p>
             </div>
           </div>
         </section>
       </div>
     </div>
 
-  {:else}
-    <div class="split">
-      <aside class="sidebar">
-        <div class="summary">
-          {#if schedule.lastTotal > 0}
-            <div class="summary-count">
-              <span class="num">{schedule.lastTotal}</span>
-              <span class="num-label">update{schedule.lastTotal === 1 ? "" : "s"}</span>
-            </div>
-            <div class="summary-actions">
-              <button class="btn btn-primary" onclick={installOutstanding}>Install all</button>
-              <div class="snooze">
-                <button class="btn btn-plain" onclick={() => { snoozeOpen = !snoozeOpen; }} aria-expanded={snoozeOpen}>
-                  {isSnoozed() ? "Snoozed" : "Snooze"}
-                </button>
-                {#if snoozeOpen}
-                  <div class="snooze-backdrop" onclick={() => { snoozeOpen = false; }} role="presentation"></div>
-                  <div class="snooze-menu" role="menu">
-                    <span class="snooze-title">Remind me in</span>
-                    <button role="menuitem" onclick={() => { snoozeUpdates(1); snoozeOpen = false; }}>1 hour</button>
-                    <button role="menuitem" onclick={() => { snoozeUpdates(24); snoozeOpen = false; }}>1 day</button>
-                    <button role="menuitem" onclick={() => { snoozeUpdates(72); snoozeOpen = false; }}>3 days</button>
-                    {#if isSnoozed()}
-                      <button role="menuitem" onclick={() => { snoozeUpdates(0); snoozeOpen = false; }}>Resume reminders</button>
-                    {/if}
-                  </div>
-                {/if}
-              </div>
-            </div>
-          {:else if schedule.lastRun}
-            <div class="summary-count ok">
-              <span class="tick">✓</span>
-              <span class="num-label">Up to date</span>
-            </div>
-            <p class="summary-note">Checked {relTime(new Date(schedule.lastRun * 1000))}</p>
-          {:else}
-            <p class="summary-note">Not checked yet</p>
-          {/if}
-        </div>
-
-        <ul class="sources">
-          {#each appSections as s (s.id)}
-            {@const st = statuses[s.id]}
-            {@const n = counts[s.id]}
-            <li>
-              <button class="source" class:active={activeTab === s.id} onclick={() => (activeTab = s.id)}>
-                <span class="source-name">{s.label}</span>
-                {#if st === "running"}
-                  <span class="spinner" aria-label="Checking"></span>
-                {:else if st === "error"}
-                  <span class="count err" title="The check failed">!</span>
-                {:else if n === null}
-                  <span class="count none">–</span>
-                {:else if n === 0}
-                  <span class="count zero" title="Up to date">✓</span>
-                {:else}
-                  <span class="count" class:quiet={s.id === "untracked_apps"}>{n}</span>
-                {/if}
-              </button>
-            </li>
-          {/each}
-        </ul>
-
-        {#if devSections.length > 0}
-          <p class="group-title">Developer tools</p>
-          <ul class="sources">
-            {#each devSections as s (s.id)}
-              {@const st = statuses[s.id]}
-              {@const n = counts[s.id]}
-              <li>
-                <button class="source" class:active={activeTab === s.id} onclick={() => (activeTab = s.id)}>
-                  <span class="source-name">{s.label}</span>
-                  {#if st === "running"}
-                    <span class="spinner" aria-label="Checking"></span>
-                  {:else if st === "error"}
-                    <span class="count err" title="The check failed">!</span>
-                  {:else if n === null}
-                    <span class="count none">–</span>
-                  {:else if n === 0}
-                    <span class="count zero" title="Up to date">✓</span>
-                  {:else}
-                    <span class="count quiet">{n}</span>
-                  {/if}
-                </button>
-              </li>
-            {/each}
-          </ul>
-        {/if}
-      </aside>
-
-      {#if activeSection}
+  {:else if activeSection}
         <section class="content">
           <header class="source-head">
             <div class="source-title">
@@ -1544,9 +1559,8 @@
             {/if}
           {/if}
         </section>
-      {/if}
-    </div>
   {/if}
+  </div>
 </main>
 
 <style>
@@ -1571,27 +1585,21 @@
     display: flex;
     align-items: center;
     gap: 12px;
-    height: 38px;
+    /* The standard unified-toolbar height; the traffic lights are moved to sit
+       centred in it (trafficLightPosition in tauri.conf.json). */
+    height: 52px;
     flex-shrink: 0;
     /* Room for the traffic lights, which macOS draws over this strip. */
-    padding: 0 12px 0 82px;
+    padding: 0 14px 0 86px;
     border-bottom: 1px solid var(--pm-border);
     background: var(--pm-surface-2);
     user-select: none;
   }
   .toolbar-space { flex: 1; align-self: stretch; }
-  .brand { display: flex; align-items: center; gap: 7px; }
-  .brand-icon { width: 18px; height: 18px; border-radius: 4px; }
-  .brand-name { font-weight: 600; color: var(--pm-text); letter-spacing: -0.01em; }
-
-  .views { display: flex; gap: 2px; padding: 2px; border-radius: var(--pm-radius); background: var(--pm-bg); }
-  .views button {
-    border: none; background: transparent; color: var(--pm-muted);
-    padding: 3px 11px; border-radius: calc(var(--pm-radius) - 2px); cursor: pointer;
-    font-weight: 500;
-  }
-  .views button:hover { color: var(--pm-text); }
-  .views button.active { background: var(--pm-card-2); color: var(--pm-text); box-shadow: 0 1px 2px var(--pm-shadow); }
+  .brand { display: flex; align-items: center; gap: 10px; }
+  .brand-icon { width: 28px; height: 28px; border-radius: 7px; }
+  .brand-name { font-size: 15px; font-weight: 600; color: var(--pm-text-bright); letter-spacing: -0.01em; }
+  .brand-accent { color: var(--pm-accent); }
 
   /* ── Buttons ─────────────────────────────────────────────────────────── */
   .btn {
@@ -1647,10 +1655,10 @@
   .num-label { font-size: 14px; font-weight: 500; color: var(--pm-text-2); }
   .summary-count.ok { align-items: center; }
   .tick { color: var(--pm-ok); font-size: 18px; font-weight: 700; }
-  .summary-actions { display: flex; align-items: center; gap: 4px; margin-top: 10px; }
-  .summary-note { color: var(--pm-muted); }
+  .summary-actions { display: flex; align-items: center; gap: 6px; margin-top: 10px; }
+  .summary-note { color: var(--pm-muted); margin-top: 2px; font-size: 12px; }
 
-  .snooze { position: relative; }
+  .snooze { position: relative; margin: 6px 0 0 -9px; }
   .snooze-backdrop { position: fixed; inset: 0; z-index: 10; }
   .snooze-menu {
     position: absolute; top: calc(100% + 4px); left: 0; z-index: 20;
@@ -1664,6 +1672,11 @@
   .snooze-menu button:hover { background: var(--pm-hover); }
 
   .group-title { margin: 14px 8px 4px; font-size: 11.5px; font-weight: 600; color: var(--pm-muted); }
+  .sidebar-foot {
+    margin-top: auto; padding-top: 8px;
+    border-top: 1px solid var(--pm-border);
+    display: flex; flex-direction: column; gap: 1px;
+  }
   .sources { list-style: none; display: flex; flex-direction: column; gap: 1px; }
   .source {
     display: flex; align-items: center; gap: 8px; width: 100%;
@@ -1748,7 +1761,7 @@
   .empty { font-family: var(--pm-font); font-size: 13px; color: var(--pm-muted); max-width: 44ch; padding: 6px 8px; }
 
   /* ── Pages: History, Settings, What's new ────────────────────────────── */
-  .page { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+  .page { flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; }
   .page-head {
     display: flex; align-items: center; gap: 12px;
     padding: 14px 18px 12px;
@@ -1780,7 +1793,7 @@
   .history-caret { color: var(--pm-faint); font-size: 11px; padding-top: 3px; }
   .history-output { flex: none; padding: 8px 18px 12px 160px; border-top: 1px solid var(--pm-border); }
 
-  .settings { padding: 6px 18px 24px; max-width: 640px; }
+  .settings { padding: 6px 18px 24px; }
   .settings section { padding: 14px 0 6px; }
   .settings section + section { border-top: 1px solid var(--pm-border); }
   .settings h3 { font-size: 13px; font-weight: 600; color: var(--pm-text-bright); margin-bottom: 8px; }
@@ -1822,6 +1835,6 @@
 
   @media (prefers-reduced-motion: reduce) {
     .spinner { animation: none; border-top-color: var(--pm-accent); }
-    .btn, .views button, .segmented button { transition: none; }
+    .btn, .segmented button { transition: none; }
   }
 </style>

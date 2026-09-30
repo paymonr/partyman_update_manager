@@ -104,12 +104,12 @@ Replacement: brew install --cask windows-app
 The end-of-run failure summary added in v1.0.3 doesn't help here — the user never
 reaches a failure, the number simply never goes down.
 
-- [ ] Detect deprecated/disabled casks (`brew info --json=v2` carries
+- [x] Detect deprecated/disabled casks (`brew info --json=v2` carries
       `deprecated`, `disabled` and `replacement_cask`) and keep them out of the
-      count.
-- [ ] Surface them as their own thing — "no longer available, replaced by
-      `windows-app`" — offering the replacement or removal rather than an upgrade
-      that cannot succeed.
+      count. *(v1.1.0)*
+- [x] Surface them as their own thing — listed after the outdated apps with the
+      date and any replacement, not offered for selection. *(v1.1.0; offering
+      the replacement or removal is still open)*
 - [ ] Same treatment for a cask whose app is missing from disk, which fails as
       `It seems the App source '/Applications/X.app' is not there` (seen with
       `brave-browser`).
@@ -117,3 +117,41 @@ reaches a failure, the number simply never goes down.
 **References:**
 - Cask check: `src-tauri/src/lib.rs` (the `brew outdated --cask --greedy` section).
 - Counting: `src-tauri/src/schedule.rs` → `count_for()`.
+
+## Fleet management: report to, or be queried by, a server
+
+**The idea:** a server that can see what each Mac has outstanding, and can ask a
+Mac to install things. Either direction needs the same payload: per source, the
+items with name, installed version, available version and whether it is really
+updatable (not a disabled cask, not an app that updates itself).
+
+**What exists already:** a scheduled run writes exactly that shape to
+`last_check.json` and the counts to `schedule.json`, so reporting is close to
+free once it is structured (see the next item).
+
+**The constraint to keep:** installing needs the admin password entered at the
+machine (the askpass flow), so a server cannot install silently. A server
+*requests*; the app shows the request as pending until someone at the Mac clicks.
+That matches the app's stance today — it only ever checks; a person starts installs.
+
+- [ ] One structured inventory in Rust — `{source, name, installed, available,
+      updatable}` — read by the UI, the menu-bar count and the server alike.
+      Today what is outdated is parsed from shell output twice, by regex
+      (`schedule.rs` → `parse_items()` / `count_for()`, `App.svelte` →
+      `parseItems()`); a server would be a third copy.
+- [ ] Decide the direction (app posts on each check, or server polls the app),
+      identity (which Mac is this), and auth.
+- [ ] A "requested by your admin" state in the UI: a highlighted group with an
+      Install button, not something that looks already in progress.
+
+## Let the user choose between the sidebar and dashboard layouts
+
+The `design/simpler-layout` branch builds the sidebar (every source and its count
+in one column). The mockups at the "PartyMAN layout options" canvas show a
+dashboard alternative (one card per source, drill in for the list). The plan is to
+offer both, chosen in Settings; both are views over the same data.
+
+- [ ] Build the dashboard view.
+- [ ] A Layout setting (Sidebar / Dashboard) persisted with the other settings.
+- [ ] Show real app names and versions in lists ("Docker Desktop · 4.86 → 4.93")
+      — Homebrew reports both; needs the structured inventory above.
