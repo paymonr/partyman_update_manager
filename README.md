@@ -28,7 +28,7 @@ Two things a Mac needs before PartyMAN can update apps, and PartyMAN walks throu
 ## Features
 
 - A sidebar of every source with its outdated count; one click to see the list
-- **Check all** at any time (⌘R), with the result preselected so one more click updates everything, or pick and choose
+- **Check all** at any time (⌘R by default; shortcuts are yours to change in Settings → Keyboard), with the result preselected so one more click updates everything, or pick and choose
 - **Ignore** an item until a newer version appears
 - **Enable auto-updates** for unmanaged apps by handing them to Homebrew
 - **History** of every run with its outcome, duration and version changes, searchable, kept for 180 days; a diagnostic log alongside it (Settings → About → Logs)

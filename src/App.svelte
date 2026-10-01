@@ -400,13 +400,96 @@
     return !q || text.toLowerCase().includes(q);
   }
 
-  // ⌘R checks everything, ⌘, opens Settings, ⌘F goes to the filter.
+  // Keyboard shortcuts: ⌘R checks everything, ⌘, opens Settings, ⌘F goes to the
+  // filter, unless the user has chosen others in Settings → Keyboard. Kept per
+  // Mac in localStorage. A shortcut must include ⌘ or ⌃, so typing in the
+  // Filter box can never trigger one.
+  type ShortcutAction = "checkAll" | "settings" | "filter";
+  type Shortcut = { key: string; meta: boolean; ctrl: boolean; alt: boolean; shift: boolean };
+  const SHORTCUT_ACTIONS: { id: ShortcutAction; label: string; desc: string }[] = [
+    { id: "checkAll", label: "Check all", desc: "Check every source for updates" },
+    { id: "settings", label: "Settings", desc: "Open this page" },
+    { id: "filter", label: "Filter", desc: "Jump to the Filter box on a long list" },
+  ];
+  const DEFAULT_SHORTCUTS: Record<ShortcutAction, Shortcut> = {
+    checkAll: { key: "r", meta: true, ctrl: false, alt: false, shift: false },
+    settings: { key: ",", meta: true, ctrl: false, alt: false, shift: false },
+    filter: { key: "f", meta: true, ctrl: false, alt: false, shift: false },
+  };
+  let shortcuts: Record<ShortcutAction, Shortcut> = loadShortcuts();
+  // The shortcut being re-recorded: its button says "Press keys…" until a key comes.
+  let recording: ShortcutAction | null = null;
+  let shortcutError = "";
+
+  function loadShortcuts(): Record<ShortcutAction, Shortcut> {
+    try {
+      const raw = localStorage.getItem("shortcuts");
+      if (raw) return { ...DEFAULT_SHORTCUTS, ...(JSON.parse(raw) as Partial<Record<ShortcutAction, Shortcut>>) };
+    } catch {}
+    return { ...DEFAULT_SHORTCUTS };
+  }
+
+  function saveShortcuts() {
+    try { localStorage.setItem("shortcuts", JSON.stringify(shortcuts)); } catch {}
+  }
+
+  // A modifier on its own is not a shortcut yet.
+  function shortcutFromEvent(e: KeyboardEvent): Shortcut | null {
+    if (["Meta", "Control", "Alt", "Shift", "CapsLock", "Fn"].includes(e.key)) return null;
+    return { key: e.key.length === 1 ? e.key.toLowerCase() : e.key, meta: e.metaKey, ctrl: e.ctrlKey, alt: e.altKey, shift: e.shiftKey };
+  }
+
+  function sameShortcut(a: Shortcut, b: Shortcut): boolean {
+    return a.key === b.key && a.meta === b.meta && a.ctrl === b.ctrl && a.alt === b.alt && a.shift === b.shift;
+  }
+
+  const KEY_NAMES: Record<string, string> = {
+    " ": "Space", ArrowUp: "↑", ArrowDown: "↓", ArrowLeft: "←", ArrowRight: "→",
+    Enter: "↩", Escape: "⎋", Backspace: "⌫", Delete: "⌦", Tab: "⇥",
+  };
+
+  function shortcutLabel(s: Shortcut): string {
+    const key = KEY_NAMES[s.key] ?? (s.key.length === 1 ? s.key.toUpperCase() : s.key);
+    return `${s.ctrl ? "⌃" : ""}${s.alt ? "⌥" : ""}${s.shift ? "⇧" : ""}${s.meta ? "⌘" : ""}${key}`;
+  }
+
+  // Takes the table as an argument so the template re-renders when it changes.
+  function isDefaultShortcut(id: ShortcutAction, table: Record<ShortcutAction, Shortcut>): boolean {
+    return sameShortcut(table[id], DEFAULT_SHORTCUTS[id]);
+  }
+
+  function resetShortcut(id: ShortcutAction) {
+    shortcuts[id] = { ...DEFAULT_SHORTCUTS[id] };
+    shortcuts = shortcuts;
+    saveShortcuts();
+    recording = null;
+    shortcutError = "";
+  }
+
   function onKey(e: KeyboardEvent) {
-    if (!e.metaKey || e.ctrlKey || e.altKey || e.shiftKey) return;
-    const k = e.key.toLowerCase();
-    if (k === "r") { e.preventDefault(); if (!runningAll) runAll(); }
-    else if (k === ",") { e.preventDefault(); go("settings"); }
-    else if (k === "f" && filterShown && filterEl) { e.preventDefault(); filterEl.focus(); filterEl.select(); }
+    if (recording) {
+      e.preventDefault();
+      if (e.key === "Escape") { recording = null; shortcutError = ""; return; }
+      const s = shortcutFromEvent(e);
+      if (!s) return;
+      if (!s.meta && !s.ctrl) { shortcutError = "Use ⌘ or ⌃ together with a key."; return; }
+      const clash = (Object.keys(shortcuts) as ShortcutAction[]).find((id) => id !== recording && sameShortcut(shortcuts[id], s));
+      if (clash) {
+        shortcutError = `${shortcutLabel(s)} already means ${SHORTCUT_ACTIONS.find((a) => a.id === clash)?.label}.`;
+        return;
+      }
+      shortcuts[recording] = s;
+      shortcuts = shortcuts;
+      saveShortcuts();
+      recording = null;
+      shortcutError = "";
+      return;
+    }
+    const pressed = shortcutFromEvent(e);
+    if (!pressed || (!pressed.meta && !pressed.ctrl)) return;
+    if (sameShortcut(pressed, shortcuts.checkAll)) { e.preventDefault(); if (!runningAll) runAll(); }
+    else if (sameShortcut(pressed, shortcuts.settings)) { e.preventDefault(); go("settings"); }
+    else if (sameShortcut(pressed, shortcuts.filter) && filterShown && filterEl) { e.preventDefault(); filterEl.focus(); filterEl.select(); }
   }
 
   type View = "updates" | "history" | "settings" | "whatsnew" | "setup";
@@ -1526,7 +1609,7 @@
             <p class="summary-note">{runningAll ? "Checking…" : `Checked ${relTime(newestCheck)}`}</p>
           {/if}
           <div class="summary-actions">
-            <button class="btn" onclick={runAll} disabled={runningAll}>{runningAll ? "Checking…" : "Check all"}</button>
+            <button class="btn" onclick={runAll} title={shortcutLabel(shortcuts.checkAll)} disabled={runningAll}>{runningAll ? "Checking…" : "Check all"}</button>
             {#if schedule.lastTotal > 0}
               <button class="btn btn-primary" onclick={installOutstanding}>Install all</button>
             {/if}
@@ -1781,6 +1864,27 @@
         </section>
 
         <section>
+          <h3>Keyboard</h3>
+          <p class="section-hint">Click a shortcut to change it, then press the new keys. A shortcut needs ⌘ or ⌃; Escape keeps the old one.</p>
+          {#each SHORTCUT_ACTIONS as a (a.id)}
+            <div class="row">
+              <span class="row-text">
+                <span class="row-label">{a.label}</span>
+                <span class="row-desc">{a.desc}</span>
+              </span>
+              {#if !isDefaultShortcut(a.id, shortcuts)}
+                <button class="btn btn-plain btn-small" onclick={() => resetShortcut(a.id)}>Reset</button>
+              {/if}
+              <button class="btn shortcut" class:recording={recording === a.id}
+                onclick={() => { recording = recording === a.id ? null : a.id; shortcutError = ""; }}>
+                {recording === a.id ? "Press keys…" : shortcutLabel(shortcuts[a.id])}
+              </button>
+            </div>
+          {/each}
+          {#if shortcutError}<p class="section-hint error">{shortcutError}</p>{/if}
+        </section>
+
+        <section>
           <h3>Automatic checks</h3>
           <p class="section-hint">
             Checks run in the background, even when PartyMAN is closed, and only ever look.
@@ -1934,7 +2038,7 @@
             </div>
             <div class="source-actions">
               {#if filterShown}
-                <input class="search filter" type="search" placeholder="Filter" bind:value={filter} bind:this={filterEl} aria-label="Filter this list" />
+                <input class="search filter" type="search" placeholder="Filter" title={shortcutLabel(shortcuts.filter)} bind:value={filter} bind:this={filterEl} aria-label="Filter this list" />
               {/if}
               {#if activeHasItemSelection && activeStatus === "done" && activeParsedItems.length > 0}
                 <div class="segmented" role="tablist" aria-label="View">
@@ -2190,6 +2294,9 @@
   .btn-plain { background: transparent; border-color: transparent; color: var(--pm-muted); }
   .btn-plain:hover:not(:disabled) { color: var(--pm-text); background: var(--pm-hover); }
   .btn-small { padding: 2px 9px; font-size: 12px; }
+  .btn.shortcut { font-family: ui-monospace, "SF Mono", Menlo, monospace; min-width: 76px; letter-spacing: 0.04em; }
+  .btn.shortcut.recording { border-color: var(--pm-accent); color: var(--pm-accent); }
+  .section-hint.error { color: var(--pm-err); }
   .btn-stop { background: var(--pm-err); border-color: transparent; color: #fff; font-weight: 600; }
   .btn-stop:hover:not(:disabled) { background: var(--pm-err); filter: brightness(1.12); }
   .link { background: none; border: none; padding: 0; color: var(--pm-accent); cursor: pointer; text-decoration: underline; text-underline-offset: 2px; }
