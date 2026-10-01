@@ -28,6 +28,7 @@ pub const CHECKED_SECTIONS: &[&str] = &[
     "pip_packages",
     "ruby_rvm",
     "ruby_rbenv",
+    "asdf",
 ];
 
 // `default` at the container level so a config written by an older version, or
@@ -52,6 +53,43 @@ pub struct ScheduleConfig {
     pub snoozed_until: u64,
     /// Run a check as soon as the app opens, rather than waiting for the interval.
     pub check_on_launch: bool,
+    /// Show brew formulae, npm, pip, rbenv and rvm in the app and include them
+    /// in scheduled runs. Off by default: most people never touch them, and the
+    /// formulae check alone can take a minute.
+    pub show_dev_tools: bool,
+    /// Items set aside until something newer turns up. See apply_ignores.
+    pub ignored: Vec<IgnoredItem>,
+    /// Homebrew's own version against its latest release, from the last run.
+    pub brew_self: BrewSelf,
+}
+
+/// Whether Homebrew itself is current. Checked with every run and shown as a
+/// banner when a newer release is out; it never counts as an update.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct BrewSelf {
+    /// "7.0.7" — the release the installed Homebrew is based on. Empty when
+    /// Homebrew is not installed.
+    pub installed: String,
+    /// The latest release on GitHub, or empty when that could not be fetched.
+    pub latest: String,
+    pub checked: u64,
+    pub outdated: bool,
+}
+
+/// An item the user has chosen not to count for now: an app they update some
+/// other way, or a version they are skipping. Ignoring is per version, not per
+/// app — the next version brings the item back.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct IgnoredItem {
+    pub section: String,
+    pub id: String,
+    pub name: String,
+    /// The version that was available when it was ignored. Empty when the
+    /// source reports no version, in which case the ignore holds until lifted.
+    pub available: String,
+    pub since: u64,
 }
 
 impl Default for ScheduleConfig {
@@ -68,6 +106,9 @@ impl Default for ScheduleConfig {
             last_counts: BTreeMap::new(),
             snoozed_until: 0,
             check_on_launch: false,
+            show_dev_tools: false,
+            ignored: Vec::new(),
+            brew_self: BrewSelf::default(),
         }
     }
 }
@@ -184,18 +225,87 @@ pub fn save(app: &AppHandle, cfg: &ScheduleConfig) -> Result<(), String> {
     fs::write(&path, json).map_err(|e| e.to_string())
 }
 
-#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CheckItem {
     pub id: String,
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub app_dir: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub installed: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub available: Option<String>,
+    /// "restart" when installing it restarts the Mac.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    /// The app bundle on disk ("/Applications/Brave Browser.app"), when the
+    /// check found it. Used to see whether the app is running before it is
+    /// replaced.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub app_path: Option<String>,
+    /// Set aside by the user; listed, but not counted or preselected.
+    pub ignored: bool,
 }
 
-// Mirrors parseItems() in App.svelte. The four sections below list their items
-// individually; the rest report a total instead, which count_for reads.
+pub fn apply_ignores(section: &str, items: &mut [CheckItem], ignored: &[IgnoredItem]) {
+    for it in items.iter_mut() {
+        it.ignored = ignored.iter().any(|g| {
+            g.section == section
+                && g.id == it.id
+                && (g.available.is_empty() || it.available.as_deref().unwrap_or("") == g.available)
+        });
+    }
+}
+
+/// The items a check found, with the user's ignores applied.
+pub fn items_for(app: &AppHandle, section: &str, lines: &[String]) -> Vec<CheckItem> {
+    let mut items = parse_items(section, lines);
+    apply_ignores(section, &mut items, &load(app).ignored);
+    items
+}
+
+/// count_for, less whatever the user has set aside.
+pub fn count_with(section: &str, lines: &[String], ignored: &[IgnoredItem]) -> usize {
+    match section {
+        "brew_casks" | "app_store" | "macos_updates" | "untracked_apps" => {
+            let mut items = parse_items(section, lines);
+            apply_ignores(section, &mut items, ignored);
+            items.iter().filter(|i| !i.ignored).count()
+        }
+        _ => count_for(section, lines),
+    }
+}
+
+/// One item as a check script reports it: a tab-separated line the UI never
+/// shows, carrying the id to act on, the name to show, and the versions.
+pub const ITEM_LINE: &str = "__PM_ITEM__\t";
+
+fn parse_item_line(line: &str) -> Option<CheckItem> {
+    let rest = line.strip_prefix(ITEM_LINE)?;
+    let mut f = rest.split('\t');
+    let id = f.next()?.trim().to_string();
+    if id.is_empty() {
+        return None;
+    }
+    let name = f.next().map(str::trim).filter(|s| !s.is_empty()).unwrap_or(&id).to_string();
+    let opt = |v: Option<&str>| v.map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+    let installed = opt(f.next());
+    let available = opt(f.next());
+    let note = opt(f.next());
+    let app_path = opt(f.next());
+    Some(CheckItem { id, name, app_dir: None, installed, available, note, app_path, ignored: false })
+}
+
+// The one place a check's output is turned into items: the menu-bar count, the
+// checklist the app shows and the history's names all come from here. Scripts
+// report each item on an ITEM_LINE; output written before those existed (an
+// older last_check.json) falls back to the human-readable lines.
 pub fn parse_items(section: &str, lines: &[String]) -> Vec<CheckItem> {
+    let structured: Vec<CheckItem> = lines.iter().filter_map(|l| parse_item_line(l)).collect();
+    if !structured.is_empty() {
+        return structured;
+    }
     let mut items = Vec::new();
     match section {
         "brew_casks" => {
@@ -216,7 +326,7 @@ pub fn parse_items(section: &str, lines: &[String]) -> Vec<CheckItem> {
                     items.push(CheckItem {
                         id: name.to_string(),
                         name: name.to_string(),
-                        app_dir: None,
+                        ..Default::default()
                     });
                 }
             }
@@ -245,7 +355,7 @@ pub fn parse_items(section: &str, lines: &[String]) -> Vec<CheckItem> {
                 items.push(CheckItem {
                     id: id.to_string(),
                     name: if name.is_empty() { id.to_string() } else { name },
-                    app_dir: None,
+                    ..Default::default()
                 });
             }
         }
@@ -260,7 +370,7 @@ pub fn parse_items(section: &str, lines: &[String]) -> Vec<CheckItem> {
                         items.push(CheckItem {
                             id: label.to_string(),
                             name: label.to_string(),
-                            app_dir: None,
+                            ..Default::default()
                         });
                     }
                 }
@@ -282,6 +392,7 @@ pub fn parse_items(section: &str, lines: &[String]) -> Vec<CheckItem> {
                         id: name.to_string(),
                         name: name.to_string(),
                         app_dir,
+                        ..Default::default()
                     });
                 }
             }
@@ -482,6 +593,49 @@ mod tests {
     }
 
     #[test]
+    fn item_lines_carry_names_and_versions_and_win_over_the_prose() {
+        let lines: Vec<String> = [
+            "⚠  Outdated apps:",
+            "__PM_ITEM__\tdocker-desktop\tDocker Desktop\t4.86.0,236216\t4.93.0,240920\t",
+            "   Docker Desktop  4.86.0 → 4.93.0  (docker-desktop)",
+            "__PM_ITEM__\tmacOS Sequoia 15.1-24B83\tmacOS Sequoia 15.1\t\t15.1\trestart",
+        ].iter().map(|s| s.to_string()).collect();
+        let items = parse_items("brew_casks", &lines);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].id, "docker-desktop");
+        assert_eq!(items[0].name, "Docker Desktop");
+        assert_eq!(items[0].installed.as_deref(), Some("4.86.0,236216"));
+        assert_eq!(items[0].available.as_deref(), Some("4.93.0,240920"));
+        assert_eq!(items[1].installed, None);
+        assert_eq!(items[1].note.as_deref(), Some("restart"));
+        assert_eq!(count_for("brew_casks", &lines), 2);
+    }
+
+    #[test]
+    fn an_ignore_holds_for_one_version_only() {
+        let lines: Vec<String> = [
+            "__PM_ITEM__\tclaude\tClaude\t2.9939.2\t2.16120.0\t",
+            "__PM_ITEM__\tslack\tSlack\t4.51\t4.52\t",
+        ].iter().map(|s| s.to_string()).collect();
+        let ignore = |available: &str| vec![IgnoredItem {
+            section: "brew_casks".into(), id: "claude".into(), name: "Claude".into(),
+            available: available.into(), since: 0,
+        }];
+        // Ignored at this version: not counted.
+        assert_eq!(count_with("brew_casks", &lines, &ignore("2.16120.0")), 1);
+        // A newer version turned up: it counts again.
+        assert_eq!(count_with("brew_casks", &lines, &ignore("2.15000.0")), 2);
+        // No version recorded: the ignore holds until lifted.
+        assert_eq!(count_with("brew_casks", &lines, &ignore("")), 1);
+        // Another section's ignore is not this section's.
+        let mut other = ignore("2.16120.0"); other[0].section = "app_store".into();
+        assert_eq!(count_with("brew_casks", &lines, &other), 2);
+        let mut items = parse_items("brew_casks", &lines);
+        apply_ignores("brew_casks", &mut items, &ignore("2.16120.0"));
+        assert!(items[0].ignored && !items[1].ignored);
+    }
+
+    #[test]
     fn a_manual_check_leaves_developer_tooling_out() {
         let apps: Vec<_> = sections_for(CheckScope::AppsOnly).collect();
         assert_eq!(apps, ["macos_updates", "app_store", "brew_casks"]);
@@ -623,6 +777,7 @@ pub const DEV_SECTIONS: &[&str] = &[
     "pip_packages",
     "ruby_rvm",
     "ruby_rbenv",
+    "asdf",
 ];
 
 /// Which sections a run covers.
@@ -650,23 +805,46 @@ pub fn sections_for(scope: CheckScope) -> impl Iterator<Item = &'static str> {
 /// an update count anyway.
 pub async fn run_checks(app: &AppHandle, scope: CheckScope) -> ScheduleConfig {
     let now = now_secs();
+    let started = std::time::Instant::now();
+    crate::diag(app, &format!(
+        "check run: {}",
+        if scope == CheckScope::All { "everything (scheduled)" } else { "apps and system updates" },
+    ));
+    // Developer tools hidden in Settings are not worth a scheduled check either:
+    // nothing shows their result, and the formulae check is the slowest of all.
+    let cfg0 = load(app);
+    let show_dev = cfg0.show_dev_tools;
     let (mut counts, mut last) = match scope {
-        CheckScope::All => (BTreeMap::new(), LastCheck::default()),
-        CheckScope::AppsOnly => (load(app).last_counts, load_last_check(app)),
+        CheckScope::All if show_dev => (BTreeMap::new(), LastCheck::default()),
+        _ => (load(app).last_counts, load_last_check(app)),
     };
     last.ts = now;
-    for section in sections_for(scope) {
+    crate::tray_checking(app, true);
+    for section in sections_for(scope).filter(|s| show_dev || !DEV_SECTIONS.contains(s)) {
+        let section_started = std::time::Instant::now();
         let lines = crate::run_check_collect(section).await;
-        counts.insert(section.to_string(), count_for(section, &lines));
+        let n = count_with(section, &lines, &cfg0.ignored);
+        crate::diag(app, &format!(
+            "check {section}: {n} outdated, {} lines, {}s",
+            lines.len(),
+            section_started.elapsed().as_secs(),
+        ));
+        counts.insert(section.to_string(), n);
+        crate::emit_section_result(app, section, &lines);
         last.sections.insert(section.to_string(), lines);
         last.section_ts.insert(section.to_string(), now);
     }
     save_last_check(app, &last);
     let mut cfg = load(app);
+    // Homebrew itself, last: the checks above let it bring itself up to date,
+    // so this records where that left it.
+    cfg.brew_self = crate::check_brew_self(app, &cfg.brew_self).await;
+    crate::tray_checking(app, false);
     cfg.last_run = now;
     cfg.last_total = total_from_counts(&counts);
     cfg.last_counts = counts;
     let _ = save(app, &cfg);
+    crate::diag(app, &format!("check run: {} updates, {}s", cfg.last_total, started.elapsed().as_secs()));
     cfg
 }
 
@@ -674,6 +852,7 @@ pub fn notify_result(app: &AppHandle, cfg: &ScheduleConfig) {
     if !cfg.notify || cfg.last_total == 0 || cfg.snoozed() {
         return;
     }
+    crate::diag(app, &format!("notification: {} updates", cfg.last_total));
     let n = cfg.last_total;
     // macOS notifications carry no buttons here, so the choice of installing or
     // postponing is offered in the app; this just says where to find it.
@@ -848,12 +1027,12 @@ pub async fn run_scheduled(app: &AppHandle) -> ScheduleConfig {
 /// Re-checks a single section after it has been upgraded, so the count reflects
 /// what is now installed rather than what was outstanding before. Cheaper than a
 /// full run, which is why it can happen after every install.
-pub async fn recount(app: &AppHandle, section: &str) -> ScheduleConfig {
-    if !CHECKED_SECTIONS.contains(&section) {
-        return load(app);
-    }
-    let lines = crate::run_check_collect(section).await;
-    record_section(app, section, lines)
+/// Re-reads Homebrew's own version, after Update Homebrew has run.
+pub async fn refresh_brew_self(app: &AppHandle) -> ScheduleConfig {
+    let mut cfg = load(app);
+    cfg.brew_self = crate::check_brew_self(app, &cfg.brew_self).await;
+    let _ = save(app, &cfg);
+    cfg
 }
 
 /// Records what one section's check found: its count, the total, and the output
@@ -865,7 +1044,7 @@ pub fn record_section(app: &AppHandle, section: &str, lines: Vec<String>) -> Sch
         return cfg;
     }
     cfg.last_counts
-        .insert(section.to_string(), count_for(section, &lines));
+        .insert(section.to_string(), count_with(section, &lines, &cfg.ignored));
     cfg.last_total = total_from_counts(&cfg.last_counts);
     let _ = save(app, &cfg);
 
@@ -879,6 +1058,18 @@ pub fn record_section(app: &AppHandle, section: &str, lines: Vec<String>) -> Sch
     last.sections.insert(section.to_string(), lines);
     save_last_check(app, &last);
 
+    cfg
+}
+
+/// Re-derives one section's count from the output the last check stored, for
+/// when what counts has changed (an ignore) but nothing has been re-checked.
+pub fn recount_stored(app: &AppHandle, section: &str) -> ScheduleConfig {
+    let mut cfg = load(app);
+    if let Some(lines) = load_last_check(app).sections.get(section) {
+        cfg.last_counts.insert(section.to_string(), count_with(section, lines, &cfg.ignored));
+        cfg.last_total = total_from_counts(&cfg.last_counts);
+        let _ = save(app, &cfg);
+    }
     cfg
 }
 

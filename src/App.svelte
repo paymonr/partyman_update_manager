@@ -4,8 +4,8 @@
   import { getVersion } from "@tauri-apps/api/app";
   import { check as checkUpdate } from "@tauri-apps/plugin-updater";
   import { relaunch } from "@tauri-apps/plugin-process";
-  import { THEMES, applyTheme, loadTheme, saveTheme, watchSystemTheme, type ThemeId } from "./themes/theme";
   import { enable as enableAutostart, disable as disableAutostart, isEnabled as isAutostartEnabled } from "@tauri-apps/plugin-autostart";
+  import { THEMES, applyTheme, loadTheme, saveTheme, type ThemeId } from "./themes/theme";
   import { onMount, afterUpdate } from "svelte";
   import iconUrl from "./assets/icon.png";
 
@@ -18,12 +18,35 @@
     upgradeCmd?: string;
     platform: "all" | "mac" | "linux" | "windows";
     dev?: boolean;
+    /** The tool this source needs. Apps sources show "Set up" without it; developer
+     *  tools are simply not listed. */
+    tool?: "brew" | "mas" | "npm" | "pip" | "rbenv" | "rvm" | "asdf";
   }
 
   interface CheckItem {
     id: string;
     name: string;
     appDir?: string;
+    installed?: string;
+    available?: string;
+    /** "restart" when installing it restarts the Mac. */
+    note?: string;
+    /** The app bundle on disk, when the check found it. */
+    appPath?: string;
+    /** Set aside by the user until a newer version is available. */
+    ignored?: boolean;
+  }
+
+  // Homebrew appends a build number after a comma; the version is enough here.
+  function shortVersion(v?: string): string {
+    return (v ?? "").split(",")[0];
+  }
+
+  function versionLabel(item: CheckItem): string {
+    const to = shortVersion(item.available);
+    if (!to) return "";
+    const from = shortVersion(item.installed);
+    return from ? `${from} → ${to}` : to;
   }
 
   interface CaskCandidate {
@@ -45,56 +68,83 @@
     items: string[];
     item_names: string[];
     lines: string[];
+    run_id: string;
+    kind: "update" | "adopt" | string;
+    outcome: "ok" | "partial" | "failed" | string;
+    duration_secs: number;
+    exit_code: number | null;
+    versions: { item: string; from: string; to: string }[];
+  }
+
+  // One run of the app — a batch of casks, an adoption, a section upgrade —
+  // as the history shows it: its entries, and the tally across them.
+  interface HistoryRun {
+    id: string;
+    ts: number;
+    section: string;
+    kind: string;
+    entries: HistoryEntry[];
+    ok: number;
+    failed: number;
+    /** Password prompt dismissed: the user stopped it, nothing went wrong. */
+    cancelled: number;
+    duration: number;
   }
 
   const sections: Section[] = [
     {
       id: "macos_updates",
-      label: "OS System Updates",
-      description: "Checks for OS-level updates via softwareupdate",
+      label: "macOS updates",
+      description: "System updates from Apple",
       upgradeCmd: "sudo softwareupdate -ia",
       platform: "mac",
     },
     {
       id: "app_store",
       label: "App Store",
-      description: "Apps installed via the Mac App Store",
+      description: "Apps installed from the Mac App Store",
       upgradeCmd: "mas upgrade",
       platform: "mac",
+      tool: "mas",
     },
     {
       id: "brew_casks",
-      label: "Homebrew Apps",
-      description: "GUI apps managed by Homebrew",
+      label: "Homebrew apps",
+      description: "Apps installed with Homebrew",
       upgradeCmd: "brew upgrade --cask --greedy",
       platform: "mac",
+      tool: "brew",
     },
     {
       id: "untracked_apps",
-      label: "Apps Without Auto-Updates",
-      description: "Apps on your Mac that aren't connected to an update manager yet. Enable auto-updates to keep them current.",
+      label: "Apps without auto-updates",
+      description: "Apps that nothing keeps up to date",
       platform: "mac",
+      tool: "brew",
     },
     {
       id: "brew_formulae",
-      label: "brew",
-      description: "Command-line tools installed via Homebrew",
+      label: "Homebrew formulae",
+      description: "Command-line tools installed with Homebrew",
       upgradeCmd: "brew upgrade",
       platform: "mac",
       dev: true,
+      tool: "brew",
     },
     {
       id: "npm_globals",
       label: "npm",
-      description: "Globally installed Node packages",
+      description: "Global npm packages",
       upgradeCmd: "npm update -g",
       platform: "all",
       dev: true,
+      tool: "npm",
     },
     {
       id: "pip_packages",
       label: "pip",
-      description: "Outdated Python packages",
+      description: "Python packages",
+      tool: "pip",
       upgradeCmd: "pip3 install --upgrade $(pip3 list --outdated --format=freeze | cut -d= -f1 | tr '\\n' ' ')",
       platform: "all",
       dev: true,
@@ -105,6 +155,7 @@
       description: "Ruby versions and gems managed by rbenv",
       platform: "all",
       dev: true,
+      tool: "rbenv",
     },
     {
       id: "ruby_rvm",
@@ -112,6 +163,16 @@
       description: "Ruby versions and gems managed by rvm",
       platform: "all",
       dev: true,
+      tool: "rvm",
+    },
+    {
+      id: "asdf",
+      label: "asdf",
+      description: "Runtimes managed by asdf — Node, Ruby, Python and the like",
+      upgradeCmd: "asdf install <plugin> latest",
+      platform: "all",
+      dev: true,
+      tool: "asdf",
     },
   ];
 
@@ -120,6 +181,8 @@
 
   let statuses: Record<string, Status> = {};
   let upgradeStatuses: Record<string, Status> = {};
+  // Stop was pressed and the run has not ended yet.
+  let stopping: Record<string, boolean> = {};
   let outputs: Record<string, string[]> = {};
   let upgradeLogs: Record<string, string[]> = {};
   let lastChecked: Record<string, Date | null> = {};
@@ -129,12 +192,80 @@
   let currentPlatform = "mac";
   let runningAll = false;
   let activeTab = "";
-  let activeDevTab = "";
   let appVersion = "";
-  let showHistory = false;
   let historyEntries: HistoryEntry[] = [];
   let historySearch = "";
-  let expandedHistoryEntry: number | null = null;
+  let historyFailedOnly = false;
+  let expandedRun: string | null = null;
+  let expandedEntry: string | null = null;
+  // Entries whose full, uncleaned output is showing.
+  let rawFor: Record<string, boolean> = {};
+
+  function groupRuns(entries: HistoryEntry[]): HistoryRun[] {
+    const runs: HistoryRun[] = [];
+    for (const e of entries) {
+      const last = runs[runs.length - 1];
+      if (last && last.id === e.run_id) {
+        // The list is newest first, so a run's entries arrive last-to-first;
+        // within the run, keep the order the apps were done in.
+        last.entries.unshift(e);
+      } else {
+        runs.push({ id: e.run_id, ts: e.ts, section: e.section, kind: e.kind, entries: [e], ok: 0, failed: 0, cancelled: 0, duration: 0 });
+      }
+      const run = runs[runs.length - 1];
+      if (e.outcome === "ok") run.ok += 1;
+      else if (e.outcome === "cancelled") run.cancelled += 1;
+      else run.failed += 1;
+      run.duration = Math.max(run.duration, e.duration_secs);
+    }
+    return runs;
+  }
+
+  function runSummary(run: HistoryRun): string {
+    // A section-wide upgrade is one entry with no items; count it as "everything".
+    const things = run.entries.reduce((n, e) => n + Math.max(1, e.items.length), 0);
+    const noun = run.kind === "adopt"
+      ? (things === 1 ? "app handed to Homebrew" : "apps handed to Homebrew")
+      : run.entries.length === 1 && run.entries[0].items.length === 0
+        ? "everything"
+        : (things === 1 ? "update" : "updates");
+    const count = noun === "everything" ? "everything" : `${things} ${noun}`;
+    const tally = run.failed === 0 && run.cancelled === 0
+      ? "done"
+      : run.ok === 0 && run.failed === 0 ? "cancelled"
+      : run.ok === 0 && run.cancelled === 0 ? "failed"
+      : [run.ok && `${run.ok} done`, run.failed && `${run.failed} failed`, run.cancelled && `${run.cancelled} cancelled`]
+          .filter(Boolean).join(", ");
+    return `${count} · ${tally}${run.duration ? ` · ${fmtDuration(run.duration)}` : ""}`;
+  }
+
+  function fmtDuration(secs: number): string {
+    if (secs < 60) return `${secs}s`;
+    const m = Math.floor(secs / 60), s = secs % 60;
+    return s ? `${m}m ${s}s` : `${m}m`;
+  }
+
+  function outcomeMark(outcome: string): string {
+    return outcome === "ok" ? "✓" : outcome === "partial" ? "◐" : outcome === "cancelled" ? "↩" : "✖";
+  }
+
+  function entryNames(e: HistoryEntry): string {
+    return e.item_names.length ? e.item_names.join(", ") : "Everything";
+  }
+
+  // Homebrew appends a build number after a comma; the version is enough here.
+  function versionText(e: HistoryEntry): string {
+    return e.versions.map((v) => `${v.from.split(",")[0]} → ${v.to.split(",")[0]}`).join(", ");
+  }
+
+  function toggleRun(id: string) {
+    expandedRun = expandedRun === id ? null : id;
+    expandedEntry = null;
+  }
+
+  function toggleEntry(key: string) {
+    expandedEntry = expandedEntry === key ? null : key;
+  }
   let caskSearch: Record<string, CaskSearchState> = {};
 
   const HIDDEN_APPS_KEY = "hiddenUntrackedApps";
@@ -159,14 +290,234 @@
   }
 
 
-  let showMenu = false;
-  let showSettings = false;
-  let showAbout = false;
-  let showSchedule = false;
-  let showWhatsNew = false;
+  // Whether macOS lets PartyMAN replace apps in /Applications (App Management).
+  // Probed on launch, at most once a day while blocked, so the system's own
+  // "was prevented from modifying apps" alert is not raised at every start.
+  type AppMgmt = "unknown" | "allowed" | "blocked" | "checking";
+  const APP_MGMT_KEY = "appManagement";
+  let appMgmt: AppMgmt = "unknown";
+  let appMgmtDismissed = false;
+
+  async function probeAppManagement(force = false) {
+    try {
+      const saved = JSON.parse(localStorage.getItem(APP_MGMT_KEY) ?? "null") as { status: AppMgmt; at: number } | null;
+      const dayAgo = Date.now() - 24 * 60 * 60 * 1000;
+      if (!force && saved?.status === "blocked" && saved.at > dayAgo) {
+        appMgmt = "blocked";
+        return;
+      }
+      appMgmt = "checking";
+      const status = await invoke<AppMgmt>("app_management_status");
+      appMgmt = status;
+      localStorage.setItem(APP_MGMT_KEY, JSON.stringify({ status, at: Date.now() }));
+    } catch (e) {
+      console.error("Failed to check App Management:", e);
+      appMgmt = "unknown";
+    }
+  }
+
+  function openAppManagement() {
+    invoke("open_app_management_settings");
+  }
+
+  // Which tools are present. Homebrew is the one that matters; jq and mas are
+  // the helpers. null until the first look.
+  type Tooling = {
+    brew: boolean; jq: boolean; mas: boolean;
+    npm: boolean; pip: boolean; rbenv: boolean; rvm: boolean; asdf: boolean;
+    /** Whether this account can install Homebrew (its installer needs an administrator). */
+    admin: boolean;
+  };
+  let tooling: Tooling | null = null;
+  let setupRunning = false;
+  let setupDismissed = false;
+  // What the setup page is showing: Homebrew's installer, or Homebrew updating itself.
+  let setupKind: "install" | "update" = "install";
+  let brewUpdateDismissed = false;
+
+  async function loadTooling() {
+    try {
+      tooling = await invoke<Tooling>("tooling_status");
+    } catch (e) {
+      console.error("Failed to look for Homebrew:", e);
+    }
+  }
+
+  // Takes the tooling as an argument so a template that calls it re-renders
+  // when the result arrives; a reference inside the function would not count.
+  function toolReady(s: Section, t: Tooling | null): boolean {
+    if (!s.tool || !t) return true;
+    return t[s.tool];
+  }
+
+  // Homebrew's own installer, then the helpers; output streams into the setup
+  // view. Afterwards everything that was waiting on Homebrew is checked.
+  async function runSetup() {
+    if (setupRunning) return;
+    setupRunning = true;
+    setupKind = "install";
+    outputs["setup"] = [];
+    outputs = outputs;
+    view = "setup";
+    try {
+      await invoke("setup_homebrew");
+    } catch (e) {
+      outputs["setup"] = [...(outputs["setup"] ?? []), `Error: ${e}`];
+      outputs = outputs;
+    } finally {
+      setupRunning = false;
+    }
+    await loadTooling();
+    if (tooling?.brew) runAll();
+  }
+
+  // Homebrew updating itself (`brew update`), from the banner or Settings.
+  // The backend re-reads the version afterwards and the banner follows.
+  async function updateHomebrew() {
+    if (setupRunning) return;
+    setupRunning = true;
+    setupKind = "update";
+    outputs["setup"] = [];
+    outputs = outputs;
+    view = "setup";
+    try {
+      await invoke("update_homebrew");
+    } catch (e) {
+      outputs["setup"] = [...(outputs["setup"] ?? []), `Error: ${e}`];
+      outputs = outputs;
+    } finally {
+      setupRunning = false;
+    }
+  }
+
+  // A filter box for long lists and long output. Cleared when the source changes.
+  let filter = "";
+  let filterEl: HTMLInputElement | null = null;
+  $: { activeTab; filter = ""; }
+  $: filterShown = view === "updates" && activeStatus === "done" && (activeParsedItems.length > 12 || activeLines.length > 30);
+  function matchesFilter(text: string): boolean {
+    const q = filter.trim().toLowerCase();
+    return !q || text.toLowerCase().includes(q);
+  }
+
+  // Keyboard shortcuts: ⌘R checks everything, ⌘, opens Settings, ⌘F goes to the
+  // filter, unless the user has chosen others in Settings → Keyboard. Kept per
+  // Mac in localStorage. A shortcut must include ⌘ or ⌃, so typing in the
+  // Filter box can never trigger one.
+  type ShortcutAction = "checkAll" | "settings" | "filter";
+  type Shortcut = { key: string; meta: boolean; ctrl: boolean; alt: boolean; shift: boolean };
+  const SHORTCUT_ACTIONS: { id: ShortcutAction; label: string; desc: string }[] = [
+    { id: "checkAll", label: "Check all", desc: "Check every source for updates" },
+    { id: "settings", label: "Settings", desc: "Open this page" },
+    { id: "filter", label: "Filter", desc: "Jump to the Filter box on a long list" },
+  ];
+  const DEFAULT_SHORTCUTS: Record<ShortcutAction, Shortcut> = {
+    checkAll: { key: "r", meta: true, ctrl: false, alt: false, shift: false },
+    settings: { key: ",", meta: true, ctrl: false, alt: false, shift: false },
+    filter: { key: "f", meta: true, ctrl: false, alt: false, shift: false },
+  };
+  let shortcuts: Record<ShortcutAction, Shortcut> = loadShortcuts();
+  // The shortcut being re-recorded: its button says "Press keys…" until a key comes.
+  let recording: ShortcutAction | null = null;
+  let shortcutError = "";
+
+  function loadShortcuts(): Record<ShortcutAction, Shortcut> {
+    try {
+      const raw = localStorage.getItem("shortcuts");
+      if (raw) return { ...DEFAULT_SHORTCUTS, ...(JSON.parse(raw) as Partial<Record<ShortcutAction, Shortcut>>) };
+    } catch {}
+    return { ...DEFAULT_SHORTCUTS };
+  }
+
+  function saveShortcuts() {
+    try { localStorage.setItem("shortcuts", JSON.stringify(shortcuts)); } catch {}
+  }
+
+  // A modifier on its own is not a shortcut yet.
+  function shortcutFromEvent(e: KeyboardEvent): Shortcut | null {
+    if (["Meta", "Control", "Alt", "Shift", "CapsLock", "Fn"].includes(e.key)) return null;
+    return { key: e.key.length === 1 ? e.key.toLowerCase() : e.key, meta: e.metaKey, ctrl: e.ctrlKey, alt: e.altKey, shift: e.shiftKey };
+  }
+
+  function sameShortcut(a: Shortcut, b: Shortcut): boolean {
+    return a.key === b.key && a.meta === b.meta && a.ctrl === b.ctrl && a.alt === b.alt && a.shift === b.shift;
+  }
+
+  const KEY_NAMES: Record<string, string> = {
+    " ": "Space", ArrowUp: "↑", ArrowDown: "↓", ArrowLeft: "←", ArrowRight: "→",
+    Enter: "↩", Escape: "⎋", Backspace: "⌫", Delete: "⌦", Tab: "⇥",
+  };
+
+  function shortcutLabel(s: Shortcut): string {
+    const key = KEY_NAMES[s.key] ?? (s.key.length === 1 ? s.key.toUpperCase() : s.key);
+    return `${s.ctrl ? "⌃" : ""}${s.alt ? "⌥" : ""}${s.shift ? "⇧" : ""}${s.meta ? "⌘" : ""}${key}`;
+  }
+
+  // Takes the table as an argument so the template re-renders when it changes.
+  function isDefaultShortcut(id: ShortcutAction, table: Record<ShortcutAction, Shortcut>): boolean {
+    return sameShortcut(table[id], DEFAULT_SHORTCUTS[id]);
+  }
+
+  function resetShortcut(id: ShortcutAction) {
+    shortcuts[id] = { ...DEFAULT_SHORTCUTS[id] };
+    shortcuts = shortcuts;
+    saveShortcuts();
+    recording = null;
+    shortcutError = "";
+  }
+
+  function onKey(e: KeyboardEvent) {
+    if (recording) {
+      e.preventDefault();
+      if (e.key === "Escape") { recording = null; shortcutError = ""; return; }
+      const s = shortcutFromEvent(e);
+      if (!s) return;
+      if (!s.meta && !s.ctrl) { shortcutError = "Use ⌘ or ⌃ together with a key."; return; }
+      const clash = (Object.keys(shortcuts) as ShortcutAction[]).find((id) => id !== recording && sameShortcut(shortcuts[id], s));
+      if (clash) {
+        shortcutError = `${shortcutLabel(s)} already means ${SHORTCUT_ACTIONS.find((a) => a.id === clash)?.label}.`;
+        return;
+      }
+      shortcuts[recording] = s;
+      shortcuts = shortcuts;
+      saveShortcuts();
+      recording = null;
+      shortcutError = "";
+      return;
+    }
+    const pressed = shortcutFromEvent(e);
+    if (!pressed || (!pressed.meta && !pressed.ctrl)) return;
+    if (sameShortcut(pressed, shortcuts.checkAll)) { e.preventDefault(); if (!runningAll) runAll(); }
+    else if (sameShortcut(pressed, shortcuts.settings)) { e.preventDefault(); go("settings"); }
+    else if (sameShortcut(pressed, shortcuts.filter) && filterShown && filterEl) { e.preventDefault(); filterEl.focus(); filterEl.select(); }
+  }
+
+  type View = "updates" | "history" | "settings" | "whatsnew" | "setup";
+  let view: View = "updates";
+  let snoozeOpen = false;
+
+  function pick(id: string) {
+    activeTab = id;
+    view = "updates";
+    snoozeOpen = false;
+  }
+
+  function go(next: View) {
+    view = next;
+    snoozeOpen = false;
+    if (next === "history") loadHistory();
+    if (next === "settings") loadSchedule();
+  }
+
   let whatsNewVersion = "";
   let whatsNewNotes = "";
+
   let theme: ThemeId = loadTheme();
+
+  function changeTheme() {
+    saveTheme(theme);
+    applyTheme(theme);
+  }
 
   const SEEN_VERSION_KEY = "lastSeenVersion";
   const PENDING_NOTES_KEY = "pendingUpdateNotes";
@@ -204,11 +555,7 @@
   function openWhatsNew(version: string, notes: string) {
     whatsNewVersion = version;
     whatsNewNotes = notes;
-    showWhatsNew = true;
-    showSettings = false;
-    showHistory = false;
-    showAbout = false;
-    showSchedule = false;
+    view = "whatsnew";
   }
 
   // Shown once, the first time a version runs. A fresh install has nothing to
@@ -239,11 +586,6 @@
     if (notes.trim()) openWhatsNew(appVersion, notes);
   }
 
-  function changeTheme() {
-    saveTheme(theme);
-    applyTheme(theme);
-  }
-
   type ScheduleConfig = {
     enabled: boolean;
     frequency: "hourly" | "daily" | "weekly";
@@ -256,12 +598,15 @@
     lastCounts: Record<string, number>;
     snoozedUntil: number;
     checkOnLaunch: boolean;
+    showDevTools: boolean;
+    ignored: { section: string; id: string; name: string; available: string; since: number }[];
+    brewSelf?: { installed: string; latest: string; checked: number; outdated: boolean };
   };
 
   let schedule: ScheduleConfig = {
     enabled: false, frequency: "daily", minute: 0, hour: 10, weekday: 1, notify: true,
     lastRun: 0, lastTotal: 0, lastCounts: {}, snoozedUntil: 0,
-    checkOnLaunch: false,
+    checkOnLaunch: false, showDevTools: false, ignored: [],
   };
   let scheduleSaving = false;
   let scheduleRunning = false;
@@ -314,6 +659,7 @@
   }
 
   function sectionLabel(id: string): string {
+    if (id === "setup") return "Setup";
     return sections.find((s) => s.id === id)?.label ?? id;
   }
 
@@ -324,6 +670,13 @@
     } catch (e) {
       console.error("Failed to read schedule:", e);
     }
+  }
+
+  async function toggleDevTools() {
+    if (!schedule.showDevTools && sections.find((s) => s.id === activeTab)?.dev) {
+      activeTab = appSections[0]?.id ?? "";
+    }
+    await saveSchedule();
   }
 
   async function saveSchedule() {
@@ -362,6 +715,7 @@
         ts: number;
         sections: Record<string, string[]>;
         sectionTs?: Record<string, number>;
+        items?: Record<string, CheckItem[]>;
       }>("get_last_check");
       if (!last?.ts) return;
       for (const [id, lines] of Object.entries(last.sections ?? {})) {
@@ -370,8 +724,10 @@
         // A manual run skips developer tooling, so those sections keep their own,
         // older time rather than the time of the run.
         const when = new Date((last.sectionTs?.[id] ?? last.ts) * 1000);
-        outputs[id] = lines;
-        parsedItems[id] = parseItems(id, lines);
+        outputs[id] = lines.filter((l) => !l.startsWith("__PM_"));
+        parsedItems[id] = last.items?.[id] ?? [];
+        selectedItems[id] = parsedItems[id].filter((i) => !i.ignored).map((i) => i.id);
+        viewMode[id] = parsedItems[id].length > 0 ? "select" : "readonly";
         statuses[id] = "done";
         if (!lastChecked[id] || lastChecked[id]!.getTime() < when.getTime()) {
           lastChecked[id] = when;
@@ -379,6 +735,8 @@
       }
       outputs = outputs;
       parsedItems = parsedItems;
+      selectedItems = selectedItems;
+      viewMode = viewMode;
       statuses = statuses;
       lastChecked = lastChecked;
     } catch (e) {
@@ -402,19 +760,21 @@
   // administrator password, so they have to be at the machine to answer it.
   // Sections run one after another so the prompts cannot overlap.
   async function installOutstanding() {
-    showSchedule = false;
-    showSettings = false;
-    showHistory = false;
-    showAbout = false;
+    view = "updates";
+    snoozeOpen = false;
     // Only what the count reports. Developer tooling is never installed from
-    // here: it is not part of the count, and "Install Now" must not run
+    // here: it is not part of the count, and "Install all" must not run
     // `brew upgrade`, `npm update -g` or pip across hundreds of packages.
     const pending = countedEntries(schedule.lastCounts)
       .map(([id]) => id)
       .filter((id) => sections.some((sec) => sec.id === id && platformVisible(sec)));
     for (const id of pending) {
       activeTab = id;
-      await runUpgrade(id);
+      // The parsed list already leaves out what cannot be updated (casks
+      // Homebrew has disabled), so prefer it to a blanket section upgrade.
+      const items = (parsedItems[id] ?? []).filter((i) => !i.ignored).map((i) => i.id);
+      if (items.length > 0) await runUpgradeItems(id, items);
+      else await runUpgrade(id);
     }
   }
 
@@ -484,61 +844,6 @@
     } catch {}
   }
 
-  function parseItems(section: string, lines: string[]): CheckItem[] {
-    if (section === "brew_casks") {
-      const items: CheckItem[] = [];
-      let inBlock = false;
-      for (const line of lines) {
-        if (line.includes("Outdated apps:")) { inBlock = true; continue; }
-        if (inBlock && line.trim().startsWith("→")) break;
-        if (inBlock && line.trim()) {
-          const name = line.trim().split(/\s+/)[0];
-          if (name) items.push({ id: name, name });
-        }
-      }
-      return items;
-    }
-    if (section === "app_store") {
-      const items: CheckItem[] = [];
-      let inBlock = false;
-      for (const line of lines) {
-        if (line.includes("Outdated App Store apps:")) { inBlock = true; continue; }
-        if (inBlock && line.trim().startsWith("→")) break;
-        if (inBlock && line.trim()) {
-          const parts = line.trim().split(/\s+/);
-          const id = parts[0];
-          const name = parts.slice(1).join(" ").replace(/\s*\([^)]+\)\s*$/, "").trim();
-          if (id && /^\d+$/.test(id)) items.push({ id, name: name || id });
-        }
-      }
-      return items;
-    }
-    if (section === "macos_updates") {
-      const items: CheckItem[] = [];
-      for (const line of lines) {
-        const m = line.match(/\*\s*Label:\s*(.+)/);
-        if (m) {
-          const label = m[1].trim();
-          items.push({ id: label, name: label });
-        }
-      }
-      return items;
-    }
-    if (section === "untracked_apps") {
-      const items: CheckItem[] = [];
-      for (const line of lines) {
-        const m = line.match(/⚠\s+(.+?)(\s+\[~\/Applications\])?$/);
-        if (m) {
-          const name = m[1].trim();
-          const appDir = m[2] ? "~/Applications" : undefined;
-          items.push({ id: name, name, appDir });
-        }
-      }
-      return items;
-    }
-    return [];
-  }
-
   onMount(async () => {
     currentPlatform = await invoke<string>("get_platform");
     appVersion = await getVersion();
@@ -548,14 +853,14 @@
 
     try { startOnLogin = await isAutostartEnabled(); } catch (e) { console.error("Failed to read start-on-login state:", e); }
 
-    watchSystemTheme(() => theme);
-
     await checkWhatsNew();
 
     loadHiddenApps();
     loadLastChecked();
     await loadSchedule();
     await hydrateLastCheck();
+    probeAppManagement();
+    loadTooling();
 
     if (autoCheckUpdates) {
       const lastCheck = parseInt(localStorage.getItem("lastUpdateCheck") ?? "0", 10);
@@ -567,11 +872,15 @@
     const visible = sections.filter(platformVisible);
     if (visible.length > 0) activeTab = visible[0].id;
 
-    const firstDev = sections.find(s => platformVisible(s) && !!s.dev);
-    if (firstDev) activeDevTab = firstDev.id;
-
     await listen<ScheduleConfig>("schedule-updated", ({ payload }) => {
       schedule = payload;
+    });
+
+    // A name or source picked in the menu-bar dropdown.
+    await listen<string>("open-section", ({ payload }) => {
+      if (!sections.some((s) => s.id === payload)) return;
+      view = "updates";
+      activeTab = payload;
     });
 
     await listen<{ section: string; line: string }>("check-output", ({ payload }) => {
@@ -579,7 +888,7 @@
       outputs = outputs;
     });
 
-    await listen<{ section: string; status: string }>("check-status", ({ payload }) => {
+    await listen<{ section: string; status: string; items?: CheckItem[] }>("check-status", ({ payload }) => {
       statuses[payload.section] = payload.status as Status;
       statuses = statuses;
       if (payload.status === "done" || payload.status === "error") {
@@ -587,12 +896,14 @@
         lastChecked = lastChecked;
         saveLastChecked();
         if (itemSections.has(payload.section)) {
-          const items = parseItems(payload.section, outputs[payload.section]);
+          const items = payload.items ?? [];
           parsedItems[payload.section] = items;
           parsedItems = parsedItems;
-          selectedItems[payload.section] = [];
+          // Everything starts selected: updating what is outdated is the
+          // common case, and unticking one is easier than ticking sixteen.
+          selectedItems[payload.section] = items.filter((i) => !i.ignored).map((i) => i.id);
           selectedItems = selectedItems;
-          viewMode[payload.section] = "readonly";
+          viewMode[payload.section] = items.length > 0 ? "select" : "readonly";
           viewMode = viewMode;
         }
       }
@@ -600,26 +911,56 @@
 
     await listen<{ section: string; line: string }>("upgrade-output", ({ payload }) => {
       if (itemSections.has(payload.section)) {
-        upgradeLogs[payload.section] = appendLine(upgradeLogs[payload.section], payload.line);
+        upgradeLogs[payload.section] = appendLine(upgradeLogs[payload.section] ?? [], payload.line);
         upgradeLogs = upgradeLogs;
       } else {
-        outputs[payload.section] = [...outputs[payload.section], payload.line];
+        outputs[payload.section] = appendLine(outputs[payload.section] ?? [], payload.line);
         outputs = outputs;
       }
+    });
+
+    // After an upgrade the backend re-checks the section; this is what it found.
+    // The list and the sidebar follow at once. The upgrade log stays on screen:
+    // it is what the user is reading, and the List tab is a click away.
+    await listen<{ section: string; items: CheckItem[]; lines: string[] }>("section-recounted", ({ payload }) => {
+      const id = payload.section;
+      if (!(id in statuses)) return;
+      if (itemSections.has(id)) {
+        outputs[id] = payload.lines;
+        outputs = outputs;
+        parsedItems[id] = payload.items;
+        parsedItems = parsedItems;
+        selectedItems[id] = payload.items.filter((i) => !i.ignored).map((i) => i.id);
+        selectedItems = selectedItems;
+      }
+      statuses[id] = "done";
+      statuses = statuses;
+      lastChecked[id] = new Date();
+      lastChecked = lastChecked;
+      saveLastChecked();
     });
 
     await listen<{ section: string; status: string }>("upgrade-status", ({ payload }) => {
       upgradeStatuses[payload.section] = payload.status as Status;
       upgradeStatuses = upgradeStatuses;
-      // Re-check what is left so the menu-bar count matches what is now installed
-      // instead of what was outstanding before the upgrade ran. Not for the App
-      // Store: "updating" there only opens the App Store, so a recount now would
-      // record the updates as still outstanding before the user has installed
-      // anything. Its count moves on its next check.
-      if (payload.status === "done" && payload.section !== "app_store") {
-        invoke("recount_section", { section: payload.section }).catch((e) =>
-          console.error("Failed to recount after upgrade:", e),
-        );
+      if (payload.status !== "running") {
+        stopping[payload.section] = false;
+        stopping = stopping;
+      }
+      // "running" arrives for every upgrade, including one started from the
+      // menu bar while this window was hidden: show its log as it comes in.
+      // (After an upgrade the backend re-checks the section itself, so the
+      // count follows without any help from here.)
+      if (payload.status === "running") {
+        if (itemSections.has(payload.section)) {
+          upgradeLogs[payload.section] = [];
+          upgradeLogs = upgradeLogs;
+          viewMode[payload.section] = "upgrade";
+          viewMode = viewMode;
+        } else {
+          outputs[payload.section] = [];
+          outputs = outputs;
+        }
       }
     });
   });
@@ -725,9 +1066,8 @@
   // check and run to hundreds of packages, so they are checked from their own tab.
   async function runAll() {
     runningAll = true;
-    const visible = sections.filter(s => platformVisible(s) && !s.dev);
+    const visible = sections.filter(s => platformVisible(s) && !s.dev && toolReady(s, tooling));
     for (const s of visible) {
-      activeTab = s.id;
       await runSection(s.id);
     }
     runningAll = false;
@@ -760,11 +1100,64 @@
     }
   }
 
+  // macOS installs run as root under the system's own authorization and are
+  // not ours to stop; the App Store one is over before it could be.
+  function stoppable(id: string): boolean {
+    return id !== "macos_updates" && id !== "app_store";
+  }
+
+  async function stopUpgrade(id: string) {
+    stopping[id] = true;
+    stopping = stopping;
+    try {
+      await invoke("cancel_upgrade", { section: id });
+    } catch (e) {
+      stopping[id] = false;
+      stopping = stopping;
+      const line = `✖  Could not stop: ${e}`;
+      if (itemSections.has(id)) upgradeLogs[id] = [...(upgradeLogs[id] ?? []), line];
+      else outputs[id] = [...(outputs[id] ?? []), line];
+      upgradeLogs = upgradeLogs;
+      outputs = outputs;
+    }
+  }
+
   async function loadHistory() {
     historyEntries = await invoke<HistoryEntry[]>("get_upgrade_history");
   }
 
+  // Apps among the selection that are open right now. Homebrew swaps the bundle
+  // under them, and Chromium/Electron apps then crash until relaunched, so the
+  // footer asks first: quit them (and reopen them afterwards), carry on, or stop.
+  type RunningApp = { id: string; name: string; path: string };
+  let quitPrompt: { section: string; running: RunningApp[]; resolve: (quit: boolean | null) => void } | null = null;
+
+  function openAppsText(running: RunningApp[]): string {
+    const names = running.map((r) => r.name);
+    const list = names.length <= 3
+      ? names.join(names.length === 2 ? " and " : ", ").replace(/, ([^,]*)$/, " and $1")
+      : `${names.length} apps`;
+    return `${list} ${names.length === 1 ? "is" : "are"} open.`;
+  }
+
   async function runUpgradeItems(id: string, items: string[]) {
+    let quitFirst: string[] = [];
+    if (id === "brew_casks") {
+      let running: RunningApp[] = [];
+      try {
+        running = await invoke<RunningApp[]>("running_apps", { section: id, items });
+      } catch (e) {
+        console.error("Could not tell which apps are open:", e);
+      }
+      if (running.length > 0) {
+        const decision = await new Promise<boolean | null>((resolve) => {
+          quitPrompt = { section: id, running, resolve };
+        });
+        quitPrompt = null;
+        if (decision === null) return;
+        if (decision) quitFirst = running.map((r) => r.path);
+      }
+    }
     const itemNames = (parsedItems[id] ?? [])
       .filter(i => items.includes(i.id))
       .map(i => i.name);
@@ -775,7 +1168,7 @@
     upgradeStatuses[id] = "running";
     upgradeStatuses = upgradeStatuses;
     try {
-      await invoke("run_upgrade_items", { section: id, items, itemNames });
+      await invoke("run_upgrade_items", { section: id, items, itemNames, quitFirst });
     } catch (e) {
       outputs[id] = [...outputs[id], `Error: ${e}`];
       outputs = outputs;
@@ -794,7 +1187,7 @@
   }
 
   function selectAll(sectionId: string) {
-    selectedItems[sectionId] = parsedItems[sectionId].map(i => i.id);
+    selectedItems[sectionId] = parsedItems[sectionId].filter(i => !i.ignored).map(i => i.id);
     selectedItems = selectedItems;
   }
 
@@ -803,54 +1196,91 @@
     selectedItems = selectedItems;
   }
 
-  function copyCmd(cmd: string) {
-    navigator.clipboard.writeText(cmd);
-  }
-
   function platformVisible(s: Section) {
     return s.platform === "all" || s.platform === currentPlatform;
   }
 
-  const statusColor: Record<Status, string> = {
-    idle: "#3d5166",
-    running: "#00659A",
-    done: "#22c55e",
-    error: "#ef4444",
-  };
+  $: appSections = sections.filter(s => platformVisible(s) && !s.dev);
+  // Developer tools that are not installed are not listed; a selected one that
+  // disappears hands over to the first app source.
+  $: devSections = sections.filter(s => platformVisible(s) && !!s.dev && toolReady(s, tooling));
+  $: if (tooling && activeTab && sections.find((s) => s.id === activeTab)?.dev && !devSections.some((s) => s.id === activeTab)) {
+    activeTab = appSections[0]?.id ?? "";
+  }
 
-  // Build main tab list, collapsing dev sections into a single "Dev" entry
-  $: devSections = sections.filter(s => platformVisible(s) && !!s.dev);
-
-  $: tabItems = (() => {
-    const items: Array<{ id: string; label: string; virtual?: true } | Section> = [];
-    let devInserted = false;
+  // What each sidebar row shows: how many things are outdated there. A checked
+  // list is the freshest source; otherwise the count the last run recorded.
+  // null means never checked.
+  function computeCounts(
+    st: Record<string, Status>,
+    items: Record<string, CheckItem[]>,
+    recorded: Record<string, number>,
+    hidden: string[],
+  ): Record<string, number | null> {
+    const out: Record<string, number | null> = {};
     for (const s of sections) {
-      if (!platformVisible(s)) continue;
-      if (s.dev) {
-        if (!devInserted) { items.push({ id: "dev", label: "Dev", virtual: true }); devInserted = true; }
+      if (s.id === "untracked_apps") {
+        out[s.id] = st[s.id] === "done"
+          ? (items[s.id] ?? []).filter((i) => !hidden.includes(i.name)).length
+          : null;
+      } else if (itemSections.has(s.id) && st[s.id] === "done") {
+        out[s.id] = (items[s.id] ?? []).filter((i) => !i.ignored).length;
+      } else if (s.id in recorded) {
+        out[s.id] = recorded[s.id];
       } else {
-        items.push(s);
+        out[s.id] = null;
       }
     }
-    return items;
-  })();
+    return out;
+  }
+  $: counts = computeCounts(statuses, parsedItems, schedule.lastCounts, hiddenApps);
+  $: newestCheck = newestOf(appSections.map((s) => lastChecked[s.id]), schedule.lastRun);
 
-  // Aggregate status for the Dev tab dot
-  $: devStatus = ((): Status => {
-    const vals = devSections.map(s => statuses[s.id]);
-    if (vals.some(v => v === "error")) return "error";
-    if (vals.some(v => v === "running")) return "running";
-    if (vals.length > 0 && vals.every(v => v === "done")) return "done";
-    return "idle";
-  })();
+  function newestOf(dates: (Date | null | undefined)[], fallbackTs: number): Date | null {
+    let best: Date | null = fallbackTs ? new Date(fallbackTs * 1000) : null;
+    for (const d of dates) {
+      if (d && (!best || d.getTime() > best.getTime())) best = d;
+    }
+    return best;
+  }
 
-  $: activeSectionId = activeTab === "dev" ? activeDevTab : activeTab;
+  function relTime(d: Date | null): string {
+    if (!d) return "";
+    const mins = Math.round((Date.now() - d.getTime()) / 60000);
+    if (mins < 1) return "just now";
+    if (mins < 60) return `${mins} min ago`;
+    const hours = Math.round(mins / 60);
+    if (hours < 24) return `${hours} hour${hours === 1 ? "" : "s"} ago`;
+    const days = Math.round(hours / 24);
+    if (days < 14) return `${days} day${days === 1 ? "" : "s"} ago`;
+    return d.toLocaleDateString([], { month: "short", day: "numeric" });
+  }
+
+  // The one line under a source's name: what state it is in, in plain words.
+  function statusLine(
+    section: Section,
+    status: Status,
+    count: number | null,
+    checked: Date | null,
+  ): string {
+    if (status === "running") return "Checking…";
+    if (status === "error") return "The check failed. See the output below.";
+    if (status !== "done" || count === null) return section.description;
+    const when = checked ? ` · checked ${relTime(checked)}` : "";
+    if (section.id === "untracked_apps") {
+      return count === 0 ? `Everything is managed${when}` : `${count} app${count === 1 ? "" : "s"}${when}`;
+    }
+    return count === 0 ? `Up to date${when}` : `${count} outdated${when}`;
+  }
+
+  $: activeSectionId = activeTab;
   $: activeSection = sections.find(s => s.id === activeSectionId);
   $: activeStatus = (activeSectionId ? statuses[activeSectionId] : "idle") as Status;
   $: activeUpgradeStatus = (activeSectionId ? upgradeStatuses[activeSectionId] : "idle") as Status;
   $: activeLines = activeSectionId ? outputs[activeSectionId] : [] as string[];
   $: activeLastChecked = activeSectionId ? lastChecked[activeSectionId] : null;
   $: activeHasOutdated = activeLines.some((l) => l.includes("⚠"));
+  $: activeCount = activeSectionId ? counts[activeSectionId] ?? null : null;
   $: activeParsedItems = activeSectionId ? (parsedItems[activeSectionId] ?? []) : [];
   $: activeSelectedItems = activeSectionId ? (selectedItems[activeSectionId] ?? []) : [];
   $: activeHasItemSelection = !!activeSectionId && itemSections.has(activeSectionId);
@@ -859,16 +1289,51 @@
   $: activeFoundCount = activeSectionId === "untracked_apps"
     ? activeParsedItems.filter(it => caskSearch[it.id]?.status === "found").length
     : 0;
+  $: activeVisibleItems = activeParsedItems.filter((i) => !i.ignored);
+  $: activeIgnoredItems = activeParsedItems.filter((i) => i.ignored);
+  let showIgnored = false;
+
+  // Ignoring is per version: the item comes back when something newer turns up.
+  async function ignoreItem(item: CheckItem) {
+    const section = activeSectionId;
+    try {
+      schedule = await invoke<ScheduleConfig>("ignore_item", {
+        section, id: item.id, name: item.name, available: item.available ?? null,
+      });
+      parsedItems[section] = (parsedItems[section] ?? []).map((i) => i.id === item.id ? { ...i, ignored: true } : i);
+      parsedItems = parsedItems;
+      selectedItems[section] = (selectedItems[section] ?? []).filter((id) => id !== item.id);
+      selectedItems = selectedItems;
+    } catch (e) {
+      console.error("Failed to ignore:", e);
+    }
+  }
+
+  async function unignoreItem(item: CheckItem) {
+    const section = activeSectionId;
+    try {
+      schedule = await invoke<ScheduleConfig>("unignore_item", { section, id: item.id });
+      parsedItems[section] = (parsedItems[section] ?? []).map((i) => i.id === item.id ? { ...i, ignored: false } : i);
+      parsedItems = parsedItems;
+      selectedItems[section] = [...(selectedItems[section] ?? []), item.id];
+      selectedItems = selectedItems;
+    } catch (e) {
+      console.error("Failed to stop ignoring:", e);
+    }
+  }
+
   $: showSelectView = activeHasItemSelection && activeStatus === "done" && activeParsedItems.length > 0 && activeViewMode === "select";
 
   $: filteredHistory = historySearch.trim()
     ? historyEntries.filter(e => {
         const q = historySearch.toLowerCase();
         return e.label.toLowerCase().includes(q)
+          || sectionLabel(e.section).toLowerCase().includes(q)
           || e.item_names.some(n => n.toLowerCase().includes(q))
           || e.lines.some(l => l.toLowerCase().includes(q));
       })
     : historyEntries;
+  $: historyRuns = groupRuns(filteredHistory).filter((r) => !historyFailedOnly || r.failed > 0);
 
   type AppUpdateStatus = "idle" | "checking" | "up-to-date" | "available" | "error";
   interface AppUpdateInfo { version: string; url: string; notes: string; }
@@ -983,9 +1448,28 @@
     return out;
   }
 
+  // The short version of a recorded run, by one rule for every kind of run:
+  // the app's own status lines, Homebrew's errors and warnings, and version
+  // changes. Nothing else, so two entries read alike. The full text is one
+  // click away. When nothing matches, the first few lines stand in.
+  function cleanLog(lines: string[]): string[] {
+    const out: string[] = [];
+    for (const raw of dropTapTrustBlock(lines)) {
+      const l = raw.trim();
+      if (!l) continue;
+      const keep =
+        /^(→|✔|✖|⚠|🍺)/.test(l)
+        || (/^(Error|Warning):/.test(l) && !/tap|quarantine approval|already downloaded/i.test(l))
+        || /^\S+ \S+ -> \S+$/.test(l) || /^\S+ -> \S+$/.test(l);
+      if (keep && out[out.length - 1] !== l) out.push(l);
+    }
+    return out.length > 0 ? out : lines.slice(0, 6);
+  }
+
   function simplifyUntrackedLog(lines: string[]): string[] {
     return dropTapTrustBlock(lines)
       .filter(l => !skipPatterns.some(p => p.test(l)))
+      .filter((l, i, all) => !/^==> Would install \d+ casks?:/.test(l) && !/^==> Would install \d+ casks?:/.test(all[i - 1] ?? ""))
       .map((l): string | null => {
         if (/^==> Fetching downloads for:/.test(l))
           return `Downloading ${l.replace(/^==> Fetching downloads for:\s*/, "")}…`;
@@ -1005,411 +1489,298 @@
       .filter((l): l is string => l !== null && l.trim() !== "");
   }
 
-  function formatTime(d: Date): string {
+  // For a list of entries: the day and the minute are enough to tell them apart.
+  function formatShort(d: Date): string {
+    const sameYear = d.getFullYear() === new Date().getFullYear();
     return d.toLocaleString([], {
-      year: "numeric", month: "short", day: "numeric",
-      hour: "2-digit", minute: "2-digit", second: "2-digit",
+      month: "short", day: "numeric", ...(sameYear ? {} : { year: "numeric" }),
+      hour: "numeric", minute: "2-digit",
     });
   }
+
 </script>
 
+<svelte:window onkeydown={onKey} />
+
 <main>
-  <header>
-    <div class="title-block">
-      <img src={iconUrl} alt="" class="app-icon" />
-      <h1><span class="brand-bed">PartyMAN</span> Update Manager</h1>
-      {#if appVersion}
-        <span class="version">v{appVersion}</span>
-      {/if}
+  <!-- The toolbar doubles as the title bar: the window has no native one, so it
+       is the drag handle. Buttons inside it still click normally. -->
+  <div class="toolbar" data-tauri-drag-region>
+    <div class="brand" data-tauri-drag-region>
+      <img src={iconUrl} alt="" class="brand-icon" />
+      <span class="brand-name"><span class="brand-accent">PartyMAN</span> Update Manager</span>
+      {#if appVersion}<span class="brand-version" data-tauri-drag-region>v{appVersion}</span>{/if}
     </div>
-    <p class="subtitle">Check for updates and apply them with one click</p>
-    <div class="view-switcher">
-      <button class:active={!showHistory && !showSettings && !showAbout && !showSchedule} onclick={() => { showHistory = false; showSettings = false; showAbout = false; showSchedule = false; }}>Updates</button>
-      <button class:active={showHistory} onclick={() => { showHistory = true; showSettings = false; showAbout = false; showSchedule = false; loadHistory(); }}>History</button>
-    </div>
-    <div class="menu-wrap">
-      <button class="hamburger" onclick={() => { showMenu = !showMenu; }}
-        class:active={showMenu} aria-label="Menu">
-        <svg width="16" height="14" viewBox="0 0 16 14" fill="none" xmlns="http://www.w3.org/2000/svg">
-          <path d="M1 1h14M1 7h14M1 13h14" stroke="currentColor" stroke-width="1.75" stroke-linecap="round"/>
-        </svg>
-      </button>
-      {#if showMenu}
-        <div class="menu-backdrop" onclick={() => { showMenu = false; }} role="presentation"></div>
-        <div class="dropdown">
-
-          <button class="menu-item menu-item-primary" onclick={() => { runAll(); showMenu = false; }} disabled={runningAll}>
-            <span class="menu-item-label">{runningAll ? "Checking…" : "Check All"}</span>
-          </button>
-
-          <div class="menu-sep"></div>
-
-          <button class="menu-item" onclick={() => { showSchedule = true; showSettings = false; showHistory = false; showAbout = false; showMenu = false; loadSchedule(); }}>
-            <span class="menu-item-label">Scheduler</span>
-            {#if schedule.enabled}<span class="menu-item-badge">On</span>{/if}
-          </button>
-
-          <button class="menu-item" onclick={() => { showHistory = true; showSettings = false; showAbout = false; showSchedule = false; showMenu = false; loadHistory(); }}>
-            <span class="menu-item-label">History</span>
-          </button>
-
-          <button class="menu-item" onclick={() => { showSettings = true; showHistory = false; showAbout = false; showSchedule = false; showMenu = false; }}>
-            <span class="menu-item-label">Settings</span>
-          </button>
-
-          <div class="menu-sep"></div>
-
-          <button class="menu-item" onclick={() => { showAbout = true; showHistory = false; showSettings = false; showSchedule = false; showMenu = false; }}>
-            <span class="menu-item-label">About</span>
-          </button>
-
-        </div>
-      {/if}
-    </div>
-  </header>
+  </div>
 
   {#if appUpdateStatus === "available" && appUpdateInfo}
-    <div class="app-update-banner">
-      <svg width="14" height="14" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg" style="flex-shrink:0">
-        <circle cx="8" cy="8" r="6.25" stroke="currentColor" stroke-width="1.5"/>
-        <path d="M8 5v3.5M8 11v.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
-      </svg>
-      <span>PartyMAN v{appUpdateInfo.version} is available</span>
+    <div class="strip strip-ok">
+      <span>PartyMAN {appUpdateInfo.version} is ready to install.</span>
       {#if appUpdateInfo.notes?.trim()}
-        <button class="banner-notes-btn"
-          onclick={() => openWhatsNew(appUpdateInfo!.version, appUpdateInfo!.notes)}>
-          What's new
-        </button>
+        <button class="btn btn-plain" onclick={() => openWhatsNew(appUpdateInfo!.version, appUpdateInfo!.notes)}>What's new</button>
       {/if}
-      <button class="banner-dl-btn" onclick={installAppUpdate}>Install Update</button>
-      <button class="banner-dismiss" onclick={() => { appUpdateStatus = "idle"; appUpdateInfo = null; }}>✕</button>
+      <button class="btn btn-primary" onclick={installAppUpdate}>Install and relaunch</button>
+      <button class="dismiss" aria-label="Dismiss" onclick={() => { appUpdateStatus = "idle"; appUpdateInfo = null; }}>✕</button>
     </div>
   {/if}
 
-  {#if schedule.lastTotal > 0 && !isSnoozed()}
-    <div class="update-prompt">
-      <span class="update-prompt-count">
-        {schedule.lastTotal} update{schedule.lastTotal === 1 ? "" : "s"} available
-      </span>
-      <button class="update-prompt-install" onclick={installOutstanding}>Install Now</button>
-      <span class="update-prompt-later">Remind me in</span>
-      <button class="update-prompt-snooze" onclick={() => snoozeUpdates(1)}>1 hour</button>
-      <button class="update-prompt-snooze" onclick={() => snoozeUpdates(24)}>1 day</button>
-      <button class="update-prompt-snooze" onclick={() => snoozeUpdates(72)}>3 days</button>
+  {#if tooling && !tooling.brew && !setupDismissed && view !== "setup"}
+    <div class="strip strip-warn">
+      {#if tooling.admin}
+        <div>
+          <strong>Homebrew isn't installed.</strong>
+          PartyMAN uses it to update the apps that didn't come from the App Store. Setting it up asks
+          for your administrator password and can take a few minutes.
+        </div>
+        <button class="btn btn-primary" onclick={runSetup} disabled={setupRunning}>Set up Homebrew</button>
+      {:else}
+        <div>
+          <strong>Homebrew isn't installed, and installing it needs an administrator.</strong>
+          PartyMAN uses it to update the apps that didn't come from the App Store. Ask an administrator
+          of this Mac to open PartyMAN and set it up; after that it works from this account too.
+        </div>
+      {/if}
+      <button class="dismiss" aria-label="Dismiss" onclick={() => { setupDismissed = true; }}>✕</button>
+    </div>
+  {:else if tooling && tooling.brew && (!tooling.jq || !tooling.mas) && !setupDismissed && view !== "setup"}
+    <div class="strip">
+      <div>
+        <strong>Finish setting up.</strong>
+        PartyMAN uses two small helpers from Homebrew{!tooling.mas ? ", including the one that checks the App Store" : ""}.
+      </div>
+      <button class="btn btn-primary" onclick={runSetup} disabled={setupRunning}>Install helpers</button>
+      <button class="dismiss" aria-label="Dismiss" onclick={() => { setupDismissed = true; }}>✕</button>
+    </div>
+  {:else if tooling && tooling.brew && schedule.brewSelf?.outdated && !brewUpdateDismissed && view !== "setup"}
+    <div class="strip">
+      <div>
+        <strong>Homebrew {schedule.brewSelf.latest} is available.</strong>
+        You have {schedule.brewSelf.installed}; updating takes a moment and needs no password.
+      </div>
+      <button class="btn btn-primary" onclick={updateHomebrew} disabled={setupRunning}>Update Homebrew</button>
+      <button class="dismiss" aria-label="Dismiss" onclick={() => { brewUpdateDismissed = true; }}>✕</button>
+    </div>
+  {/if}
+
+  {#if appMgmt === "blocked" && !appMgmtDismissed}
+    <div class="strip strip-warn">
+      <div>
+        <strong>PartyMAN can't replace apps in /Applications yet.</strong>
+        macOS protects other apps' files. Allow PartyMAN under App Management, then come back here.
+      </div>
+      <button class="btn btn-primary" onclick={openAppManagement}>Open System Settings</button>
+      <button class="btn" onclick={() => probeAppManagement(true)}>Check again</button>
+      <button class="dismiss" aria-label="Dismiss" onclick={() => { appMgmtDismissed = true; }}>✕</button>
     </div>
   {/if}
 
   {#if installedTwice.length > 0 && !installedTwiceDismissed}
-    <div class="twice-banner">
-      <div class="twice-text">
+    <div class="strip">
+      <div>
         <strong>Installed twice.</strong>
         {installedTwice.length === 1 ? "This app is" : "These apps are"} installed from the App Store
-        and by Homebrew. Each copy is checked for updates and counted on its own, so
-        you may want to keep just one.
+        and by Homebrew, so each copy is checked and counted on its own.
         <ul>
           {#each installedTwice as entry}<li>{entry}</li>{/each}
         </ul>
       </div>
-      <button class="banner-dismiss" onclick={() => { installedTwiceDismissed = true; }}>✕</button>
+      <button class="dismiss" aria-label="Dismiss" onclick={() => { installedTwiceDismissed = true; }}>✕</button>
     </div>
   {/if}
 
-  {#if showWhatsNew}
-    <div class="settings-panel">
-      <div class="page-header">
-        <h2>What's New in v{whatsNewVersion}</h2>
-        <button class="page-close" onclick={() => { showWhatsNew = false; }}>✕</button>
-      </div>
-      <div class="settings-body">
-        <div class="whats-new">
-          {#each renderNotes(whatsNewNotes) as line}
-            {#if line.kind === "heading"}
-              <h3 class="whats-new-heading">
-                {#each line.segments as seg}{seg.text}{/each}
-              </h3>
-            {:else}
-              <p class={line.kind === "bullet" ? "whats-new-bullet" : "whats-new-text"}>
-                {#each line.segments as seg}{#if seg.strong}<strong>{seg.text}</strong>{:else}{seg.text}{/if}{/each}
-              </p>
+  <div class="split">
+      <aside class="sidebar">
+        <div class="summary">
+          {#if schedule.lastTotal > 0}
+            <div class="summary-count">
+              <span class="num">{schedule.lastTotal}</span>
+              <span class="num-label">update{schedule.lastTotal === 1 ? "" : "s"}</span>
+            </div>
+          {:else if newestCheck}
+            <div class="summary-count ok">
+              <span class="tick">✓</span>
+              <span class="num-label">Up to date</span>
+            </div>
+          {:else}
+            <div class="summary-count">
+              <span class="num-label">Not checked yet</span>
+            </div>
+          {/if}
+          {#if newestCheck}
+            <p class="summary-note">{runningAll ? "Checking…" : `Checked ${relTime(newestCheck)}`}</p>
+          {/if}
+          <div class="summary-actions">
+            <button class="btn" onclick={runAll} title={shortcutLabel(shortcuts.checkAll)} disabled={runningAll}>{runningAll ? "Checking…" : "Check all"}</button>
+            {#if schedule.lastTotal > 0}
+              <button class="btn btn-primary" onclick={installOutstanding}>Install all</button>
             {/if}
-          {/each}
-        </div>
-      </div>
-    </div>
-
-  {:else if showSchedule}
-    <div class="settings-panel">
-      <div class="page-header">
-        <h2>Scheduler</h2>
-        <button class="page-close" onclick={() => { showSchedule = false; }}>✕</button>
-      </div>
-      <div class="settings-body">
-        <p class="section-note">
-          PartyMAN can check for updates on its own, and keeps doing so after you quit —
-          a background job runs on the schedule below. It only ever <strong>checks</strong>;
-          installing is always something you start, so nothing is changed without you.
-          Found updates appear in the menu bar and, if you like, as a notification.
-        </p>
-        {#if scheduleError}
-          <div class="schedule-error">{scheduleError}</div>
-        {/if}
-
-        <div class="settings-section">
-          <h3 class="settings-section-title">Automatic Checks</h3>
-          <label class="settings-row">
-            <div class="settings-row-info">
-              <span class="settings-row-label">Check for updates automatically</span>
-              <span class="settings-row-desc">Keeps checking in the background even after you quit PartyMAN</span>
-            </div>
-            <input type="checkbox" bind:checked={schedule.enabled}
-              onchange={saveSchedule} disabled={scheduleSaving} />
-          </label>
-          <div class="settings-row">
-            <div class="settings-row-info">
-              <span class="settings-row-label">How often</span>
-              <span class="settings-row-desc">Next run: {nextRunLabel()}</span>
-            </div>
-            <select class="schedule-select" bind:value={schedule.frequency}
-              onchange={saveSchedule} disabled={!schedule.enabled || scheduleSaving}>
-              {#each FREQUENCIES as choice}
-                <option value={choice.id}>{choice.label}</option>
-              {/each}
-            </select>
           </div>
-
-          {#if schedule.frequency === "weekly"}
-            <div class="settings-row">
-              <div class="settings-row-info">
-                <span class="settings-row-label">Day of the week</span>
-                <span class="settings-row-desc">Which day the weekly check runs on</span>
-              </div>
-              <select class="schedule-select" bind:value={schedule.weekday}
-                onchange={saveSchedule} disabled={!schedule.enabled || scheduleSaving}>
-                {#each WEEKDAYS as day}
-                  <option value={day.id}>{day.label}</option>
-                {/each}
-              </select>
-            </div>
-          {/if}
-
-          {#if schedule.frequency !== "hourly"}
-            <div class="settings-row">
-              <div class="settings-row-info">
-                <span class="settings-row-label">Hour</span>
-                <span class="settings-row-desc">Local time, so it holds through daylight saving</span>
-              </div>
-              <select class="schedule-select" bind:value={schedule.hour}
-                onchange={saveSchedule} disabled={!schedule.enabled || scheduleSaving}>
-                {#each HOURS as h}
-                  <option value={h.id}>{h.label}</option>
-                {/each}
-              </select>
-            </div>
-          {/if}
-
-          <div class="settings-row">
-            <div class="settings-row-info">
-              <span class="settings-row-label">Minutes past the hour</span>
-              <span class="settings-row-desc">
-                {schedule.frequency === "hourly"
-                  ? "Runs at this minute of every hour"
-                  : `Runs at ${hourLabel(schedule.hour)}${pad(schedule.minute)}`}
-              </span>
-            </div>
-            <input class="schedule-select schedule-number" type="number" min="0" max="59"
-              value={schedule.minute} onchange={setMinute}
-              disabled={!schedule.enabled || scheduleSaving} />
-          </div>
-          <label class="settings-row">
-            <div class="settings-row-info">
-              <span class="settings-row-label">Check when PM Updater opens</span>
-              <span class="settings-row-desc">Checks apps and system updates on launch instead of waiting for the next interval. Developer tools are left to the schedule and their own tab.</span>
-            </div>
-            <input type="checkbox" bind:checked={schedule.checkOnLaunch}
-              onchange={saveSchedule} disabled={scheduleSaving} />
-          </label>
-        </div>
-
-        <div class="settings-section">
-          <h3 class="settings-section-title">Notifications</h3>
-          <label class="settings-row">
-            <div class="settings-row-info">
-              <span class="settings-row-label">Notify me when updates are found</span>
-              <span class="settings-row-desc">The menu bar always shows the count; this adds a notification</span>
-            </div>
-            <input type="checkbox" bind:checked={schedule.notify}
-              onchange={saveSchedule} disabled={scheduleSaving} />
-          </label>
-          {#if isSnoozed()}
-            <div class="settings-row">
-              <div class="settings-row-info">
-                <span class="settings-row-label">Reminders paused</span>
-                <span class="settings-row-desc">Until {formatWhen(schedule.snoozedUntil)}</span>
-              </div>
-              <button class="settings-check-btn" onclick={() => snoozeUpdates(0)}>Resume</button>
-            </div>
-          {/if}
-        </div>
-
-        <div class="settings-section">
-          <h3 class="settings-section-title">Last Run</h3>
-          <div class="settings-row">
-            <div class="settings-row-info">
-              <span class="settings-row-label">
-                {schedule.lastTotal} update{schedule.lastTotal === 1 ? "" : "s"} found
-              </span>
-              <span class="settings-row-desc">Last checked: {formatWhen(schedule.lastRun)}</span>
-            </div>
-            <button class="settings-check-btn" onclick={runScheduleNow} disabled={scheduleRunning}>
-              {scheduleRunning ? "Checking…" : "Run Now"}
-            </button>
-          </div>
-          {#if countedEntries(schedule.lastCounts).length > 0}
-            <div class="schedule-breakdown">
-              {#each countedEntries(schedule.lastCounts) as [sec, n]}
-                <span class="schedule-chip">{sectionLabel(sec)} <strong>{n}</strong></span>
-              {/each}
-            </div>
-          {/if}
-        </div>
-      </div>
-    </div>
-
-  {:else if showSettings}
-    <div class="settings-panel">
-      <div class="page-header">
-        <h2>Settings</h2>
-        <button class="page-close" onclick={() => { showSettings = false; }}>✕</button>
-      </div>
-      <div class="settings-body">
-        <p class="section-note">
-          Appearance and start-up behaviour. <strong>Start on login</strong> keeps the
-          menu-bar icon available so scheduled checks can report what they find, and the
-          theme applies immediately.
-        </p>
-        <div class="settings-section">
-          <h3 class="settings-section-title">General</h3>
-          <div class="settings-row">
-            <div class="settings-row-info">
-              <span class="settings-row-label">Theme</span>
-              <span class="settings-row-desc">
-                {THEMES.find((t) => t.id === theme)?.note ?? ""}
-              </span>
-            </div>
-            <select class="schedule-select" bind:value={theme} onchange={changeTheme}>
-              {#each THEMES as choice}
-                <option value={choice.id}>{choice.label}</option>
-              {/each}
-            </select>
-          </div>
-          <label class="settings-row">
-            <div class="settings-row-info">
-              <span class="settings-row-label">Start on login</span>
-              <span class="settings-row-desc">Launch PartyMAN Update Manager automatically when you log in</span>
-            </div>
-            <input type="checkbox" bind:checked={startOnLogin} onchange={toggleStartOnLogin} />
-          </label>
-        </div>
-        <div class="settings-section">
-          <h3 class="settings-section-title">App Updates</h3>
-          <div class="settings-row">
-            <div class="settings-row-info">
-              <span class="settings-row-label">Check for Updates</span>
-              <span class="settings-row-desc">
-              {#if appUpdateStatus === "error" && appUpdateError}Error: {appUpdateError}{:else}Check GitHub for a newer version of PartyMAN Update Manager{/if}
-            </span>
-            </div>
-            <button class="settings-check-btn"
-              onclick={() => { if (appUpdateStatus === "available") { installAppUpdate(); } else { checkAppUpdate(); } }}
-              disabled={appUpdateStatus === "checking"}>
-              {#if appUpdateStatus === "checking"}Checking…
-              {:else if appUpdateStatus === "up-to-date"}✔ Up to date
-              {:else if appUpdateStatus === "available" && appUpdateInfo}v{appUpdateInfo.version} — Install
-              {:else if appUpdateStatus === "error"}Retry
-              {:else}Check Now{/if}
-            </button>
-          </div>
-          <label class="settings-row">
-            <div class="settings-row-info">
-              <span class="settings-row-label">Auto-check on startup</span>
-              <span class="settings-row-desc">Automatically check once per day when the app opens</span>
-            </div>
-            <input type="checkbox" bind:checked={autoCheckUpdates}
-              onchange={() => localStorage.setItem("autoCheckUpdates", String(autoCheckUpdates))} />
-          </label>
-        </div>
-      </div>
-    </div>
-
-  {:else if showAbout}
-    <div class="about-panel">
-      <div class="page-header">
-        <h2>About</h2>
-        <button class="page-close" onclick={() => { showAbout = false; }}>✕</button>
-      </div>
-      <div class="about-body">
-        <img src={iconUrl} alt="" class="about-icon" />
-        <h2 class="about-app-name"><span class="brand-bed">PartyMAN</span> Update Manager</h2>
-        <p class="about-app-version">Version {appVersion}</p>
-        <p class="about-app-desc">A macOS update manager that checks for and applies updates across system tools, App Store apps, Homebrew, and more — all in one place.</p>
-        <div class="about-actions">
-          <button class="about-action-btn" onclick={() => openReleaseUrl("https://github.com/paymonr/partyman_update_manager/releases")}>
-            View Releases
-          </button>
-          <button class="about-action-btn" onclick={() => openReleaseUrl("https://github.com/paymonr/partyman_update_manager")}>
-            GitHub
-          </button>
-        </div>
-        <p class="about-license">Licensed under the Apache License 2.0</p>
-        <div class="about-credits">
-          <p>
-            Kawaii Meadow themes use
-            <button class="about-link" onclick={() => openReleaseUrl("https://github.com/paymonr/kawaii-meadow")}>kawaii-meadow</button>,
-            an MIT-licensed CSS kit by
-            <button class="about-link" onclick={() => openReleaseUrl("https://github.com/paymonr")}>@paymonr</button>.
-          </p>
-          <p>Set in Nunito, licensed under the SIL Open Font License.</p>
-        </div>
-      </div>
-    </div>
-
-  {:else if showHistory}
-    <div class="history-panel">
-      <div class="history-header">
-        <h2>Update History <span class="history-sub">last 180 days</span></h2>
-        <input
-          class="history-search"
-          type="search"
-          placeholder="Search by app, type, or keyword…"
-          bind:value={historySearch}
-        />
-      </div>
-      <div class="history-list">
-        {#if filteredHistory.length === 0}
-          <p class="empty">{historyEntries.length === 0 ? "No update history yet." : "No results for that search."}</p>
-        {:else}
-          {#each filteredHistory as entry, i}
-            <div class="history-entry">
-              <button class="history-entry-header" onclick={() => expandedHistoryEntry = expandedHistoryEntry === i ? null : i}>
-                <div class="history-meta">
-                  <span class="history-label">{entry.label}</span>
-                  <span class="history-time">{formatTime(new Date(entry.ts * 1000))}</span>
-                </div>
-                <div class="history-items">
-                  {#if entry.item_names.length > 0}
-                    {#each entry.item_names as name}
-                      <span class="history-item-chip">{name}</span>
-                    {/each}
-                  {:else}
-                    <span class="history-item-chip history-item-bulk">bulk upgrade</span>
+          {#if schedule.lastTotal > 0}
+            <div class="snooze">
+              <button class="btn btn-plain btn-small" onclick={() => { snoozeOpen = !snoozeOpen; }} aria-expanded={snoozeOpen}>
+                {isSnoozed() ? "Reminders snoozed" : "Snooze reminders"}
+              </button>
+              {#if snoozeOpen}
+                <div class="snooze-backdrop" onclick={() => { snoozeOpen = false; }} role="presentation"></div>
+                <div class="snooze-menu" role="menu">
+                  <span class="snooze-title">Remind me in</span>
+                  <button role="menuitem" onclick={() => { snoozeUpdates(1); snoozeOpen = false; }}>1 hour</button>
+                  <button role="menuitem" onclick={() => { snoozeUpdates(24); snoozeOpen = false; }}>1 day</button>
+                  <button role="menuitem" onclick={() => { snoozeUpdates(72); snoozeOpen = false; }}>3 days</button>
+                  {#if isSnoozed()}
+                    <button role="menuitem" onclick={() => { snoozeUpdates(0); snoozeOpen = false; }}>Resume reminders</button>
                   {/if}
                 </div>
-                <span class="history-expand">{expandedHistoryEntry === i ? "▲" : "▼"}</span>
+              {/if}
+            </div>
+          {/if}
+        </div>
+
+        <ul class="sources">
+          {#each appSections as s (s.id)}
+            {@const st = statuses[s.id]}
+            {@const n = counts[s.id]}
+            <li>
+              <button class="source" class:active={view === "updates" && activeTab === s.id} onclick={() => pick(s.id)}>
+                <span class="source-name">{s.label}</span>
+                {#if !toolReady(s, tooling)}
+                  <span class="count none">Set up</span>
+                {:else if st === "running"}
+                  <span class="spinner" aria-label="Checking"></span>
+                {:else if st === "error"}
+                  <span class="count err" title="The check failed">!</span>
+                {:else if n === null}
+                  <span class="count none">–</span>
+                {:else if n === 0}
+                  <span class="count zero" title="Up to date">✓</span>
+                {:else}
+                  <span class="count" class:quiet={s.id === "untracked_apps"}>{n}</span>
+                {/if}
               </button>
-              {#if expandedHistoryEntry === i}
-                <div class="history-output">
-                  {#each entry.lines as line}
-                    <div class="line">{line}</div>
+            </li>
+          {/each}
+        </ul>
+
+        {#if schedule.showDevTools && devSections.length > 0}
+          <p class="group-title">Developer tools</p>
+          <ul class="sources">
+            {#each devSections as s (s.id)}
+              {@const st = statuses[s.id]}
+              {@const n = counts[s.id]}
+              <li>
+                <button class="source" class:active={view === "updates" && activeTab === s.id} onclick={() => pick(s.id)}>
+                  <span class="source-name">{s.label}</span>
+                  {#if st === "running"}
+                    <span class="spinner" aria-label="Checking"></span>
+                  {:else if st === "error"}
+                    <span class="count err" title="The check failed">!</span>
+                  {:else if n === null}
+                    <span class="count none">–</span>
+                  {:else if n === 0}
+                    <span class="count zero" title="Up to date">✓</span>
+                  {:else}
+                    <span class="count quiet">{n}</span>
+                  {/if}
+                </button>
+              </li>
+            {/each}
+          </ul>
+        {/if}
+
+        <div class="sidebar-foot">
+          <button class="source" class:active={view === "history"} onclick={() => go("history")}>History</button>
+          <button class="source" class:active={view === "settings" || view === "whatsnew"} onclick={() => go("settings")}>Settings</button>
+        </div>
+      </aside>
+
+  {#if view === "setup"}
+    <div class="page">
+      <div class="page-head">
+        <h2>{setupKind === "update" ? (setupRunning ? "Updating Homebrew…" : "Homebrew update") : (setupRunning ? "Setting up Homebrew…" : "Homebrew setup")}</h2>
+        {#if !setupRunning}<button class="btn btn-plain" onclick={() => go("updates")}>Done</button>{/if}
+      </div>
+      <div class="output" bind:this={outputEl}>
+        {#if (outputs["setup"] ?? []).length === 0}
+          <p class="empty">Starting…</p>
+        {:else}
+          {#each outputs["setup"] as line}<div class="line" class:ok={line.startsWith("✔")} class:warn={line.startsWith("⚠")} class:bad={line.startsWith("✖")}>{line}</div>{/each}
+        {/if}
+      </div>
+    </div>
+
+  {:else if view === "whatsnew"}
+    <div class="page">
+      <div class="page-head">
+        <h2>What's new in {whatsNewVersion}</h2>
+        <button class="btn btn-plain" onclick={() => go("updates")}>Done</button>
+      </div>
+      <div class="page-body prose">
+        {#each renderNotes(whatsNewNotes) as line}
+          {#if line.kind === "heading"}
+            <h3>{#each line.segments as seg}{seg.text}{/each}</h3>
+          {:else}
+            <p class={line.kind === "bullet" ? "bullet" : ""}>
+              {#each line.segments as seg}{#if seg.strong}<strong>{seg.text}</strong>{:else}{seg.text}{/if}{/each}
+            </p>
+          {/if}
+        {/each}
+      </div>
+    </div>
+
+  {:else if view === "history"}
+    <div class="page">
+      <div class="page-head">
+        <h2>History <span class="page-sub">last 180 days</span></h2>
+        <button class="btn btn-small" class:btn-primary={historyFailedOnly}
+          onclick={() => { historyFailedOnly = !historyFailedOnly; }} aria-pressed={historyFailedOnly}>Failed only</button>
+        <input class="search" type="search" placeholder="Search" bind:value={historySearch} />
+      </div>
+      <div class="page-body history">
+        {#if historyRuns.length === 0}
+          <p class="empty">
+            {#if historyEntries.length === 0}Nothing has been updated from here yet.
+            {:else if historyFailedOnly && !historySearch.trim()}Nothing has failed. Good.
+            {:else}Nothing matches.{/if}
+          </p>
+        {:else}
+          {#each historyRuns as run (run.id)}
+            <div class="run" class:open={expandedRun === run.id}>
+              <button class="run-row" onclick={() => toggleRun(run.id)} aria-expanded={expandedRun === run.id}>
+                <span class="history-when">{formatShort(new Date(run.ts * 1000))}</span>
+                <span class="run-what">
+                  <span class="history-source">{sectionLabel(run.section)}</span>
+                  <span class="run-summary">{runSummary(run)}</span>
+                </span>
+                <span class="mark" class:ok={run.failed === 0 && run.cancelled === 0} class:bad={run.failed > 0 && run.ok === 0} class:mixed={run.failed > 0 && run.ok > 0}>
+                  {run.failed === 0 && run.cancelled === 0 ? "✓" : run.failed === 0 ? "↩" : run.ok === 0 ? "✖" : "◐"}
+                </span>
+                <span class="history-caret" aria-hidden="true">{expandedRun === run.id ? "▾" : "▸"}</span>
+              </button>
+              {#if expandedRun === run.id}
+                <div class="run-body">
+                  {#each run.entries as entry, j}
+                    {@const key = `${run.id}:${j}`}
+                    <div class="run-item">
+                      <button class="run-item-row" onclick={() => toggleEntry(key)} aria-expanded={expandedEntry === key}>
+                        <span class="mark" class:ok={entry.outcome === "ok"} class:bad={entry.outcome === "failed"} class:mixed={entry.outcome === "partial"}>{outcomeMark(entry.outcome)}</span>
+                        <span class="run-item-name">{entryNames(entry)}</span>
+                        {#if entry.versions.length > 0}<span class="run-item-ver">{versionText(entry)}</span>{/if}
+                        {#if entry.outcome === "failed"}<span class="run-item-note">failed</span>
+                        {:else if entry.outcome === "cancelled"}<span class="run-item-note quiet">cancelled</span>{/if}
+                        <span class="history-caret" aria-hidden="true">{expandedEntry === key ? "▾" : "▸"}</span>
+                      </button>
+                      {#if expandedEntry === key}
+                        <div class="output history-output">
+                          {#each (rawFor[key] ? entry.lines : cleanLog(entry.lines)) as line}
+                            <div class="line" class:ok={line.startsWith("✔") || line.startsWith("🍺") || line.startsWith("→  Done")} class:bad={line.startsWith("✖")}>{line}</div>
+                          {/each}
+                          {#if entry.lines.length === 0}<p class="empty">No output was recorded.</p>{/if}
+                          <button class="btn btn-plain btn-small raw-toggle" onclick={() => { rawFor[key] = !rawFor[key]; rawFor = rawFor; }}>
+                            {rawFor[key] ? "Show the short version" : "Show everything Homebrew said"}
+                          </button>
+                        </div>
+                      {/if}
+                    </div>
                   {/each}
                 </div>
               {/if}
@@ -1418,1189 +1789,752 @@
         {/if}
       </div>
     </div>
-  {:else}
 
-  <p class="section-note">
-    Each tab is one place software comes from. <strong>Run Check</strong> asks what is out
-    of date; nothing is installed until you choose to. Select what you want and use
-    <strong>Update Selected</strong> — you'll be asked for your administrator password once
-    per run, and only if it's needed.
-  </p>
+  {:else if view === "settings"}
+    <div class="page">
+      <div class="page-head"><h2>Settings</h2></div>
+      <div class="page-body settings">
+        {#if scheduleError}<div class="strip strip-err">{scheduleError}</div>{/if}
 
-  <div class="tab-bar">
-    {#each tabItems as item (item.id)}
-      {#if item.id === "dev"}
-        <button
-          class="tab"
-          class:active={activeTab === "dev"}
-          class:running={devStatus === "running"}
-          class:done={devStatus === "done"}
-          class:error={devStatus === "error"}
-          onclick={() => (activeTab = "dev")}
-        >
-          <span class="tab-dot" style="background:{statusColor[devStatus]}"></span>
-          Dev
-        </button>
-      {:else}
-        {@const st = statuses[item.id]}
-        <button
-          class="tab"
-          class:active={activeTab === item.id}
-          class:running={st === "running"}
-          class:done={st === "done"}
-          class:error={st === "error"}
-          onclick={() => (activeTab = item.id)}
-        >
-          <span class="tab-dot" style="background:{statusColor[st]}"></span>
-          {item.label}
-        </button>
-      {/if}
-    {/each}
-  </div>
+        <section>
+          <h3>General</h3>
+          <div class="row">
+            <span class="row-text">
+              <span class="row-label">Replacing apps in /Applications</span>
+              <span class="row-desc">
+                {#if appMgmt === "allowed"}Allowed. macOS lets PartyMAN update other apps.
+                {:else if appMgmt === "blocked"}Not allowed yet. Updates to apps will fail until PartyMAN is allowed under App Management.
+                {:else if appMgmt === "checking"}Checking…
+                {:else}Couldn't tell. If an update fails with "Operation not permitted", allow PartyMAN under App Management.{/if}
+              </span>
+            </span>
+            <span class="row-controls">
+              {#if appMgmt !== "allowed"}
+                <button class="btn" class:btn-primary={appMgmt === "blocked"} onclick={openAppManagement}>Open System Settings</button>
+              {/if}
+              <button class="btn btn-plain" onclick={() => probeAppManagement(true)} disabled={appMgmt === "checking"}>Check again</button>
+            </span>
+          </div>
+          <div class="row">
+            <span class="row-text">
+              <span class="row-label">Homebrew</span>
+              <span class="row-desc">
+                {#if !tooling}Looking…
+                {:else if !tooling.brew && !tooling.admin}Not installed, and installing it needs an administrator account.
+                {:else if !tooling.brew}Not installed. PartyMAN needs it to update apps that didn't come from the App Store.
+                {:else if tooling.jq && tooling.mas}Installed, with the jq and mas helpers.
+                {:else}Installed. Missing helper{!tooling.jq && !tooling.mas ? "s" : ""}: {[!tooling.jq && "jq", !tooling.mas && "mas"].filter(Boolean).join(", ")}.{/if}
+                {#if tooling?.brew && schedule.brewSelf?.installed}
+                  Homebrew {schedule.brewSelf.installed}{schedule.brewSelf.outdated ? ` — ${schedule.brewSelf.latest} is available.` : schedule.brewSelf.latest ? ", the latest." : "."}
+                {/if}
+              </span>
+            </span>
+            {#if tooling && (!tooling.brew || !tooling.jq || !tooling.mas) && (tooling.brew || tooling.admin)}
+              <button class="btn btn-primary" onclick={runSetup} disabled={setupRunning}>{tooling.brew ? "Install helpers" : "Set up Homebrew"}</button>
+            {:else if tooling?.brew && schedule.brewSelf?.outdated}
+              <button class="btn btn-primary" onclick={updateHomebrew} disabled={setupRunning}>Update Homebrew</button>
+            {/if}
+          </div>
+          <label class="row">
+            <span class="row-text">
+              <span class="row-label">Open at login</span>
+              <span class="row-desc">Keeps the menu bar icon available for scheduled checks</span>
+            </span>
+            <input type="checkbox" bind:checked={startOnLogin} onchange={toggleStartOnLogin} />
+          </label>
+          <label class="row">
+            <span class="row-text">
+              <span class="row-label">Show developer tools</span>
+              <span class="row-desc">Homebrew formulae, npm, pip, asdf, rbenv and rvm. They never count towards the total, and are only checked from their own page or by the schedule while shown.</span>
+            </span>
+            <input type="checkbox" bind:checked={schedule.showDevTools} onchange={toggleDevTools} disabled={scheduleSaving} />
+          </label>
+        </section>
 
-  {#if activeTab === "dev"}
-    <div class="sub-tab-bar">
-      {#each devSections as section (section.id)}
-        {@const st = statuses[section.id]}
-        <button
-          class="sub-tab"
-          class:active={activeDevTab === section.id}
-          class:running={st === "running"}
-          class:done={st === "done"}
-          class:error={st === "error"}
-          onclick={() => (activeDevTab = section.id)}
-        >
-          <span class="tab-dot" style="background:{statusColor[st]}"></span>
-          {section.label}
-        </button>
-      {/each}
-    </div>
-  {/if}
+        <section>
+          <h3>Appearance</h3>
+          <div class="row">
+            <span class="row-text">
+              <span class="row-label">Theme</span>
+              <span class="row-desc">{THEMES.find((t) => t.id === theme)?.note ?? ""}</span>
+            </span>
+            <select class="select" bind:value={theme} onchange={changeTheme}>
+              {#each THEMES as choice}<option value={choice.id}>{choice.label}</option>{/each}
+            </select>
+          </div>
+        </section>
 
-  {#if activeSection}
-    <div class="panel" class:running={activeStatus === "running"} class:done={activeStatus === "done"} class:error={activeStatus === "error"}>
-      <div class="panel-header">
-        <div class="panel-info">
-          <h2>{activeSection.label}</h2>
-          <p class="desc">{activeSection.description}</p>
-          {#if activeLastChecked}
-            <p class="last-checked">Last checked at {formatTime(activeLastChecked)}</p>
-          {/if}
-          {#if activeSection.upgradeCmd}
-            <div class="cmd-bar">
-              <code class="cmd-text">{activeSection.upgradeCmd}</code>
-              <button
-                class="cmd-copy"
-                onclick={() => copyCmd(activeSection!.upgradeCmd!)}
-                aria-label="Copy upgrade command"
-              >
-                <svg width="13" height="13" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
-                  <rect x="5" y="5" width="9" height="9" rx="1.5" stroke="currentColor" stroke-width="1.5"/>
-                  <path d="M11 5V3.5A1.5 1.5 0 0 0 9.5 2H3.5A1.5 1.5 0 0 0 2 3.5V9.5A1.5 1.5 0 0 0 3.5 11H5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
-                </svg>
+        <section>
+          <h3>Keyboard</h3>
+          <p class="section-hint">Click a shortcut to change it, then press the new keys. A shortcut needs ⌘ or ⌃; Escape keeps the old one.</p>
+          {#each SHORTCUT_ACTIONS as a (a.id)}
+            <div class="row">
+              <span class="row-text">
+                <span class="row-label">{a.label}</span>
+                <span class="row-desc">{a.desc}</span>
+              </span>
+              {#if !isDefaultShortcut(a.id, shortcuts)}
+                <button class="btn btn-plain btn-small" onclick={() => resetShortcut(a.id)}>Reset</button>
+              {/if}
+              <button class="btn shortcut" class:recording={recording === a.id}
+                onclick={() => { recording = recording === a.id ? null : a.id; shortcutError = ""; }}>
+                {recording === a.id ? "Press keys…" : shortcutLabel(shortcuts[a.id])}
               </button>
             </div>
-          {/if}
-        </div>
-        <div class="panel-actions">
-          {#if activeHasItemSelection && activeSectionId !== "untracked_apps" && activeStatus === "done" && activeParsedItems.length > 0}
-            <button
-              class="update-btn"
-              onclick={() => runUpgradeItems(activeSectionId, activeSelectedItems)}
-              disabled={activeUpgradeStatus === "running" || activeSelectedItems.length === 0}
-            >
-              {activeUpgradeStatus === "running" ? "Updating…" : `Update Selected (${activeSelectedItems.length})`}
-            </button>
-          {:else if activeSection.upgradeCmd && activeStatus === "done" && activeHasOutdated && !activeHasItemSelection && !activeSection.dev}
-            <button
-              class="update-btn"
-              onclick={() => runUpgrade(activeSectionId)}
-              disabled={activeUpgradeStatus === "running"}
-            >
-              {activeUpgradeStatus === "running" ? "Updating…" : "Run Update"}
-            </button>
-          {/if}
-          {#if activeHasItemSelection && activeStatus === "done" && activeParsedItems.length > 0}
-            <div class="view-toggle">
-              <button class:active={activeViewMode === "readonly"} onclick={() => { viewMode[activeSectionId] = "readonly"; viewMode = viewMode; }}>Read-Only</button>
-              <button class:active={activeViewMode === "select"} onclick={() => { viewMode[activeSectionId] = "select"; viewMode = viewMode; }}>Updates</button>
-              <button class:active={activeViewMode === "upgrade"} onclick={() => { viewMode[activeSectionId] = "upgrade"; viewMode = viewMode; }}>Log</button>
-            </div>
-          {/if}
-          <button
-            class="check-btn"
-            onclick={() => runSection(activeSectionId)}
-            disabled={activeStatus === "running" || activeUpgradeStatus === "running"}
-          >
-            {activeStatus === "running" ? "Running…" : "Run Check"}
-          </button>
-        </div>
-      </div>
+          {/each}
+          {#if shortcutError}<p class="section-hint error">{shortcutError}</p>{/if}
+        </section>
 
-      {#if showSelectView}
-        <div class="items-list">
-          {#if activeSectionId === "untracked_apps"}
-            {@const shown = activeParsedItems.filter(i => !hiddenApps.includes(i.name)).length}
-            <p class="section-note">
-              Nothing updates these automatically — they aren't managed by Homebrew,
-              the App Store or Apple. PartyMAN can hand one to Homebrew when a cask
-              genuinely matches it. Many have no cask at all: company-managed tools,
-              helper apps, or software Homebrew doesn't carry. Mark those
-              <strong>No cask available</strong> to clear them from the list.
-            </p>
-            <div class="items-bar">
-              <span class="items-count">{shown} app{shown === 1 ? "" : "s"} found</span>
-              <button class="items-sel-btn" onclick={findAllCasks}>Check All</button>
-              {#if hiddenApps.length > 0}
-                <button class="items-sel-btn" onclick={unhideAll}>
-                  Show {hiddenApps.length} hidden
-                </button>
-              {/if}
-              {#if activeFoundCount > 0}
-                <button class="items-sel-btn" onclick={trackAllApps} disabled={activeUpgradeStatus === "running"}>
-                  {activeUpgradeStatus === "running" ? "Enabling…" : `Enable All (${activeFoundCount})`}
-                </button>
-              {/if}
-            </div>
-            {#each activeParsedItems.filter(i => !hiddenApps.includes(i.name)) as item}
-              <div class="item-row untracked-row">
-                <span class="item-name">{item.name}</span>
-                <div class="cask-search-state">
-                  {#if !caskSearch[item.id]}
-                    <button class="find-cask-btn" onclick={() => findCask(item.id)}>Check</button>
-                  {:else if caskSearch[item.id].status === "searching"}
-                    <span class="cask-status-text">Checking…</span>
-                  {:else if caskSearch[item.id].status === "none"}
-                    <span class="cask-status-text cask-none">Can't be auto-updated</span>
-                  {:else if caskSearch[item.id].status === "found"}
-                    {@const confirmed = caskSearch[item.id].candidates.find(c => c.exact)}
-                    {#if confirmed}
-                      <span class="cask-match">✓ {confirmed.token}</span>
-                      <button
-                        class="track-btn"
-                        onclick={() => trackApp(confirmed.token, item.appDir)}
-                        disabled={activeUpgradeStatus === "running"}
-                      >Enable Auto-Updates</button>
-                    {:else}
-                      <!-- Nothing is confirmed to install this app. Offering
-                           guesses is what installed unrelated software before,
-                           so the only option here is to say so and move on.
-                           Choosing a cask by hand is a future TODO. -->
-                      <span class="cask-status-text cask-unsure">No cask found</span>
-                      <button class="cask-link-btn" onclick={() => hideApp(item.name)}>
-                        No cask available
-                      </button>
-                    {/if}
-                  {/if}
-                </div>
-              </div>
-            {/each}
-          {:else}
-            <div class="items-bar">
-              <span class="items-count">{activeParsedItems.length} outdated</span>
-              <button class="items-sel-btn" onclick={() => selectAll(activeSectionId)}>Select All</button>
-              <button class="items-sel-btn" onclick={() => selectNone(activeSectionId)}>Clear</button>
-            </div>
-            {#each activeParsedItems as item}
-              <label class="item-row">
-                <input
-                  type="checkbox"
-                  checked={activeSelectedItems.includes(item.id)}
-                  onchange={(e) => toggleItem(activeSectionId, item.id, (e.target as HTMLInputElement).checked)}
-                />
-                <span class="item-name">{item.name}</span>
-              </label>
-            {/each}
-          {/if}
-        </div>
-      {:else if activeViewMode === "upgrade"}
-        <div class="output" bind:this={outputEl}>
-          {#if activeUpgradeLines.length === 0}
-            <p class="empty">No updates have been run yet.</p>
-          {:else}
-            {@const displayLines = activeSectionId === "untracked_apps" ? simplifyUntrackedLog(activeUpgradeLines) : activeUpgradeLines}
-            {#each displayLines as line}
-              <div class="line">{line}</div>
-            {/each}
-          {/if}
-        </div>
-      {:else}
-        {#if activeHasItemSelection && activeStatus === "done" && activeParsedItems.length > 0}
-          <div class="updates-hint">
-            Updates available — switch to <button class="hint-link" onclick={() => { viewMode[activeSectionId] = "select"; viewMode = viewMode; }}>Updates</button> to choose which ones to install.
+        <section>
+          <h3>Automatic checks</h3>
+          <p class="section-hint">
+            Checks run in the background, even when PartyMAN is closed, and only ever look.
+            Installing is always something you start.
+          </p>
+          <label class="row">
+            <span class="row-text">
+              <span class="row-label">Check automatically</span>
+              <span class="row-desc">Found updates show in the menu bar</span>
+            </span>
+            <input type="checkbox" bind:checked={schedule.enabled} onchange={saveSchedule} disabled={scheduleSaving} />
+          </label>
+          <div class="row">
+            <span class="row-text">
+              <span class="row-label">How often</span>
+              <span class="row-desc">Next check: {nextRunLabel()}</span>
+            </span>
+            <select class="select" bind:value={schedule.frequency} onchange={saveSchedule} disabled={!schedule.enabled || scheduleSaving}>
+              {#each FREQUENCIES as choice}<option value={choice.id}>{choice.label}</option>{/each}
+            </select>
           </div>
-        {/if}
-        <div class="output" bind:this={outputEl}>
-          {#if activeLines.length === 0}
-            <p class="empty">Press "Run Check" to check for updates.</p>
-          {:else}
-            {#each activeLines as line}
-              <div class="line">{line}</div>
-            {/each}
+          {#if schedule.frequency === "weekly"}
+            <div class="row">
+              <span class="row-text"><span class="row-label">On</span></span>
+              <select class="select" bind:value={schedule.weekday} onchange={saveSchedule} disabled={!schedule.enabled || scheduleSaving}>
+                {#each WEEKDAYS as day}<option value={day.id}>{day.label}</option>{/each}
+              </select>
+            </div>
           {/if}
-        </div>
-      {/if}
+          <div class="row">
+            <span class="row-text">
+              <span class="row-label">At</span>
+              <span class="row-desc">
+                {schedule.frequency === "hourly"
+                  ? "This many minutes past every hour"
+                  : `Local time, ${hourLabel(schedule.hour)}${pad(schedule.minute)}`}
+              </span>
+            </span>
+            <span class="row-controls">
+              {#if schedule.frequency !== "hourly"}
+                <select class="select" bind:value={schedule.hour} onchange={saveSchedule} disabled={!schedule.enabled || scheduleSaving}>
+                  {#each HOURS as h}<option value={h.id}>{h.label}</option>{/each}
+                </select>
+              {/if}
+              <input class="select minutes" type="number" min="0" max="59" value={schedule.minute} onchange={setMinute}
+                disabled={!schedule.enabled || scheduleSaving} aria-label="Minutes past the hour" />
+            </span>
+          </div>
+          <label class="row">
+            <span class="row-text">
+              <span class="row-label">Check when PartyMAN opens</span>
+              <span class="row-desc">Apps and system updates only; developer tools keep to the schedule</span>
+            </span>
+            <input type="checkbox" bind:checked={schedule.checkOnLaunch} onchange={saveSchedule} disabled={scheduleSaving} />
+          </label>
+          <label class="row">
+            <span class="row-text">
+              <span class="row-label">Notify me when updates are found</span>
+              <span class="row-desc">The menu bar shows the count either way</span>
+            </span>
+            <input type="checkbox" bind:checked={schedule.notify} onchange={saveSchedule} disabled={scheduleSaving} />
+          </label>
+          {#if isSnoozed()}
+            <div class="row">
+              <span class="row-text">
+                <span class="row-label">Reminders snoozed</span>
+                <span class="row-desc">Until {formatWhen(schedule.snoozedUntil)}</span>
+              </span>
+              <button class="btn" onclick={() => snoozeUpdates(0)}>Resume</button>
+            </div>
+          {/if}
+          <div class="row">
+            <span class="row-text">
+              <span class="row-label">Last check</span>
+              <span class="row-desc">
+                {#if schedule.lastRun}
+                  {formatWhen(schedule.lastRun)} · {schedule.lastTotal} update{schedule.lastTotal === 1 ? "" : "s"}
+                  {#if countedEntries(schedule.lastCounts).length > 0}
+                    ({countedEntries(schedule.lastCounts).map(([sec, n]) => `${sectionLabel(sec)} ${n}`).join(", ")})
+                  {/if}
+                {:else}
+                  Never
+                {/if}
+              </span>
+            </span>
+            <button class="btn" onclick={runScheduleNow} disabled={scheduleRunning}>
+              {scheduleRunning ? "Checking…" : "Check now"}
+            </button>
+          </div>
+        </section>
+
+        <section>
+          <h3>About PartyMAN</h3>
+          <div class="row">
+            <span class="row-text">
+              <span class="row-label">Version {appVersion}</span>
+              <span class="row-desc">
+                {#if appUpdateStatus === "error" && appUpdateError}Couldn't check: {appUpdateError}
+                {:else if appUpdateStatus === "up-to-date"}This is the latest version
+                {:else if appUpdateStatus === "available" && appUpdateInfo}{appUpdateInfo.version} is available
+                {:else}Checks GitHub for a newer version{/if}
+              </span>
+            </span>
+            <button class="btn" class:btn-primary={appUpdateStatus === "available"}
+              onclick={() => { if (appUpdateStatus === "available") { installAppUpdate(); } else { checkAppUpdate(); } }}
+              disabled={appUpdateStatus === "checking"}>
+              {#if appUpdateStatus === "checking"}Checking…
+              {:else if appUpdateStatus === "available"}Install update
+              {:else if appUpdateStatus === "error"}Try again
+              {:else}Check for updates{/if}
+            </button>
+          </div>
+          <label class="row">
+            <span class="row-text">
+              <span class="row-label">Check for new versions daily</span>
+              <span class="row-desc">Once a day, when the app opens</span>
+            </span>
+            <input type="checkbox" bind:checked={autoCheckUpdates}
+              onchange={() => localStorage.setItem("autoCheckUpdates", String(autoCheckUpdates))} />
+          </label>
+          <div class="row">
+            <span class="row-text">
+              <span class="row-label">Logs</span>
+              <span class="row-desc">What was updated (updates.log) and what the app itself did (partyman.log)</span>
+            </span>
+            <button class="btn" onclick={() => invoke("open_logs_folder")}>Show in Finder</button>
+          </div>
+          <div class="about">
+            <img src={iconUrl} alt="" class="about-icon" />
+            <div>
+              <p><strong>PartyMAN Update Manager</strong> keeps one Mac's software current from one place: Apple, the App Store, Homebrew and the usual developer tools.</p>
+              <p class="about-links">
+                <button class="link" onclick={() => openReleaseUrl("https://github.com/paymonr/partyman_update_manager/releases")}>Release notes</button>
+                <button class="link" onclick={() => openReleaseUrl("https://github.com/paymonr/partyman_update_manager")}>Source on GitHub</button>
+              </p>
+              <p class="about-fine">Apache License 2.0.</p>
+            </div>
+          </div>
+        </section>
+      </div>
     </div>
+
+  {:else if activeSection}
+        <section class="content">
+          <header class="source-head">
+            <div class="source-title">
+              <h2>{activeSection.label}</h2>
+              <p class="source-status" class:err={activeStatus === "error"}>
+                {statusLine(activeSection, activeStatus, activeCount, activeLastChecked)}
+              </p>
+            </div>
+            <div class="source-actions">
+              {#if filterShown}
+                <input class="search filter" type="search" placeholder="Filter" title={shortcutLabel(shortcuts.filter)} bind:value={filter} bind:this={filterEl} aria-label="Filter this list" />
+              {/if}
+              {#if activeHasItemSelection && activeStatus === "done" && activeParsedItems.length > 0}
+                <div class="segmented" role="tablist" aria-label="View">
+                  <button class:active={activeViewMode === "select"} onclick={() => { viewMode[activeSectionId] = "select"; viewMode = viewMode; }}>List</button>
+                  <button class:active={activeViewMode === "readonly"} onclick={() => { viewMode[activeSectionId] = "readonly"; viewMode = viewMode; }}>Output</button>
+                  <button class:active={activeViewMode === "upgrade"} onclick={() => { viewMode[activeSectionId] = "upgrade"; viewMode = viewMode; }}>Log</button>
+                </div>
+              {/if}
+              {#if !toolReady(activeSection, tooling)}
+                <button class="btn btn-primary" onclick={runSetup} disabled={setupRunning || !tooling?.admin}
+                  title={tooling?.admin ? "" : "Installing Homebrew needs an administrator account"}>
+                  {activeSection.tool === "mas" ? "Set up App Store checking" : "Set up Homebrew"}
+                </button>
+              {:else}
+                <button class="btn" onclick={() => runSection(activeSectionId)}
+                  disabled={activeStatus === "running" || activeUpgradeStatus === "running"}>
+                  {activeStatus === "running" ? "Checking…" : activeStatus === "done" ? "Check again" : "Check now"}
+                </button>
+              {/if}
+            </div>
+          </header>
+
+          {#if showSelectView}
+            {#if activeSectionId === "untracked_apps"}
+              {@const shown = activeParsedItems.filter(i => !hiddenApps.includes(i.name))}
+              <div class="list-bar">
+                <span class="list-count">{shown.length} app{shown.length === 1 ? "" : "s"}</span>
+                <button class="btn btn-small" onclick={findAllCasks}>Look up all</button>
+                {#if activeFoundCount > 0}
+                  <button class="btn btn-small btn-primary" onclick={trackAllApps} disabled={activeUpgradeStatus === "running"}>
+                    {activeUpgradeStatus === "running" ? "Enabling…" : `Enable auto-updates for ${activeFoundCount}`}
+                  </button>
+                {/if}
+                {#if hiddenApps.length > 0}
+                  <button class="btn btn-small btn-plain" onclick={unhideAll}>Show {hiddenApps.length} hidden</button>
+                {/if}
+              </div>
+              <div class="list">
+                {#each shown as item}
+                  <div class="item item-untracked">
+                    <span class="item-name">{item.name}</span>
+                    <span class="item-side">
+                      {#if !caskSearch[item.id]}
+                        <button class="btn btn-small" onclick={() => findCask(item.id)}>Look up</button>
+                      {:else if caskSearch[item.id].status === "searching"}
+                        <span class="item-note">Looking up…</span>
+                      {:else if caskSearch[item.id].status === "none"}
+                        <span class="item-note">Homebrew doesn't carry this</span>
+                        <button class="btn btn-small btn-plain" onclick={() => hideApp(item.name)}>Hide</button>
+                      {:else if caskSearch[item.id].status === "found"}
+                        {@const confirmed = caskSearch[item.id].candidates.find(c => c.exact)}
+                        {#if confirmed}
+                          <span class="item-note ok">{confirmed.token}</span>
+                          <button class="btn btn-small btn-primary" onclick={() => trackApp(confirmed.token, item.appDir)}
+                            disabled={activeUpgradeStatus === "running"}>Enable auto-updates</button>
+                        {:else}
+                          <span class="item-note">No matching cask</span>
+                          <button class="btn btn-small btn-plain" onclick={() => hideApp(item.name)}>Hide</button>
+                        {/if}
+                      {/if}
+                    </span>
+                  </div>
+                {/each}
+                {#if shown.length === 0}
+                  <p class="empty">Every app here is managed by something.</p>
+                {/if}
+              </div>
+              <footer class="source-foot">
+                <span class="foot-note">
+                  Look up an app to see whether Homebrew carries it. Hidden apps are kept out of the list and the count.
+                </span>
+              </footer>
+            {:else}
+              <div class="list">
+                {#each activeVisibleItems.filter((i) => matchesFilter(i.name) || matchesFilter(i.id)) as item (item.id)}
+                  <label class="item">
+                    <input type="checkbox" checked={activeSelectedItems.includes(item.id)}
+                      onchange={(e) => toggleItem(activeSectionId, item.id, (e.target as HTMLInputElement).checked)} />
+                    <span class="item-name">{item.name}</span>
+                    {#if item.note === "restart"}<span class="item-tag">Restart required</span>{/if}
+                    {#if versionLabel(item)}<span class="item-ver">{versionLabel(item)}</span>{/if}
+                    <button class="btn btn-plain btn-small item-ignore" title="Leave this out of the count until a newer version is available"
+                      onclick={(e) => { e.preventDefault(); e.stopPropagation(); ignoreItem(item); }}>Ignore</button>
+                  </label>
+                {/each}
+                {#if activeVisibleItems.length === 0}
+                  <p class="empty">Nothing to update here.</p>
+                {/if}
+                {#if activeIgnoredItems.length > 0}
+                  <div class="ignored-group">
+                    <button class="btn btn-plain btn-small" onclick={() => { showIgnored = !showIgnored; }} aria-expanded={showIgnored}>
+                      {showIgnored ? "▾" : "▸"} {activeIgnoredItems.length} ignored until a newer version
+                    </button>
+                    {#if showIgnored}
+                      {#each activeIgnoredItems as item (item.id)}
+                        <div class="item item-ignored">
+                          <span class="item-name">{item.name}</span>
+                          {#if versionLabel(item)}<span class="item-ver">{versionLabel(item)}</span>{/if}
+                          <button class="btn btn-plain btn-small" onclick={() => unignoreItem(item)}>Stop ignoring</button>
+                        </div>
+                      {/each}
+                    {/if}
+                  </div>
+                {/if}
+              </div>
+              <footer class="source-foot">
+                {#if quitPrompt && quitPrompt.section === activeSectionId}
+                  <span class="foot-note"><strong>{openAppsText(quitPrompt.running)}</strong> Quit {quitPrompt.running.length === 1 ? "it" : "them"} first? {quitPrompt.running.length === 1 ? "It'll" : "They'll"} be reopened when the update finishes.</span>
+                  <button class="btn btn-primary" onclick={() => quitPrompt?.resolve(true)}>Quit, update and reopen</button>
+                  <button class="btn" onclick={() => quitPrompt?.resolve(false)}>Update anyway</button>
+                  <button class="btn btn-plain" onclick={() => quitPrompt?.resolve(null)}>Cancel</button>
+                {:else}
+                <button class="btn btn-primary" onclick={() => runUpgradeItems(activeSectionId, activeSelectedItems)}
+                  disabled={activeUpgradeStatus === "running" || activeSelectedItems.length === 0}>
+                  {#if activeUpgradeStatus === "running"}Updating…
+                  {:else if activeSectionId === "app_store"}Open App Store to update
+                  {:else}Update {activeSelectedItems.length} selected{/if}
+                </button>
+                <button class="btn btn-plain" onclick={() => selectAll(activeSectionId)}
+                  disabled={activeSelectedItems.length === activeParsedItems.length}>Select all</button>
+                <button class="btn btn-plain" onclick={() => selectNone(activeSectionId)}
+                  disabled={activeSelectedItems.length === 0}>Deselect all</button>
+                {#if activeSectionId !== "app_store"}
+                  <span class="foot-note">You may be asked for your password.</span>
+                {/if}
+                {/if}
+              </footer>
+            {/if}
+          {:else if activeViewMode === "upgrade"}
+            <div class="output" bind:this={outputEl}>
+              {#if activeUpgradeLines.length === 0}
+                <p class="empty">Nothing has been updated here yet.</p>
+              {:else}
+                {@const displayLines = activeSectionId === "untracked_apps" ? simplifyUntrackedLog(activeUpgradeLines) : activeUpgradeLines}
+                {#each displayLines as line}<div class="line" class:ok={line.startsWith("✔") || line.startsWith("🍺")} class:warn={line.startsWith("⚠")} class:bad={line.startsWith("✖") || line.startsWith("Error")}>{line}</div>{/each}
+              {/if}
+            </div>
+            {#if activeUpgradeStatus === "running" && stoppable(activeSectionId)}
+              <footer class="source-foot">
+                <button class="btn btn-stop" onclick={() => stopUpgrade(activeSectionId)} disabled={!!stopping[activeSectionId]}>
+                  {stopping[activeSectionId] ? "Stopping…" : "■  Stop"}
+                </button>
+                <span class="foot-note">Apps already updated stay updated; the one in progress is put back.</span>
+              </footer>
+            {/if}
+          {:else}
+            <div class="output" bind:this={outputEl}>
+              {#if activeLines.length === 0}
+                {#if activeStatus === "running"}
+                  <p class="empty">Checking…</p>
+                {:else}
+                  <p class="empty">
+                    {#if !toolReady(activeSection, tooling)}
+                      {activeSection.tool === "mas"
+                        ? "Checking the App Store needs a small helper from Homebrew. Set it up and this page fills in."
+                        : "This needs Homebrew, which isn't installed yet. Set it up and this page fills in."}
+                    {:else}
+                      Not checked yet.
+                      {#if activeSection.dev}These aren't part of the update count; check them whenever you like.
+                      {:else}Check now to see what's out of date. Nothing is installed until you choose to.{/if}
+                    {/if}
+                  </p>
+                {/if}
+              {:else}
+                {#each activeLines.filter(matchesFilter) as line}<div class="line" class:ok={line.startsWith("✔")} class:warn={line.startsWith("⚠")} class:bad={line.startsWith("✖")}>{line}</div>{/each}
+              {/if}
+            </div>
+            {#if activeUpgradeStatus === "running" && !activeHasItemSelection}
+              <footer class="source-foot">
+                <button class="btn btn-primary" disabled>Updating…</button>
+                {#if stoppable(activeSectionId)}
+                  <button class="btn btn-stop" onclick={() => stopUpgrade(activeSectionId)} disabled={!!stopping[activeSectionId]}>
+                    {stopping[activeSectionId] ? "Stopping…" : "■  Stop"}
+                  </button>
+                {/if}
+              </footer>
+            {:else if activeSection.dev && activeSection.upgradeCmd && activeStatus === "done" && activeHasOutdated}
+              <footer class="source-foot">
+                <button class="btn btn-primary" onclick={() => runUpgrade(activeSectionId)} disabled={activeUpgradeStatus === "running"}>
+                  {activeUpgradeStatus === "running" ? "Updating…" : "Update all"}
+                </button>
+                <code class="cmd">{activeSection.upgradeCmd}</code>
+              </footer>
+            {:else if !activeSection.dev && activeSection.upgradeCmd && activeStatus === "done" && activeHasOutdated && !activeHasItemSelection}
+              <footer class="source-foot">
+                <button class="btn btn-primary" onclick={() => runUpgrade(activeSectionId)} disabled={activeUpgradeStatus === "running"}>
+                  {activeUpgradeStatus === "running" ? "Updating…" : "Update all"}
+                </button>
+              </footer>
+            {/if}
+          {/if}
+        </section>
   {/if}
-  {/if}
+  </div>
 </main>
 
 <style>
   :global(*, *::before, *::after) { box-sizing: border-box; margin: 0; padding: 0; }
-  :global(html), :global(body) {
-    height: 100%;
-    overflow: hidden;
-  }
+  :global(html), :global(body) { height: 100%; overflow: hidden; }
   :global(body) {
     font-family: var(--pm-font);
+    font-size: 13px;
+    line-height: 1.45;
     background: var(--pm-surface);
     color: var(--pm-text-2);
+    -webkit-font-smoothing: antialiased;
   }
+  :global(button), :global(input), :global(select) { font: inherit; color: inherit; }
+  :global(:focus-visible) { outline: 2px solid var(--pm-accent); outline-offset: 2px; }
+  :global(button:focus:not(:focus-visible)) { outline: none; }
 
-  main { max-width: 860px; margin: 0 auto; padding: 2.1rem 1rem 1.5rem; display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
+  main { height: 100vh; display: flex; flex-direction: column; overflow: hidden; }
 
-  header {
+  /* ── Toolbar ─────────────────────────────────────────────────────────── */
+  .toolbar {
     display: flex;
     align-items: center;
-    column-gap: 0.75rem;
-    row-gap: 0.35rem;
-    margin-bottom: 1rem;
-    flex-wrap: wrap;
-    padding-bottom: 0.9rem;
-    border-bottom: 1px solid var(--pm-border);
-    position: relative;
-  }
-  header::after {
-    content: "";
-    position: absolute;
-    bottom: -1px;
-    left: 0;
-    width: 3rem;
-    height: 2px;
-    background: var(--pm-accent);
-    border-radius: 1px;
-  }
-
-  .title-block { display: flex; align-items: center; gap: 0.65rem; flex: 1; }
-  .app-icon { width: 36px; height: 36px; border-radius: var(--pm-radius); flex-shrink: 0; }
-  h1 { font-size: 1.4rem; font-weight: 700; color: var(--pm-text-bright); letter-spacing: -0.01em; }
-  .brand-bed { color: var(--pm-accent); }
-  .version { font-size: 0.75rem; color: var(--pm-label); font-weight: 500; }
-  .subtitle { font-size: 0.78rem; color: var(--pm-label); width: 100%; margin-top: 0.15rem; }
-
-
-  /* ── Main tab bar ── */
-  .tab-bar {
-    display: flex;
-    gap: 2px;
-    overflow-x: auto;
-    padding-bottom: 0;
-    scrollbar-width: none;
-    margin-top: -0.25rem;
-    margin-bottom: 0.5rem;
-  }
-  .tab-bar::-webkit-scrollbar { display: none; }
-
-  .tab {
-    display: flex;
-    align-items: center;
-    gap: 0.4rem;
-    padding: 0.55rem 0.9rem;
-    background: transparent;
-    border: none;
-    border-bottom: 2px solid transparent;
-    color: var(--pm-faint-2);
-    font-size: 0.82rem;
-    font-weight: 500;
-    cursor: pointer;
-    white-space: nowrap;
-    transition: color 0.15s, border-color 0.15s;
-    margin-bottom: -1px;
-  }
-  .tab:hover { color: var(--pm-text-dim); }
-  .tab.active { color: var(--pm-text); border-bottom-color: var(--pm-accent); }
-  .tab.running { color: var(--pm-info); }
-  .tab.done { color: var(--pm-faint); }
-  .tab.error { color: var(--pm-err); }
-
-  .tab-dot {
-    width: 6px;
-    height: 6px;
-    border-radius: 50%;
+    justify-content: center;
+    gap: 12px;
+    /* The standard unified-toolbar height; the traffic lights are moved to sit
+       centred in it (trafficLightPosition in tauri.conf.json). */
+    height: 52px;
     flex-shrink: 0;
-    transition: background 0.2s;
-  }
-
-  /* ── Dev sub-tab bar ── */
-  .sub-tab-bar {
-    display: flex;
-    gap: 2px;
-    overflow-x: auto;
+    /* Room for the traffic lights, which macOS draws over this strip; the same
+       on the right so the brand sits on the window's centre line. */
+    padding: 0 86px;
+    border-bottom: 1px solid var(--pm-border);
     background: var(--pm-surface-2);
-    border-bottom: 1px solid var(--pm-border);
-    padding: 0 0.5rem;
-    scrollbar-width: none;
-  }
-  .sub-tab-bar::-webkit-scrollbar { display: none; }
-
-  .sub-tab {
-    display: flex;
-    align-items: center;
-    gap: 0.4rem;
-    padding: 0.4rem 0.8rem;
-    background: transparent;
-    border: none;
-    border-bottom: 2px solid transparent;
-    color: var(--pm-label);
-    font-size: 0.78rem;
-    font-weight: 500;
-    cursor: pointer;
-    white-space: nowrap;
-    transition: color 0.15s, border-color 0.15s;
-    margin-bottom: -1px;
-  }
-  .sub-tab:hover { color: var(--pm-muted); }
-  .sub-tab.active { color: var(--pm-text-2); border-bottom-color: var(--pm-accent); }
-  .sub-tab.running { color: var(--pm-info); }
-  .sub-tab.done { color: var(--pm-faint-2); }
-  .sub-tab.error { color: var(--pm-err); }
-
-  /* ── Panel ── */
-  .panel {
-    background: var(--pm-card-2);
-    border: 1px solid var(--pm-border);
-    border-radius: var(--pm-radius-lg);
-    overflow: hidden;
-    transition: border-color 0.2s;
-    display: flex;
-    flex-direction: column;
-    flex: 1;
-    min-height: 0;
-    margin-bottom: 0;
-  }
-  .panel.running { border-color: var(--pm-info); }
-  .panel.done { border-color: var(--pm-ok-border); }
-  .panel.error { border-color: var(--pm-err-border); }
-
-  .panel-header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 1rem 1.25rem;
-    border-bottom: 1px solid var(--pm-border);
-    gap: 1rem;
-    flex-wrap: wrap;
-    background: var(--pm-card);
-  }
-
-  h2 { font-size: 1rem; font-weight: 600; color: var(--pm-text); }
-  .desc { font-size: 0.78rem; color: var(--pm-faint-2); margin-top: 0.2rem; }
-
-  .panel-actions { display: flex; gap: 0.5rem; align-items: center; flex-shrink: 0; }
-
-  .check-btn {
-    background: var(--pm-info);
-    color: white;
-    border: none;
-    border-radius: var(--pm-radius);
-    padding: 0.45rem 1rem;
-    font-size: 0.85rem;
-    font-weight: 600;
-    cursor: pointer;
-    transition: background 0.15s;
-  }
-  .check-btn:hover:not(:disabled) { background: var(--pm-info-hover); }
-  .check-btn:disabled { opacity: 0.5; cursor: not-allowed; }
-
-  .update-btn {
-    background: var(--pm-accent);
-    color: var(--pm-surface);
-    border: none;
-    border-radius: var(--pm-radius);
-    padding: 0.45rem 1rem;
-    font-size: 0.85rem;
-    font-weight: 600;
-    cursor: pointer;
-    transition: background 0.15s;
-  }
-  .update-btn:hover:not(:disabled) { background: var(--pm-accent-hover); }
-  .update-btn:disabled { opacity: 0.5; cursor: not-allowed; }
-
-  /* ── View toggle ── */
-  .view-toggle {
-    display: flex;
-    border: 1px solid var(--pm-border);
-    border-radius: var(--pm-radius-sm);
-    overflow: hidden;
-  }
-  .view-toggle button {
-    background: transparent;
-    border: none;
-    color: var(--pm-faint-2);
-    font-size: 0.78rem;
-    font-weight: 500;
-    padding: 0.3rem 0.65rem;
-    cursor: pointer;
-    transition: background 0.12s, color 0.12s;
-  }
-  .view-toggle button:hover { color: var(--pm-muted); }
-  .view-toggle button.active { background: var(--pm-border); color: var(--pm-text); }
-
-  /* ── Items checklist ── */
-  .items-list {
-    background: var(--pm-bg);
-    padding: 0.75rem 1.25rem 1rem;
-    flex: 1;
-    min-height: 0;
-    overflow-y: auto;
-  }
-
-  .items-bar {
-    display: flex;
-    align-items: center;
-    gap: 0.4rem;
-    margin-bottom: 0.45rem;
-  }
-
-  .update-prompt {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    flex-wrap: wrap;
-    margin: 0 0 14px;
-    padding: 9px 12px;
-    border-radius: var(--pm-radius);
-    background: rgba(90, 140, 220, 0.12);
-    border: 1px solid rgba(90, 140, 220, 0.32);
-    font-size: 12.5px;
-  }
-
-  .update-prompt-count { font-weight: 600; }
-
-  .twice-banner {
-    display: flex;
-    align-items: flex-start;
-    gap: 8px;
-    margin: 0 0 14px;
-    padding: 9px 12px;
-    border-radius: var(--pm-radius);
-    background: var(--pm-info-tint);
-    font-size: 0.82rem;
-  }
-  .twice-text ul { margin: 4px 0 0; padding-left: 18px; }
-
-  .update-prompt-later {
-    margin-left: 4px;
-    opacity: 0.7;
-  }
-
-  .update-prompt-install,
-  .update-prompt-snooze {
-    font: inherit;
-    font-size: 12px;
-    padding: 4px 11px;
-    border-radius: var(--pm-radius);
-    cursor: pointer;
-    border: 1px solid rgba(128, 128, 128, 0.35);
-    background: transparent;
-    color: inherit;
-  }
-
-  .update-prompt-install {
-    font-weight: 600;
-    border-color: transparent;
-    background: rgba(90, 140, 220, 0.9);
-    color: var(--pm-on-accent);
-  }
-
-  .update-prompt-install:hover { background: rgba(90, 140, 220, 1); }
-  .update-prompt-snooze:hover { background: rgba(128, 128, 128, 0.14); }
-
-  .whats-new { max-width: 40rem; }
-
-  .whats-new-heading {
-    font-size: 0.82rem;
-    font-weight: 700;
-    color: var(--pm-text);
-    margin: 1.1rem 0 0.4rem;
-  }
-
-  .whats-new-heading:first-child { margin-top: 0; }
-
-  .whats-new-text,
-  .whats-new-bullet {
-    font-size: 0.8rem;
-    line-height: 1.65;
-    color: var(--pm-muted);
-    margin: 0.25rem 0;
-  }
-
-  .whats-new-bullet { padding-left: 1rem; text-indent: -0.65rem; }
-  .whats-new-text strong,
-  .whats-new-bullet strong { color: var(--pm-text); font-weight: 600; }
-  .whats-new-bullet::before { content: "• "; color: var(--pm-accent); }
-
-  .banner-notes-btn {
-    font: inherit;
-    font-size: 0.72rem;
-    padding: 3px 10px;
-    border-radius: var(--pm-radius-sm);
-    border: 1px solid var(--pm-border-strong);
-    background: transparent;
-    color: inherit;
-    cursor: pointer;
-  }
-
-  .banner-notes-btn:hover { background: var(--pm-hover); }
-
-  .schedule-error {
-    margin: 0 0 14px;
-    padding: 10px 12px;
-    border-radius: var(--pm-radius);
-    background: rgba(220, 60, 60, 0.12);
-    border: 1px solid rgba(220, 60, 60, 0.35);
-    font-size: 12.5px;
-    line-height: 1.45;
-  }
-
-  .schedule-select {
-    font: inherit;
-    font-size: 13px;
-    padding: 5px 8px;
-    border-radius: var(--pm-radius-sm);
-    border: 1px solid var(--pm-border-strong);
-    background: var(--pm-card);
-    color: var(--pm-text);
-  }
-
-  /* The opened menu is drawn by macOS, not the page, so its rows have to carry
-     their own colours or they inherit ones meant for the app's background. */
-  .schedule-select option {
-    background: var(--pm-card);
-    color: var(--pm-text);
-  }
-
-  .schedule-select:disabled { opacity: 0.5; }
-
-  .schedule-number { width: 4.5rem; }
-
-  .schedule-breakdown {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 6px;
-    padding: 4px 0 2px;
-  }
-
-  .schedule-chip {
-    font-size: 11.5px;
-    padding: 3px 9px;
-    border-radius: 999px;
-    background: rgba(128, 128, 128, 0.14);
-    border: 1px solid rgba(128, 128, 128, 0.22);
-    white-space: nowrap;
-  }
-
-  .menu-item-badge {
-    margin-left: auto;
-    font-size: 10.5px;
-    letter-spacing: 0.04em;
-    text-transform: uppercase;
-    padding: 2px 7px;
-    border-radius: 999px;
-    background: rgba(80, 170, 110, 0.18);
-    border: 1px solid rgba(80, 170, 110, 0.4);
-  }
-
-  .items-count {
-    font-size: 0.72rem;
-    color: var(--pm-label);
-    flex: 1;
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
-  }
-
-  .items-sel-btn {
-    background: transparent;
-    border: 1px solid var(--pm-border);
-    border-radius: var(--pm-radius-sm);
-    color: var(--pm-faint-2);
-    font-size: 0.68rem;
-    padding: 0.1rem 0.45rem;
-    cursor: pointer;
-    transition: color 0.1s, border-color 0.1s;
-  }
-  .items-sel-btn:hover { color: var(--pm-muted); border-color: var(--pm-border-strong); }
-
-  .item-row {
-    display: flex;
-    align-items: center;
-    gap: 0.55rem;
-    padding: 0.2rem 0;
-    cursor: pointer;
     user-select: none;
   }
-  .item-row input[type="checkbox"] {
-    accent-color: var(--pm-accent);
-    width: 13px;
-    height: 13px;
-    cursor: pointer;
-    flex-shrink: 0;
-  }
-  .item-name {
-    font-size: 0.8rem;
-    color: var(--pm-muted);
-    font-family: "SF Mono", "Fira Code", monospace;
-  }
-  .item-row:hover .item-name { color: var(--pm-text-hover); }
+  .brand { display: flex; align-items: center; gap: 10px; }
+  .brand-icon { width: 28px; height: 28px; border-radius: 7px; }
+  .brand-name { font-size: 15px; font-weight: 600; color: var(--pm-text-bright); letter-spacing: -0.01em; }
+  .brand-accent { color: var(--pm-accent); }
+  .brand-version { font-size: 12px; font-weight: 500; color: var(--pm-muted); margin-left: 2px; margin-top: 2px; }
 
-  /* ── Updates hint bar ── */
-  .updates-hint {
-    padding: 0.45rem 1.25rem;
-    background: var(--pm-bg-deep);
-    border-bottom: 1px solid var(--pm-border-accent);
-    font-size: 0.78rem;
-    color: var(--pm-faint-2);
-  }
-  .hint-link {
-    background: none;
-    border: none;
-    color: var(--pm-info);
-    font-size: inherit;
-    font-weight: 600;
-    cursor: pointer;
-    padding: 0;
-    text-decoration: underline;
-    text-underline-offset: 2px;
-  }
-  .hint-link:hover { color: var(--pm-link-hover); }
-
-  /* ── Output ── */
-  .output {
-    flex: 1;
-    background: var(--pm-bg);
-    padding: 1rem 1.25rem;
-    overflow-y: auto;
-    font-family: "SF Mono", "Fira Code", monospace;
-    font-size: 0.8rem;
-    line-height: 1.7;
-  }
-
-  .last-checked { font-size: 0.72rem; color: var(--pm-label); margin-top: 0.25rem; }
-  .empty { color: var(--pm-label); font-style: italic; font-family: inherit; font-size: 0.85rem; }
-  .line { white-space: pre-wrap; word-break: break-all; color: var(--pm-muted); }
-
-  /* ── App update banner ── */
-  .app-update-banner {
-    display: flex;
-    align-items: center;
-    gap: 0.6rem;
-    padding: 0.5rem 1rem;
-    background: var(--pm-ok-bg);
-    border: 1px solid var(--pm-ok-border);
+  /* ── Buttons ─────────────────────────────────────────────────────────── */
+  .btn {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 5px 12px;
     border-radius: var(--pm-radius);
-    font-size: 0.82rem;
-    color: var(--pm-ok);
-    margin-bottom: 0.5rem;
-  }
-  .banner-dl-btn {
-    background: var(--pm-ok);
-    color: var(--pm-ok-fg);
-    border: none;
-    border-radius: var(--pm-radius-sm);
-    padding: 0.22rem 0.7rem;
-    font-size: 0.78rem;
-    font-weight: 600;
-    cursor: pointer;
-    transition: background 0.12s;
-  }
-  .banner-dl-btn:hover { background: var(--pm-ok-hover); }
-  .banner-dismiss {
-    background: transparent;
-    border: none;
-    color: var(--pm-ok-dim);
-    font-size: 0.75rem;
-    cursor: pointer;
-    margin-left: auto;
-    padding: 0.1rem 0.25rem;
-    transition: color 0.1s;
-  }
-  .banner-dismiss:hover { color: var(--pm-ok); }
-
-  /* ── Hamburger + dropdown ── */
-  .menu-wrap {
-    position: absolute;
-    top: 0;
-    right: 0;
-    z-index: 30;
-  }
-
-  .hamburger {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    background: transparent;
-    border: 1px solid var(--pm-border);
-    border-radius: var(--pm-radius);
-    color: var(--pm-faint-2);
-    width: 36px;
-    height: 36px;
-    cursor: pointer;
-    transition: color 0.12s, border-color 0.12s, background 0.12s;
-  }
-  .hamburger:hover, .hamburger.active { color: var(--pm-text); border-color: var(--pm-border-strong); background: var(--pm-card); }
-
-  .menu-backdrop { position: fixed; inset: 0; z-index: 10; }
-
-  .dropdown {
-    position: absolute;
-    top: calc(100% + 2px);
-    right: 0;
-    z-index: 20;
-    background: var(--pm-card);
-    border: 1px solid var(--pm-border);
-    border-radius: var(--pm-radius-lg);
-    min-width: 210px;
-    padding: 0.35rem 0;
-    box-shadow: 0 8px 24px var(--pm-shadow);
-  }
-
-  .menu-item {
-    display: flex;
-    align-items: center;
-    width: 100%;
-    padding: 0.5rem 1rem;
-    background: transparent;
-    border: none;
-    color: var(--pm-text-hover);
-    font-size: 0.84rem;
-    font-weight: 500;
-    cursor: pointer;
-    text-align: left;
-    gap: 0.5rem;
-    transition: background 0.1s;
-  }
-  .menu-item:hover:not(:disabled) { background: var(--pm-hover); }
-  .menu-item:disabled { opacity: 0.5; cursor: not-allowed; }
-  .menu-item-primary { color: var(--pm-text); font-weight: 600; }
-  .menu-item-primary:hover:not(:disabled) { background: var(--pm-info-tint); }
-  .menu-item-label { flex: 1; }
-  .menu-sep { height: 1px; background: var(--pm-border); margin: 0.25rem 0; }
-
-  /* ── Shared page header (Settings, About) ── */
-  .page-header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 0.9rem 1.25rem;
-    border-bottom: 1px solid var(--pm-border);
-    background: var(--pm-card);
-  }
-  .page-header h2 { font-size: 0.95rem; font-weight: 600; color: var(--pm-text); }
-  .page-close {
-    background: transparent;
-    border: none;
-    color: var(--pm-label);
-    font-size: 0.85rem;
-    cursor: pointer;
-    padding: 0.2rem 0.4rem;
-    border-radius: var(--pm-radius-sm);
-    transition: color 0.1s, background 0.1s;
-  }
-  .page-close:hover { color: var(--pm-text); background: var(--pm-border); }
-
-  /* ── Settings page ── */
-  .settings-panel {
-    background: var(--pm-card-2);
-    border: 1px solid var(--pm-border);
-    border-radius: var(--pm-radius-lg);
-    display: flex;
-    flex-direction: column;
-    flex: 1;
-    min-height: 0;
-    overflow: hidden;
-  }
-  .settings-body { padding: 1.25rem; overflow-y: auto; flex: 1; }
-  .settings-section { margin-bottom: 1.5rem; }
-  .settings-section-title {
-    font-size: 0.7rem;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.07em;
-    color: var(--pm-label);
-    margin-bottom: 0.75rem;
-  }
-  .settings-row {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 1.5rem;
-    padding: 0.75rem 1rem;
-    background: var(--pm-card);
-    border: 1px solid var(--pm-border);
-    border-radius: var(--pm-radius);
-    cursor: pointer;
-  }
-  .settings-row-info { display: flex; flex-direction: column; gap: 0.15rem; }
-  .settings-row-label { font-size: 0.84rem; color: var(--pm-text-2); font-weight: 500; }
-  .settings-row-desc { font-size: 0.72rem; color: var(--pm-label); }
-  .settings-row input[type="checkbox"] { accent-color: var(--pm-accent); cursor: pointer; width: 16px; height: 16px; flex-shrink: 0; }
-
-  .settings-check-btn {
-    background: var(--pm-info);
-    color: white;
-    border: none;
-    border-radius: var(--pm-radius-sm);
-    padding: 0.35rem 0.85rem;
-    font-size: 0.78rem;
-    font-weight: 600;
-    cursor: pointer;
-    white-space: nowrap;
-    flex-shrink: 0;
-    transition: background 0.15s;
-  }
-  .settings-check-btn:hover:not(:disabled) { background: var(--pm-info-hover); }
-  .settings-check-btn:disabled { opacity: 0.5; cursor: not-allowed; }
-
-  /* ── About page ── */
-  .about-panel {
-    background: var(--pm-card-2);
-    border: 1px solid var(--pm-border);
-    border-radius: var(--pm-radius-lg);
-    display: flex;
-    flex-direction: column;
-    flex: 1;
-    min-height: 0;
-    overflow: hidden;
-  }
-  .about-body {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    gap: 0.5rem;
-    flex: 1;
-    padding: 2rem 1.5rem;
-    text-align: center;
-  }
-  .about-icon { width: 72px; height: 72px; border-radius: var(--pm-radius-lg); margin-bottom: 0.5rem; }
-  .about-app-name { font-size: 1.25rem; font-weight: 700; color: var(--pm-text-bright); }
-  .about-app-version { font-size: 0.78rem; color: var(--pm-label); }
-  .about-app-desc { font-size: 0.82rem; color: var(--pm-faint-2); max-width: 360px; line-height: 1.6; margin: 0.5rem 0; }
-  .about-actions { display: flex; gap: 0.5rem; margin-top: 0.5rem; }
-  .about-action-btn {
-    background: transparent;
-    border: 1px solid var(--pm-border);
-    border-radius: var(--pm-radius);
-    color: var(--pm-muted);
-    font-size: 0.82rem;
-    font-weight: 500;
-    padding: 0.4rem 1rem;
-    cursor: pointer;
-    transition: color 0.12s, border-color 0.12s, background 0.12s;
-  }
-  .about-action-btn:hover { color: var(--pm-text); border-color: var(--pm-border-strong); background: var(--pm-card); }
-  .about-credits {
-    margin-top: 0.9rem;
-    padding-top: 0.9rem;
-    border-top: 1px solid var(--pm-border);
-    font-size: 0.72rem;
-    line-height: 1.6;
-    color: var(--pm-label);
-    max-width: 30rem;
-  }
-
-  .about-link {
-    font: inherit;
-    color: var(--pm-accent);
-    background: none;
-    border: none;
-    padding: 0;
-    cursor: pointer;
-    text-decoration: underline;
-  }
-
-  .about-license { font-size: 0.68rem; color: var(--pm-border); margin-top: 1rem; }
-
-  /* ── View switcher (Updates / History toggle) ── */
-  .view-switcher {
-    display: flex;
-    border: 1px solid var(--pm-border);
-    border-radius: var(--pm-radius);
-    overflow: hidden;
-    flex-shrink: 0;
-  }
-  .view-switcher button {
-    background: transparent;
-    border: none;
-    color: var(--pm-faint-2);
-    font-size: 0.82rem;
-    font-weight: 500;
-    padding: 0.4rem 1rem;
-    cursor: pointer;
-    transition: background 0.12s, color 0.12s;
-  }
-  .view-switcher button:hover { color: var(--pm-text-dim); }
-  .view-switcher button.active { background: var(--pm-border); color: var(--pm-text); }
-
-
-  /* ── History panel ── */
-  .history-panel {
-    background: var(--pm-card-2);
-    border: 1px solid var(--pm-border);
-    border-radius: var(--pm-radius-lg);
-    display: flex;
-    flex-direction: column;
-    flex: 1;
-    min-height: 0;
-    overflow: hidden;
-  }
-
-  .history-header {
-    display: flex;
-    align-items: center;
-    gap: 1rem;
-    padding: 0.9rem 1.25rem;
-    border-bottom: 1px solid var(--pm-border);
-    background: var(--pm-card);
-    flex-wrap: wrap;
-  }
-  .history-header h2 { font-size: 0.95rem; font-weight: 600; color: var(--pm-text); flex-shrink: 0; }
-  .history-sub { font-size: 0.72rem; color: var(--pm-label); font-weight: 400; margin-left: 0.4rem; }
-
-  .history-search {
-    flex: 1;
-    min-width: 180px;
-    background: var(--pm-bg);
-    border: 1px solid var(--pm-border);
-    border-radius: var(--pm-radius-sm);
-    color: var(--pm-text-2);
-    font-size: 0.82rem;
-    padding: 0.3rem 0.65rem;
-    outline: none;
-    transition: border-color 0.15s;
-  }
-  .history-search:focus { border-color: var(--pm-info); }
-  .history-search::placeholder { color: var(--pm-label); }
-
-  .history-list {
-    flex: 1;
-    overflow-y: auto;
-    padding: 0.5rem 0;
-  }
-
-  .history-entry {
-    border-bottom: 1px solid var(--pm-card);
-  }
-
-  .history-entry-header {
-    display: flex;
-    align-items: flex-start;
-    gap: 0.75rem;
-    padding: 0.65rem 1.25rem;
-    cursor: pointer;
-    transition: background 0.1s;
-    background: transparent;
-    border: none;
-    width: 100%;
-    text-align: left;
-    color: inherit;
-  }
-  .history-entry-header:hover { background: var(--pm-card); }
-
-  .history-meta {
-    display: flex;
-    flex-direction: column;
-    gap: 0.15rem;
-    min-width: 130px;
-    flex-shrink: 0;
-  }
-  .history-label {
-    font-size: 0.78rem;
-    font-weight: 600;
-    color: var(--pm-accent);
-  }
-  .history-time {
-    font-size: 0.68rem;
-    color: var(--pm-label);
-  }
-
-  .history-items {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 0.3rem;
-    flex: 1;
-    align-items: center;
-  }
-
-  .history-item-chip {
-    background: var(--pm-bg);
-    border: 1px solid var(--pm-border);
-    border-radius: var(--pm-radius-sm);
-    padding: 0.1rem 0.45rem;
-    font-size: 0.72rem;
-    font-family: "SF Mono", "Fira Code", monospace;
-    color: var(--pm-muted);
-  }
-  .history-item-bulk {
-    color: var(--pm-label);
-    font-style: italic;
-    font-family: inherit;
-  }
-
-  .history-expand {
-    font-size: 0.6rem;
-    color: var(--pm-label);
-    flex-shrink: 0;
-    align-self: center;
-  }
-
-  .history-output {
-    padding: 0.5rem 1.25rem 0.75rem 2.5rem;
-    background: var(--pm-bg);
-    font-family: "SF Mono", "Fira Code", monospace;
-    font-size: 0.75rem;
-    line-height: 1.7;
-    border-top: 1px solid var(--pm-card);
-  }
-
-  /* ── Untracked apps find/track row ── */
-  .untracked-row { justify-content: space-between; }
-
-  .cask-search-state {
-    display: flex;
-    align-items: center;
-    gap: 0.35rem;
-    flex-shrink: 0;
-  }
-
-  .find-cask-btn {
-    background: transparent;
-    border: 1px solid var(--pm-border);
-    border-radius: var(--pm-radius-sm);
-    color: var(--pm-faint-2);
-    font-size: 0.68rem;
-    padding: 0.1rem 0.5rem;
-    cursor: pointer;
-    transition: color 0.1s, border-color 0.1s;
-  }
-  .find-cask-btn:hover { color: var(--pm-muted); border-color: var(--pm-border-strong); }
-
-  .cask-status-text {
-    font-size: 0.7rem;
-    color: var(--pm-label);
-    font-style: italic;
-  }
-  .cask-unsure { opacity: 0.85; }
-
-  .cask-input {
-    font: inherit;
-    font-size: 11.5px;
-    padding: 4px 8px;
-    min-width: 15rem;
-    border-radius: var(--pm-radius-sm);
     border: 1px solid var(--pm-border-strong);
     background: var(--pm-card);
     color: var(--pm-text);
-  }
-
-  .cask-input.bad { border-color: var(--pm-err); }
-
-  .items-hint {
-    font-size: 11.5px;
-    color: var(--pm-muted);
-    text-decoration: underline dotted;
-    cursor: help;
-  }
-
-  .section-note {
-    font-size: 11.5px;
-    line-height: 1.55;
-    color: var(--pm-muted);
-    padding: 0.5rem 0.75rem;
-    margin: 0 0 0.5rem;
-    border-left: 2px solid var(--pm-border-strong);
-    background: var(--pm-surface-2);
-    border-radius: 0 var(--pm-radius-sm) var(--pm-radius-sm) 0;
-  }
-
-  .section-note strong { color: var(--pm-text-2); }
-
-  .cask-link-btn {
-    font: inherit;
-    font-size: 11.5px;
-    padding: 3px 8px;
-    border-radius: var(--pm-radius-sm);
-    border: 1px solid transparent;
-    background: none;
-    color: var(--pm-muted);
-    cursor: pointer;
-    white-space: nowrap;
-  }
-
-  .cask-link-btn:hover { color: var(--pm-text); border-color: var(--pm-border-strong); }
-  .cask-picker { max-width: 13rem; }
-
-  .cask-none { color: var(--pm-cask-none); }
-
-  .cask-match {
-    font-size: 0.7rem;
-    color: var(--pm-ok);
     font-weight: 500;
-  }
-
-  .track-btn {
-    background: var(--pm-accent);
-    color: var(--pm-surface);
-    border: none;
-    border-radius: var(--pm-radius-sm);
-    padding: 0.12rem 0.55rem;
-    font-size: 0.68rem;
-    font-weight: 600;
     cursor: pointer;
-    transition: background 0.12s;
-  }
-  .track-btn:hover:not(:disabled) { background: var(--pm-accent-hover); }
-  .track-btn:disabled { opacity: 0.5; cursor: not-allowed; }
-
-  /* ── Panel info column ── */
-  .panel-info { display: flex; flex-direction: column; flex: 1; min-width: 0; }
-
-  /* ── Command bar ── */
-  .cmd-bar {
-    display: inline-flex;
-    align-items: center;
-    gap: 0.4rem;
-    margin-top: 0.55rem;
-    background: var(--pm-bg);
-    border: 1px solid var(--pm-border);
-    border-radius: var(--pm-radius-sm);
-    padding: 0.28rem 0.28rem 0.28rem 0.6rem;
-    align-self: flex-start;
-    max-width: 100%;
-  }
-
-  .cmd-text {
-    font-family: "SF Mono", "Fira Code", monospace;
-    font-size: 0.71rem;
-    color: var(--pm-link-hover);
     white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
+    transition: background 0.12s, border-color 0.12s, color 0.12s;
   }
+  .btn:hover:not(:disabled) { background: var(--pm-hover); }
+  .btn:disabled { opacity: 0.45; cursor: default; }
+  .btn-primary { background: var(--pm-accent); border-color: transparent; color: var(--pm-on-accent); font-weight: 600; }
+  .btn-primary:hover:not(:disabled) { background: var(--pm-accent-hover); }
+  .btn-plain { background: transparent; border-color: transparent; color: var(--pm-muted); }
+  .btn-plain:hover:not(:disabled) { color: var(--pm-text); background: var(--pm-hover); }
+  .btn-small { padding: 2px 9px; font-size: 12px; }
+  .btn.shortcut { font-family: ui-monospace, "SF Mono", Menlo, monospace; min-width: 76px; letter-spacing: 0.04em; }
+  .btn.shortcut.recording { border-color: var(--pm-accent); color: var(--pm-accent); }
+  .section-hint.error { color: var(--pm-err); }
+  .btn-stop { background: var(--pm-err); border-color: transparent; color: #fff; font-weight: 600; }
+  .btn-stop:hover:not(:disabled) { background: var(--pm-err); filter: brightness(1.12); }
+  .link { background: none; border: none; padding: 0; color: var(--pm-accent); cursor: pointer; text-decoration: underline; text-underline-offset: 2px; }
+  .dismiss { background: none; border: none; color: var(--pm-muted); cursor: pointer; margin-left: auto; padding: 2px 6px; border-radius: var(--pm-radius-sm); }
+  .dismiss:hover { color: var(--pm-text); background: var(--pm-hover); }
 
-  .cmd-copy {
-    background: transparent;
-    border: none;
-    color: var(--pm-label);
-    cursor: pointer;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    padding: 0.22rem;
-    border-radius: var(--pm-radius-sm);
-    transition: color 0.12s, background 0.12s;
-    flex-shrink: 0;
+  /* ── Strips (app update, installed twice, errors) ────────────────────── */
+  .strip {
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    margin: 10px 14px 0;
+    padding: 8px 12px;
+    border-radius: var(--pm-radius);
+    background: var(--pm-info-tint);
+    border: 1px solid var(--pm-border);
   }
-  .cmd-copy:hover { color: var(--pm-link-hover); background: var(--pm-info-tint); }
+  .strip ul { margin: 4px 0 0 18px; }
+  .strip-ok { background: var(--pm-ok-bg); border-color: var(--pm-ok-border); }
+  .strip-warn { border-color: var(--pm-accent); }
+  .strip-err { background: var(--pm-err-bg); border-color: var(--pm-err-border); }
 
+  /* ── Split: sidebar + content ────────────────────────────────────────── */
+  .split { flex: 1; min-height: 0; display: flex; }
+
+  .sidebar {
+    width: 254px; flex-shrink: 0;
+    display: flex; flex-direction: column;
+    overflow-y: auto;
+    padding: 12px 8px;
+    border-right: 1px solid var(--pm-border);
+    background: var(--pm-surface-2);
+  }
+  .summary { padding: 4px 8px 14px; margin-bottom: 6px; border-bottom: 1px solid var(--pm-border); }
+  .summary-count { display: flex; align-items: baseline; gap: 6px; color: var(--pm-text-bright); }
+  .num { font-size: 26px; font-weight: 600; letter-spacing: -0.02em; font-variant-numeric: tabular-nums; line-height: 1.1; }
+  .num-label { font-size: 14px; font-weight: 500; color: var(--pm-text-2); }
+  .summary-count.ok { align-items: center; }
+  .tick { color: var(--pm-ok); font-size: 18px; font-weight: 700; }
+  .summary-actions { display: flex; align-items: center; gap: 6px; margin-top: 10px; }
+  .summary-note { color: var(--pm-muted); margin-top: 2px; font-size: 12px; }
+
+  .snooze { position: relative; margin: 6px 0 0 -9px; }
+  .snooze-backdrop { position: fixed; inset: 0; z-index: 10; }
+  .snooze-menu {
+    position: absolute; top: calc(100% + 4px); left: 0; z-index: 20;
+    display: flex; flex-direction: column; min-width: 160px;
+    padding: 4px; border-radius: var(--pm-radius);
+    background: var(--pm-card); border: 1px solid var(--pm-border-strong);
+    box-shadow: 0 8px 24px var(--pm-shadow);
+  }
+  .snooze-title { padding: 4px 10px 2px; font-size: 11px; color: var(--pm-muted); }
+  .snooze-menu button { text-align: left; border: none; background: none; padding: 5px 10px; border-radius: var(--pm-radius-sm); cursor: pointer; }
+  .snooze-menu button:hover { background: var(--pm-hover); }
+
+  .group-title { margin: 14px 8px 4px; font-size: 11.5px; font-weight: 600; color: var(--pm-muted); }
+  .sidebar-foot {
+    margin-top: auto; padding-top: 8px;
+    border-top: 1px solid var(--pm-border);
+    display: flex; flex-direction: column; gap: 1px;
+  }
+  .sources { list-style: none; display: flex; flex-direction: column; gap: 1px; }
+  .source {
+    display: flex; align-items: center; gap: 8px; width: 100%;
+    padding: 5px 7px; border: none; border-radius: var(--pm-radius-sm);
+    background: transparent; color: var(--pm-text-2); text-align: left; cursor: pointer;
+  }
+  .source:hover { background: var(--pm-hover); }
+  .source.active { background: var(--pm-card-2); color: var(--pm-text-bright); box-shadow: inset 0 0 0 1px var(--pm-border); }
+  .source-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .count {
+    min-width: 20px; padding: 1px 6px; border-radius: 999px; text-align: center; flex-shrink: 0;
+    font-size: 11.5px; font-weight: 600; font-variant-numeric: tabular-nums;
+    background: var(--pm-accent); color: var(--pm-on-accent);
+  }
+  .count.quiet { background: var(--pm-border); color: var(--pm-text-2); }
+  .count.zero { background: transparent; color: var(--pm-ok); }
+  .count.none { background: transparent; color: var(--pm-faint); font-weight: 400; }
+  .count.err { background: var(--pm-err); color: var(--pm-text-bright); }
+  .spinner {
+    width: 12px; height: 12px; border-radius: 50%;
+    border: 2px solid var(--pm-border-strong); border-top-color: var(--pm-accent);
+    animation: spin 0.8s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  .content { flex: 1; min-width: 0; display: flex; flex-direction: column; background: var(--pm-surface); }
+  .source-head {
+    display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; flex-wrap: wrap;
+    padding: 14px 18px 12px;
+    border-bottom: 1px solid var(--pm-border);
+  }
+  .source-title { flex: 1 1 240px; min-width: 0; }
+  h2 { font-size: 16px; font-weight: 600; color: var(--pm-text-bright); letter-spacing: -0.01em; }
+  .source-status { margin-top: 2px; color: var(--pm-muted); }
+  .source-status.err { color: var(--pm-err); }
+  .source-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; margin-left: auto; }
+
+  .segmented { display: flex; gap: 2px; padding: 2px; border-radius: var(--pm-radius); background: var(--pm-bg); }
+  .segmented button {
+    border: none; background: transparent; color: var(--pm-muted);
+    padding: 3px 10px; border-radius: calc(var(--pm-radius) - 2px); cursor: pointer; font-size: 12px; font-weight: 500;
+  }
+  .segmented button:hover { color: var(--pm-text); }
+  .segmented button.active { background: var(--pm-card-2); color: var(--pm-text); }
+
+  .list { flex: 1; min-height: 0; overflow-y: auto; padding: 6px 10px; }
+  .list-bar { display: flex; align-items: center; gap: 6px; padding: 10px 18px 0; }
+  .list-count { color: var(--pm-muted); margin-right: auto; }
+  .item {
+    display: flex; align-items: center; gap: 10px;
+    padding: 6px 8px; border-radius: var(--pm-radius-sm);
+    cursor: pointer; user-select: none;
+  }
+  .item:hover { background: var(--pm-card); }
+  .item input[type="checkbox"] { accent-color: var(--pm-accent); width: 14px; height: 14px; flex-shrink: 0; cursor: pointer; }
+  .item-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--pm-text); }
+  .item-ver { flex-shrink: 0; color: var(--pm-muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+  .item-tag { flex-shrink: 0; font-size: 11px; padding: 1px 7px; border-radius: 999px; background: var(--pm-border); color: var(--pm-text-2); }
+  .item-ignore { opacity: 0; }
+  .item:hover .item-ignore, .item-ignore:focus-visible { opacity: 1; }
+  .item-ignored { cursor: default; color: var(--pm-muted); }
+  .item-ignored .item-name { color: var(--pm-muted); }
+  .ignored-group { margin-top: 8px; padding-top: 6px; border-top: 1px dashed var(--pm-border); }
+  .item-untracked { cursor: default; }
+  .item-side { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
+  .item-note { font-size: 12px; color: var(--pm-muted); }
+  .item-note.ok { color: var(--pm-ok); font-family: "SF Mono", Menlo, monospace; font-size: 11.5px; }
+
+  .source-foot {
+    display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+    padding: 10px 18px;
+    border-top: 1px solid var(--pm-border);
+    background: var(--pm-surface-2);
+  }
+  .foot-note { font-size: 12px; color: var(--pm-muted); margin-left: auto; }
+  .cmd { font-family: "SF Mono", Menlo, monospace; font-size: 12px; color: var(--pm-muted); margin-left: 4px; }
+
+  .output {
+    flex: 1; min-height: 0; overflow-y: auto;
+    padding: 12px 18px;
+    background: var(--pm-bg);
+    font-family: "SF Mono", Menlo, monospace;
+    font-size: 12px; line-height: 1.65;
+  }
+  .line { white-space: pre-wrap; word-break: break-word; color: var(--pm-muted); }
+  .line.ok { color: var(--pm-ok); }
+  .line.warn { color: var(--pm-text); }
+  .line.bad { color: var(--pm-err); }
+  .empty { font-family: var(--pm-font); font-size: 13px; color: var(--pm-muted); max-width: 44ch; padding: 6px 8px; }
+
+  /* ── Pages: History, Settings, What's new ────────────────────────────── */
+  .page { flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; }
+  .page-head {
+    display: flex; align-items: center; gap: 12px;
+    padding: 14px 18px 12px;
+    border-bottom: 1px solid var(--pm-border);
+  }
+  .page-head h2 { flex: 1; }
+  .page-sub { font-size: 12px; font-weight: 400; color: var(--pm-muted); margin-left: 6px; }
+  .page-body { flex: 1; min-height: 0; overflow-y: auto; }
+  .search {
+    width: 220px; padding: 4px 9px;
+    border-radius: var(--pm-radius); border: 1px solid var(--pm-border-strong);
+    background: var(--pm-bg); color: var(--pm-text);
+  }
+  .search:focus { outline: none; border-color: var(--pm-accent); }
+  .search::placeholder { color: var(--pm-faint); }
+  .search.filter { width: 150px; padding: 4px 9px; }
+
+  .history { padding: 4px 0; }
+  .run { border-bottom: 1px solid var(--pm-border); }
+  .run-row, .run-item-row {
+    display: flex; align-items: center; gap: 12px; width: 100%;
+    border: none; background: transparent; text-align: left; cursor: pointer; color: inherit;
+  }
+  .run-row { padding: 9px 18px; }
+  .run-row:hover, .run-item-row:hover { background: var(--pm-card); }
+  .history-when { width: 128px; flex-shrink: 0; color: var(--pm-muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+  .run-what { flex: 1; min-width: 0; display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px; }
+  .history-source { color: var(--pm-text); font-weight: 500; }
+  .run-summary { color: var(--pm-muted); font-size: 12px; }
+  .mark { width: 16px; flex-shrink: 0; text-align: center; font-weight: 700; color: var(--pm-muted); }
+  .mark.ok { color: var(--pm-ok); }
+  .mark.bad { color: var(--pm-err); }
+  .mark.mixed { color: var(--pm-accent); }
+  .history-caret { color: var(--pm-muted); font-size: 13px; flex-shrink: 0; width: 12px; text-align: center; }
+  .run-body { padding: 0 0 6px 146px; background: var(--pm-surface-2); border-top: 1px solid var(--pm-border); }
+  .run-item-row { padding: 6px 18px 6px 6px; font-size: 12.5px; }
+  .run-item-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--pm-text); }
+  .run-item-ver { color: var(--pm-muted); font-variant-numeric: tabular-nums; }
+  .run-item-note { color: var(--pm-err); font-size: 12px; }
+  .run-item-note.quiet { color: var(--pm-muted); }
+  .history-output { flex: none; margin: 0 18px 6px 0; border-radius: var(--pm-radius-sm); border: 1px solid var(--pm-border); padding: 8px 12px; }
+  .raw-toggle { margin-top: 6px; font-family: var(--pm-font); }
+
+  .settings { padding: 6px 18px 24px; }
+  .settings section { padding: 14px 0 6px; }
+  .settings section + section { border-top: 1px solid var(--pm-border); }
+  .settings h3 { font-size: 13px; font-weight: 600; color: var(--pm-text-bright); margin-bottom: 8px; }
+  .section-hint { color: var(--pm-muted); margin: -4px 0 10px; max-width: 60ch; }
+  .row {
+    display: flex; align-items: center; justify-content: space-between; gap: 16px;
+    padding: 9px 0;
+  }
+  .row + .row { border-top: 1px solid var(--pm-border); }
+  label.row { cursor: pointer; }
+  .row-text { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+  .row-label { color: var(--pm-text); font-weight: 500; }
+  .row-desc { font-size: 12px; color: var(--pm-muted); }
+  .row-controls { display: flex; gap: 6px; flex-shrink: 0; }
+  .row input[type="checkbox"] { accent-color: var(--pm-accent); width: 16px; height: 16px; flex-shrink: 0; cursor: pointer; }
+  .select {
+    padding: 4px 8px; border-radius: var(--pm-radius-sm);
+    border: 1px solid var(--pm-border-strong); background: var(--pm-card); color: var(--pm-text);
+  }
+  /* The opened menu is drawn by macOS, not the page, so its rows carry their own colours. */
+  .select option { background: var(--pm-card); color: var(--pm-text); }
+  .select:disabled { opacity: 0.5; }
+  .minutes { width: 4.2rem; }
+
+  .about { display: flex; gap: 14px; align-items: flex-start; padding: 12px 0 0; color: var(--pm-muted); }
+  .about-icon { width: 44px; height: 44px; border-radius: 10px; flex-shrink: 0; }
+  .about p + p { margin-top: 6px; }
+  .about strong { color: var(--pm-text); }
+  .about-links { display: flex; gap: 14px; }
+  .about-fine { font-size: 12px; color: var(--pm-muted); }
+
+  .prose { padding: 14px 18px 24px; max-width: 60ch; color: var(--pm-text-2); }
+  .prose h3 { font-size: 13px; font-weight: 600; color: var(--pm-text-bright); margin: 14px 0 6px; }
+  .prose h3:first-child { margin-top: 0; }
+  .prose p { margin: 4px 0; line-height: 1.6; }
+  .prose .bullet { padding-left: 14px; text-indent: -10px; }
+  .prose .bullet::before { content: "• "; color: var(--pm-accent); }
+  .prose strong { color: var(--pm-text); }
+
+  @media (prefers-reduced-motion: reduce) {
+    .spinner { animation: none; border-top-color: var(--pm-accent); }
+    .btn, .segmented button { transition: none; }
+  }
 </style>
