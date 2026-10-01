@@ -28,6 +28,7 @@ pub const CHECKED_SECTIONS: &[&str] = &[
     "pip_packages",
     "ruby_rvm",
     "ruby_rbenv",
+    "asdf",
 ];
 
 // `default` at the container level so a config written by an older version, or
@@ -753,6 +754,7 @@ pub const DEV_SECTIONS: &[&str] = &[
     "pip_packages",
     "ruby_rvm",
     "ruby_rbenv",
+    "asdf",
 ];
 
 /// Which sections a run covers.
@@ -794,6 +796,7 @@ pub async fn run_checks(app: &AppHandle, scope: CheckScope) -> ScheduleConfig {
         _ => (load(app).last_counts, load_last_check(app)),
     };
     last.ts = now;
+    crate::tray_checking(app, true);
     for section in sections_for(scope).filter(|s| show_dev || !DEV_SECTIONS.contains(s)) {
         let section_started = std::time::Instant::now();
         let lines = crate::run_check_collect(section).await;
@@ -808,6 +811,7 @@ pub async fn run_checks(app: &AppHandle, scope: CheckScope) -> ScheduleConfig {
         last.section_ts.insert(section.to_string(), now);
     }
     save_last_check(app, &last);
+    crate::tray_checking(app, false);
     let mut cfg = load(app);
     cfg.last_run = now;
     cfg.last_total = total_from_counts(&counts);
@@ -996,14 +1000,6 @@ pub async fn run_scheduled(app: &AppHandle) -> ScheduleConfig {
 /// Re-checks a single section after it has been upgraded, so the count reflects
 /// what is now installed rather than what was outstanding before. Cheaper than a
 /// full run, which is why it can happen after every install.
-pub async fn recount(app: &AppHandle, section: &str) -> ScheduleConfig {
-    if !CHECKED_SECTIONS.contains(&section) {
-        return load(app);
-    }
-    let lines = crate::run_check_collect(section).await;
-    record_section(app, section, lines)
-}
-
 /// Records what one section's check found: its count, the total, and the output
 /// the app preloads next time. Used after an upgrade and whenever the user runs a
 /// check, so Check All and Run Check move the count as well as a scheduled run.

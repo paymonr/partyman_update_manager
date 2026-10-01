@@ -19,16 +19,53 @@ Options to evaluate:
 - [ ] Ship the app so it can appear in / request **App Management** permission
       (proper code signing + hardened runtime; confirm the bundle is attributed as the
       "responsible process" for the brew-spawned file operations).
-- [ ] Add a **first-run / onboarding check**: detect whether the app has App Management
+- [x] Add a **first-run / onboarding check**: detect whether the app has App Management
       or Full Disk Access, and if not, prompt the user to grant it before their first
       cask upgrade (with a button that opens
       `x-apple.systempreferences:com.apple.preference.security?Privacy_AppBundles`).
-- [ ] Document the requirement in the README / app Settings.
+      *(`app_management_status` tries to create and remove an empty file inside
+      an app the user owns and has opened; a strip on launch and a Settings →
+      General row with "Open System Settings" / "Check again". Probed at most once
+      a day while blocked. Verified on a fresh macOS 26 VM on 2026-10-01: a
+      same-mode chmod never reaches the policy and is allowed everywhere, so the
+      probe must really write; and macOS only protects a quarantined app after
+      Gatekeeper approved its first launch, so unopened apps say nothing.)*
+- [x] Document the requirement in the README / app Settings. *(README "First run";
+      Settings → General shows the live status.)*
 
 **References:**
 - Error handling: `src-tauri/src/lib.rs` → `brew_cask_upgrade_fn()` (the
   `Permission denied @ apply2files` / `Operation not permitted` branch).
 - Panes: App Management `?Privacy_AppBundles`, Full Disk Access `?Privacy_AllFiles`.
+
+## Set up Homebrew for people who don't have it
+
+**Done 2026-10-01:** `tooling_status` looks for `brew`, `jq` and `mas` at launch.
+Without Homebrew the app shows a strip and "Set up" on the sources that need
+it; `setup_homebrew` runs Homebrew's own installer (`NONINTERACTIVE=1`, the
+password through our askpass dialog, Command Line Tools installed by the script
+itself) and then `brew install jq mas`, streaming into a setup view and recorded
+in history. With Homebrew but a helper missing, "Install helpers" runs the same
+script, which skips the install.
+
+- [x] Tried on a fresh macOS 26.6.2 VM (`tart` VM `partyman-test`, from
+      Cirrus Labs' vanilla Tahoe image) on 2026-10-01: the strip, Set up
+      Homebrew, PartyMAN's own password dialog (after removing the image's
+      passwordless-sudo rule), Homebrew + jq + mas installed, the first checks
+      ran by themselves; and the App Management *blocked* state appeared,
+      was allowed in System Settings, and flipped to allowed. Not exercised:
+      the Command Line Tools download (the image already had them) and anything
+      App Store (Apple Accounts cannot sign in inside VMs).
+      Notes for next time: the image's `admin` has passwordless sudo
+      (`/etc/sudoers.d/admin-nopasswd`); apps launched with `open` from an SSH
+      session inherit sshd's Full Disk Access, so launch test apps from Finder.
+- [x] The UI side of the flow can be walked on any Mac: a debug build run with
+      `PM_PRETEND_NO_BREW=1 npm run tauri dev` believes Homebrew is missing until
+      one pretend setup has run (nothing is installed). Walked 2026-10-01: strip,
+      "Set up" rows, setup view, history entry, follow-up Check all.
+- [x] A non-administrator cannot install Homebrew: `tooling_status` reports
+      `admin` (`dseditgroup -o checkmember`), and the strip, the source pages and
+      Settings say an administrator has to do this step instead of offering it.
 
 ## Help users find a cask when the name doesn't match
 

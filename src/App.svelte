@@ -18,6 +18,9 @@
     upgradeCmd?: string;
     platform: "all" | "mac" | "linux" | "windows";
     dev?: boolean;
+    /** The tool this source needs. Apps sources show "Set up" without it; developer
+     *  tools are simply not listed. */
+    tool?: "brew" | "mas" | "npm" | "pip" | "rbenv" | "rvm" | "asdf";
   }
 
   interface CheckItem {
@@ -81,6 +84,8 @@
     entries: HistoryEntry[];
     ok: number;
     failed: number;
+    /** Password prompt dismissed: the user stopped it, nothing went wrong. */
+    cancelled: number;
     duration: number;
   }
 
@@ -98,6 +103,7 @@
       description: "Apps installed from the Mac App Store",
       upgradeCmd: "mas upgrade",
       platform: "mac",
+      tool: "mas",
     },
     {
       id: "brew_casks",
@@ -105,12 +111,14 @@
       description: "Apps installed with Homebrew",
       upgradeCmd: "brew upgrade --cask --greedy",
       platform: "mac",
+      tool: "brew",
     },
     {
       id: "untracked_apps",
       label: "Apps without auto-updates",
       description: "Apps that nothing keeps up to date",
       platform: "mac",
+      tool: "brew",
     },
     {
       id: "brew_formulae",
@@ -119,6 +127,7 @@
       upgradeCmd: "brew upgrade",
       platform: "mac",
       dev: true,
+      tool: "brew",
     },
     {
       id: "npm_globals",
@@ -127,11 +136,13 @@
       upgradeCmd: "npm update -g",
       platform: "all",
       dev: true,
+      tool: "npm",
     },
     {
       id: "pip_packages",
       label: "pip",
       description: "Python packages",
+      tool: "pip",
       upgradeCmd: "pip3 install --upgrade $(pip3 list --outdated --format=freeze | cut -d= -f1 | tr '\\n' ' ')",
       platform: "all",
       dev: true,
@@ -142,6 +153,7 @@
       description: "Ruby versions and gems managed by rbenv",
       platform: "all",
       dev: true,
+      tool: "rbenv",
     },
     {
       id: "ruby_rvm",
@@ -149,6 +161,16 @@
       description: "Ruby versions and gems managed by rvm",
       platform: "all",
       dev: true,
+      tool: "rvm",
+    },
+    {
+      id: "asdf",
+      label: "asdf",
+      description: "Runtimes managed by asdf — Node, Ruby, Python and the like",
+      upgradeCmd: "asdf install <plugin> latest",
+      platform: "all",
+      dev: true,
+      tool: "asdf",
     },
   ];
 
@@ -184,10 +206,12 @@
         // within the run, keep the order the apps were done in.
         last.entries.unshift(e);
       } else {
-        runs.push({ id: e.run_id, ts: e.ts, section: e.section, kind: e.kind, entries: [e], ok: 0, failed: 0, duration: 0 });
+        runs.push({ id: e.run_id, ts: e.ts, section: e.section, kind: e.kind, entries: [e], ok: 0, failed: 0, cancelled: 0, duration: 0 });
       }
       const run = runs[runs.length - 1];
-      if (e.outcome === "ok") run.ok += 1; else run.failed += 1;
+      if (e.outcome === "ok") run.ok += 1;
+      else if (e.outcome === "cancelled") run.cancelled += 1;
+      else run.failed += 1;
       run.duration = Math.max(run.duration, e.duration_secs);
     }
     return runs;
@@ -202,9 +226,12 @@
         ? "everything"
         : (things === 1 ? "update" : "updates");
     const count = noun === "everything" ? "everything" : `${things} ${noun}`;
-    const tally = run.failed === 0
+    const tally = run.failed === 0 && run.cancelled === 0
       ? "done"
-      : run.ok === 0 ? "failed" : `${run.ok} done, ${run.failed} failed`;
+      : run.ok === 0 && run.failed === 0 ? "cancelled"
+      : run.ok === 0 && run.cancelled === 0 ? "failed"
+      : [run.ok && `${run.ok} done`, run.failed && `${run.failed} failed`, run.cancelled && `${run.cancelled} cancelled`]
+          .filter(Boolean).join(", ");
     return `${count} · ${tally}${run.duration ? ` · ${fmtDuration(run.duration)}` : ""}`;
   }
 
@@ -215,7 +242,7 @@
   }
 
   function outcomeMark(outcome: string): string {
-    return outcome === "ok" ? "✓" : outcome === "partial" ? "◐" : "✖";
+    return outcome === "ok" ? "✓" : outcome === "partial" ? "◐" : outcome === "cancelled" ? "↩" : "✖";
   }
 
   function entryNames(e: HistoryEntry): string {
@@ -259,7 +286,103 @@
   }
 
 
-  type View = "updates" | "history" | "settings" | "whatsnew";
+  // Whether macOS lets PartyMAN replace apps in /Applications (App Management).
+  // Probed on launch, at most once a day while blocked, so the system's own
+  // "was prevented from modifying apps" alert is not raised at every start.
+  type AppMgmt = "unknown" | "allowed" | "blocked" | "checking";
+  const APP_MGMT_KEY = "appManagement";
+  let appMgmt: AppMgmt = "unknown";
+  let appMgmtDismissed = false;
+
+  async function probeAppManagement(force = false) {
+    try {
+      const saved = JSON.parse(localStorage.getItem(APP_MGMT_KEY) ?? "null") as { status: AppMgmt; at: number } | null;
+      const dayAgo = Date.now() - 24 * 60 * 60 * 1000;
+      if (!force && saved?.status === "blocked" && saved.at > dayAgo) {
+        appMgmt = "blocked";
+        return;
+      }
+      appMgmt = "checking";
+      const status = await invoke<AppMgmt>("app_management_status");
+      appMgmt = status;
+      localStorage.setItem(APP_MGMT_KEY, JSON.stringify({ status, at: Date.now() }));
+    } catch (e) {
+      console.error("Failed to check App Management:", e);
+      appMgmt = "unknown";
+    }
+  }
+
+  function openAppManagement() {
+    invoke("open_app_management_settings");
+  }
+
+  // Which tools are present. Homebrew is the one that matters; jq and mas are
+  // the helpers. null until the first look.
+  type Tooling = {
+    brew: boolean; jq: boolean; mas: boolean;
+    npm: boolean; pip: boolean; rbenv: boolean; rvm: boolean; asdf: boolean;
+    /** Whether this account can install Homebrew (its installer needs an administrator). */
+    admin: boolean;
+  };
+  let tooling: Tooling | null = null;
+  let setupRunning = false;
+  let setupDismissed = false;
+
+  async function loadTooling() {
+    try {
+      tooling = await invoke<Tooling>("tooling_status");
+    } catch (e) {
+      console.error("Failed to look for Homebrew:", e);
+    }
+  }
+
+  // Takes the tooling as an argument so a template that calls it re-renders
+  // when the result arrives; a reference inside the function would not count.
+  function toolReady(s: Section, t: Tooling | null): boolean {
+    if (!s.tool || !t) return true;
+    return t[s.tool];
+  }
+
+  // Homebrew's own installer, then the helpers; output streams into the setup
+  // view. Afterwards everything that was waiting on Homebrew is checked.
+  async function runSetup() {
+    if (setupRunning) return;
+    setupRunning = true;
+    outputs["setup"] = [];
+    outputs = outputs;
+    view = "setup";
+    try {
+      await invoke("setup_homebrew");
+    } catch (e) {
+      outputs["setup"] = [...(outputs["setup"] ?? []), `Error: ${e}`];
+      outputs = outputs;
+    } finally {
+      setupRunning = false;
+    }
+    await loadTooling();
+    if (tooling?.brew) runAll();
+  }
+
+  // A filter box for long lists and long output. Cleared when the source changes.
+  let filter = "";
+  let filterEl: HTMLInputElement | null = null;
+  $: { activeTab; filter = ""; }
+  $: filterShown = view === "updates" && activeStatus === "done" && (activeParsedItems.length > 12 || activeLines.length > 30);
+  function matchesFilter(text: string): boolean {
+    const q = filter.trim().toLowerCase();
+    return !q || text.toLowerCase().includes(q);
+  }
+
+  // ⌘R checks everything, ⌘, opens Settings, ⌘F goes to the filter.
+  function onKey(e: KeyboardEvent) {
+    if (!e.metaKey || e.ctrlKey || e.altKey || e.shiftKey) return;
+    const k = e.key.toLowerCase();
+    if (k === "r") { e.preventDefault(); if (!runningAll) runAll(); }
+    else if (k === ",") { e.preventDefault(); go("settings"); }
+    else if (k === "f" && filterShown && filterEl) { e.preventDefault(); filterEl.focus(); filterEl.select(); }
+  }
+
+  type View = "updates" | "history" | "settings" | "whatsnew" | "setup";
   let view: View = "updates";
   let snoozeOpen = false;
 
@@ -425,6 +548,7 @@
   }
 
   function sectionLabel(id: string): string {
+    if (id === "setup") return "Setup";
     return sections.find((s) => s.id === id)?.label ?? id;
   }
 
@@ -624,6 +748,8 @@
     loadLastChecked();
     await loadSchedule();
     await hydrateLastCheck();
+    probeAppManagement();
+    loadTooling();
 
     if (autoCheckUpdates) {
       const lastCheck = parseInt(localStorage.getItem("lastUpdateCheck") ?? "0", 10);
@@ -637,6 +763,13 @@
 
     await listen<ScheduleConfig>("schedule-updated", ({ payload }) => {
       schedule = payload;
+    });
+
+    // A name or source picked in the menu-bar dropdown.
+    await listen<string>("open-section", ({ payload }) => {
+      if (!sections.some((s) => s.id === payload)) return;
+      view = "updates";
+      activeTab = payload;
     });
 
     await listen<{ section: string; line: string }>("check-output", ({ payload }) => {
@@ -667,26 +800,52 @@
 
     await listen<{ section: string; line: string }>("upgrade-output", ({ payload }) => {
       if (itemSections.has(payload.section)) {
-        upgradeLogs[payload.section] = appendLine(upgradeLogs[payload.section], payload.line);
+        upgradeLogs[payload.section] = appendLine(upgradeLogs[payload.section] ?? [], payload.line);
         upgradeLogs = upgradeLogs;
       } else {
-        outputs[payload.section] = [...outputs[payload.section], payload.line];
+        outputs[payload.section] = appendLine(outputs[payload.section] ?? [], payload.line);
         outputs = outputs;
       }
+    });
+
+    // After an upgrade the backend re-checks the section; this is what it found.
+    // The list and the sidebar follow at once. The upgrade log stays on screen:
+    // it is what the user is reading, and the List tab is a click away.
+    await listen<{ section: string; items: CheckItem[]; lines: string[] }>("section-recounted", ({ payload }) => {
+      const id = payload.section;
+      if (!(id in statuses)) return;
+      if (itemSections.has(id)) {
+        outputs[id] = payload.lines;
+        outputs = outputs;
+        parsedItems[id] = payload.items;
+        parsedItems = parsedItems;
+        selectedItems[id] = payload.items.filter((i) => !i.ignored).map((i) => i.id);
+        selectedItems = selectedItems;
+      }
+      statuses[id] = "done";
+      statuses = statuses;
+      lastChecked[id] = new Date();
+      lastChecked = lastChecked;
+      saveLastChecked();
     });
 
     await listen<{ section: string; status: string }>("upgrade-status", ({ payload }) => {
       upgradeStatuses[payload.section] = payload.status as Status;
       upgradeStatuses = upgradeStatuses;
-      // Re-check what is left so the menu-bar count matches what is now installed
-      // instead of what was outstanding before the upgrade ran. Not for the App
-      // Store: "updating" there only opens the App Store, so a recount now would
-      // record the updates as still outstanding before the user has installed
-      // anything. Its count moves on its next check.
-      if (payload.status === "done" && payload.section !== "app_store") {
-        invoke("recount_section", { section: payload.section }).catch((e) =>
-          console.error("Failed to recount after upgrade:", e),
-        );
+      // "running" arrives for every upgrade, including one started from the
+      // menu bar while this window was hidden: show its log as it comes in.
+      // (After an upgrade the backend re-checks the section itself, so the
+      // count follows without any help from here.)
+      if (payload.status === "running") {
+        if (itemSections.has(payload.section)) {
+          upgradeLogs[payload.section] = [];
+          upgradeLogs = upgradeLogs;
+          viewMode[payload.section] = "upgrade";
+          viewMode = viewMode;
+        } else {
+          outputs[payload.section] = [];
+          outputs = outputs;
+        }
       }
     });
   });
@@ -792,7 +951,7 @@
   // check and run to hundreds of packages, so they are checked from their own tab.
   async function runAll() {
     runningAll = true;
-    const visible = sections.filter(s => platformVisible(s) && !s.dev);
+    const visible = sections.filter(s => platformVisible(s) && !s.dev && toolReady(s, tooling));
     for (const s of visible) {
       await runSection(s.id);
     }
@@ -874,7 +1033,12 @@
   }
 
   $: appSections = sections.filter(s => platformVisible(s) && !s.dev);
-  $: devSections = sections.filter(s => platformVisible(s) && !!s.dev);
+  // Developer tools that are not installed are not listed; a selected one that
+  // disappears hands over to the first app source.
+  $: devSections = sections.filter(s => platformVisible(s) && !!s.dev && toolReady(s, tooling));
+  $: if (tooling && activeTab && sections.find((s) => s.id === activeTab)?.dev && !devSections.some((s) => s.id === activeTab)) {
+    activeTab = appSections[0]?.id ?? "";
+  }
 
   // What each sidebar row shows: how many things are outdated there. A checked
   // list is the freshest source; otherwise the count the last run recorded.
@@ -1168,6 +1332,8 @@
 
 </script>
 
+<svelte:window onkeydown={onKey} />
+
 <main>
   <!-- The toolbar doubles as the title bar: the window has no native one, so it
        is the drag handle. Buttons inside it still click normally. -->
@@ -1186,6 +1352,47 @@
       {/if}
       <button class="btn btn-primary" onclick={installAppUpdate}>Install and relaunch</button>
       <button class="dismiss" aria-label="Dismiss" onclick={() => { appUpdateStatus = "idle"; appUpdateInfo = null; }}>✕</button>
+    </div>
+  {/if}
+
+  {#if tooling && !tooling.brew && !setupDismissed && view !== "setup"}
+    <div class="strip strip-warn">
+      {#if tooling.admin}
+        <div>
+          <strong>Homebrew isn't installed.</strong>
+          PartyMAN uses it to update the apps that didn't come from the App Store. Setting it up asks
+          for your administrator password and can take a few minutes.
+        </div>
+        <button class="btn btn-primary" onclick={runSetup} disabled={setupRunning}>Set up Homebrew</button>
+      {:else}
+        <div>
+          <strong>Homebrew isn't installed, and installing it needs an administrator.</strong>
+          PartyMAN uses it to update the apps that didn't come from the App Store. Ask an administrator
+          of this Mac to open PartyMAN and set it up; after that it works from this account too.
+        </div>
+      {/if}
+      <button class="dismiss" aria-label="Dismiss" onclick={() => { setupDismissed = true; }}>✕</button>
+    </div>
+  {:else if tooling && tooling.brew && (!tooling.jq || !tooling.mas) && !setupDismissed && view !== "setup"}
+    <div class="strip">
+      <div>
+        <strong>Finish setting up.</strong>
+        PartyMAN uses two small helpers from Homebrew{!tooling.mas ? ", including the one that checks the App Store" : ""}.
+      </div>
+      <button class="btn btn-primary" onclick={runSetup} disabled={setupRunning}>Install helpers</button>
+      <button class="dismiss" aria-label="Dismiss" onclick={() => { setupDismissed = true; }}>✕</button>
+    </div>
+  {/if}
+
+  {#if appMgmt === "blocked" && !appMgmtDismissed}
+    <div class="strip strip-warn">
+      <div>
+        <strong>PartyMAN can't replace apps in /Applications yet.</strong>
+        macOS protects other apps' files. Allow PartyMAN under App Management, then come back here.
+      </div>
+      <button class="btn btn-primary" onclick={openAppManagement}>Open System Settings</button>
+      <button class="btn" onclick={() => probeAppManagement(true)}>Check again</button>
+      <button class="dismiss" aria-label="Dismiss" onclick={() => { appMgmtDismissed = true; }}>✕</button>
     </div>
   {/if}
 
@@ -1258,7 +1465,9 @@
             <li>
               <button class="source" class:active={view === "updates" && activeTab === s.id} onclick={() => pick(s.id)}>
                 <span class="source-name">{s.label}</span>
-                {#if st === "running"}
+                {#if !toolReady(s, tooling)}
+                  <span class="count none">Set up</span>
+                {:else if st === "running"}
                   <span class="spinner" aria-label="Checking"></span>
                 {:else if st === "error"}
                   <span class="count err" title="The check failed">!</span>
@@ -1306,7 +1515,22 @@
         </div>
       </aside>
 
-  {#if view === "whatsnew"}
+  {#if view === "setup"}
+    <div class="page">
+      <div class="page-head">
+        <h2>{setupRunning ? "Setting up Homebrew…" : "Homebrew setup"}</h2>
+        {#if !setupRunning}<button class="btn btn-plain" onclick={() => go("updates")}>Done</button>{/if}
+      </div>
+      <div class="output" bind:this={outputEl}>
+        {#if (outputs["setup"] ?? []).length === 0}
+          <p class="empty">Starting…</p>
+        {:else}
+          {#each outputs["setup"] as line}<div class="line" class:ok={line.startsWith("✔")} class:warn={line.startsWith("⚠")} class:bad={line.startsWith("✖")}>{line}</div>{/each}
+        {/if}
+      </div>
+    </div>
+
+  {:else if view === "whatsnew"}
     <div class="page">
       <div class="page-head">
         <h2>What's new in {whatsNewVersion}</h2>
@@ -1349,8 +1573,8 @@
                   <span class="history-source">{sectionLabel(run.section)}</span>
                   <span class="run-summary">{runSummary(run)}</span>
                 </span>
-                <span class="mark" class:ok={run.failed === 0} class:bad={run.failed > 0 && run.ok === 0} class:mixed={run.failed > 0 && run.ok > 0}>
-                  {run.failed === 0 ? "✓" : run.ok === 0 ? "✖" : "◐"}
+                <span class="mark" class:ok={run.failed === 0 && run.cancelled === 0} class:bad={run.failed > 0 && run.ok === 0} class:mixed={run.failed > 0 && run.ok > 0}>
+                  {run.failed === 0 && run.cancelled === 0 ? "✓" : run.failed === 0 ? "↩" : run.ok === 0 ? "✖" : "◐"}
                 </span>
                 <span class="history-caret" aria-hidden="true">{expandedRun === run.id ? "▾" : "▸"}</span>
               </button>
@@ -1363,7 +1587,8 @@
                         <span class="mark" class:ok={entry.outcome === "ok"} class:bad={entry.outcome === "failed"} class:mixed={entry.outcome === "partial"}>{outcomeMark(entry.outcome)}</span>
                         <span class="run-item-name">{entryNames(entry)}</span>
                         {#if entry.versions.length > 0}<span class="run-item-ver">{versionText(entry)}</span>{/if}
-                        {#if entry.outcome === "failed"}<span class="run-item-note">failed</span>{/if}
+                        {#if entry.outcome === "failed"}<span class="run-item-note">failed</span>
+                        {:else if entry.outcome === "cancelled"}<span class="run-item-note quiet">cancelled</span>{/if}
                         <span class="history-caret" aria-hidden="true">{expandedEntry === key ? "▾" : "▸"}</span>
                       </button>
                       {#if expandedEntry === key}
@@ -1395,6 +1620,38 @@
 
         <section>
           <h3>General</h3>
+          <div class="row">
+            <span class="row-text">
+              <span class="row-label">Replacing apps in /Applications</span>
+              <span class="row-desc">
+                {#if appMgmt === "allowed"}Allowed. macOS lets PartyMAN update other apps.
+                {:else if appMgmt === "blocked"}Not allowed yet. Updates to apps will fail until PartyMAN is allowed under App Management.
+                {:else if appMgmt === "checking"}Checking…
+                {:else}Couldn't tell. If an update fails with "Operation not permitted", allow PartyMAN under App Management.{/if}
+              </span>
+            </span>
+            <span class="row-controls">
+              {#if appMgmt !== "allowed"}
+                <button class="btn" class:btn-primary={appMgmt === "blocked"} onclick={openAppManagement}>Open System Settings</button>
+              {/if}
+              <button class="btn btn-plain" onclick={() => probeAppManagement(true)} disabled={appMgmt === "checking"}>Check again</button>
+            </span>
+          </div>
+          <div class="row">
+            <span class="row-text">
+              <span class="row-label">Homebrew</span>
+              <span class="row-desc">
+                {#if !tooling}Looking…
+                {:else if !tooling.brew && !tooling.admin}Not installed, and installing it needs an administrator account.
+                {:else if !tooling.brew}Not installed. PartyMAN needs it to update apps that didn't come from the App Store.
+                {:else if tooling.jq && tooling.mas}Installed, with the jq and mas helpers.
+                {:else}Installed. Missing helper{!tooling.jq && !tooling.mas ? "s" : ""}: {[!tooling.jq && "jq", !tooling.mas && "mas"].filter(Boolean).join(", ")}.{/if}
+              </span>
+            </span>
+            {#if tooling && (!tooling.brew || !tooling.jq || !tooling.mas) && (tooling.brew || tooling.admin)}
+              <button class="btn btn-primary" onclick={runSetup} disabled={setupRunning}>{tooling.brew ? "Install helpers" : "Set up Homebrew"}</button>
+            {/if}
+          </div>
           <label class="row">
             <span class="row-text">
               <span class="row-label">Open at login</span>
@@ -1405,7 +1662,7 @@
           <label class="row">
             <span class="row-text">
               <span class="row-label">Show developer tools</span>
-              <span class="row-desc">Homebrew formulae, npm, pip, rbenv and rvm. They never count towards the total, and are only checked from their own page or by the schedule while shown.</span>
+              <span class="row-desc">Homebrew formulae, npm, pip, asdf, rbenv and rvm. They never count towards the total, and are only checked from their own page or by the schedule while shown.</span>
             </span>
             <input type="checkbox" bind:checked={schedule.showDevTools} onchange={toggleDevTools} disabled={scheduleSaving} />
           </label>
@@ -1577,6 +1834,9 @@
               </p>
             </div>
             <div class="source-actions">
+              {#if filterShown}
+                <input class="search filter" type="search" placeholder="Filter" bind:value={filter} bind:this={filterEl} aria-label="Filter this list" />
+              {/if}
               {#if activeHasItemSelection && activeStatus === "done" && activeParsedItems.length > 0}
                 <div class="segmented" role="tablist" aria-label="View">
                   <button class:active={activeViewMode === "select"} onclick={() => { viewMode[activeSectionId] = "select"; viewMode = viewMode; }}>List</button>
@@ -1584,10 +1844,17 @@
                   <button class:active={activeViewMode === "upgrade"} onclick={() => { viewMode[activeSectionId] = "upgrade"; viewMode = viewMode; }}>Log</button>
                 </div>
               {/if}
-              <button class="btn" onclick={() => runSection(activeSectionId)}
-                disabled={activeStatus === "running" || activeUpgradeStatus === "running"}>
-                {activeStatus === "running" ? "Checking…" : activeStatus === "done" ? "Check again" : "Check now"}
-              </button>
+              {#if !toolReady(activeSection, tooling)}
+                <button class="btn btn-primary" onclick={runSetup} disabled={setupRunning || !tooling?.admin}
+                  title={tooling?.admin ? "" : "Installing Homebrew needs an administrator account"}>
+                  {activeSection.tool === "mas" ? "Set up App Store checking" : "Set up Homebrew"}
+                </button>
+              {:else}
+                <button class="btn" onclick={() => runSection(activeSectionId)}
+                  disabled={activeStatus === "running" || activeUpgradeStatus === "running"}>
+                  {activeStatus === "running" ? "Checking…" : activeStatus === "done" ? "Check again" : "Check now"}
+                </button>
+              {/if}
             </div>
           </header>
 
@@ -1643,7 +1910,7 @@
               </footer>
             {:else}
               <div class="list">
-                {#each activeVisibleItems as item (item.id)}
+                {#each activeVisibleItems.filter((i) => matchesFilter(i.name) || matchesFilter(i.id)) as item (item.id)}
                   <label class="item">
                     <input type="checkbox" checked={activeSelectedItems.includes(item.id)}
                       onchange={(e) => toggleItem(activeSectionId, item.id, (e.target as HTMLInputElement).checked)} />
@@ -1706,13 +1973,19 @@
                   <p class="empty">Checking…</p>
                 {:else}
                   <p class="empty">
-                    Not checked yet.
-                    {#if activeSection.dev}These aren't part of the update count; check them whenever you like.
-                    {:else}Check now to see what's out of date. Nothing is installed until you choose to.{/if}
+                    {#if !toolReady(activeSection, tooling)}
+                      {activeSection.tool === "mas"
+                        ? "Checking the App Store needs a small helper from Homebrew. Set it up and this page fills in."
+                        : "This needs Homebrew, which isn't installed yet. Set it up and this page fills in."}
+                    {:else}
+                      Not checked yet.
+                      {#if activeSection.dev}These aren't part of the update count; check them whenever you like.
+                      {:else}Check now to see what's out of date. Nothing is installed until you choose to.{/if}
+                    {/if}
                   </p>
                 {/if}
               {:else}
-                {#each activeLines as line}<div class="line" class:ok={line.startsWith("✔")} class:warn={line.startsWith("⚠")} class:bad={line.startsWith("✖")}>{line}</div>{/each}
+                {#each activeLines.filter(matchesFilter) as line}<div class="line" class:ok={line.startsWith("✔")} class:warn={line.startsWith("⚠")} class:bad={line.startsWith("✖")}>{line}</div>{/each}
               {/if}
             </div>
             {#if activeSection.dev && activeSection.upgradeCmd && activeStatus === "done" && activeHasOutdated}
@@ -1809,13 +2082,14 @@
   }
   .strip ul { margin: 4px 0 0 18px; }
   .strip-ok { background: var(--pm-ok-bg); border-color: var(--pm-ok-border); }
+  .strip-warn { border-color: var(--pm-accent); }
   .strip-err { background: var(--pm-err-bg); border-color: var(--pm-err-border); }
 
   /* ── Split: sidebar + content ────────────────────────────────────────── */
   .split { flex: 1; min-height: 0; display: flex; }
 
   .sidebar {
-    width: 246px; flex-shrink: 0;
+    width: 254px; flex-shrink: 0;
     display: flex; flex-direction: column;
     overflow-y: auto;
     padding: 12px 8px;
@@ -1957,6 +2231,7 @@
   }
   .search:focus { outline: none; border-color: var(--pm-accent); }
   .search::placeholder { color: var(--pm-faint); }
+  .search.filter { width: 150px; padding: 4px 9px; }
 
   .history { padding: 4px 0; }
   .run { border-bottom: 1px solid var(--pm-border); }
@@ -1980,6 +2255,7 @@
   .run-item-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--pm-text); }
   .run-item-ver { color: var(--pm-muted); font-variant-numeric: tabular-nums; }
   .run-item-note { color: var(--pm-err); font-size: 12px; }
+  .run-item-note.quiet { color: var(--pm-muted); }
   .history-output { flex: none; margin: 0 18px 6px 0; border-radius: var(--pm-radius-sm); border: 1px solid var(--pm-border); padding: 8px 12px; }
   .raw-toggle { margin-top: 6px; font-family: var(--pm-font); }
 

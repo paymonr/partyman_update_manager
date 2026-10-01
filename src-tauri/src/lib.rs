@@ -195,12 +195,24 @@ struct HistoryEntry {
 fn outcome_from_lines(lines: &[String], exit_code: Option<i32>) -> &'static str {
     let done = lines.iter().filter(|l| {
         let t = l.trim_start();
-        t.starts_with("→  Done") || t.starts_with('✔') || (t.starts_with('🍺') && t.contains("successfully"))
+        // Two spaces: our own marker. Homebrew's fetch lines start "✔︎ " (with a
+        // variation selector and one space) and say nothing about the outcome.
+        t.starts_with("→  Done") || t.starts_with("✔  ") || (t.starts_with('🍺') && t.contains("successfully"))
     }).count();
     let failed = lines.iter().filter(|l| l.trim_start().starts_with('✖')).count();
+    // Our own marker for a dismissed password prompt, or AppleScript's for the
+    // macOS updates' administrator dialog.
+    let cancelled = lines.iter().filter(|l| {
+        let t = l.trim_start();
+        t.starts_with("↩  Cancelled") || t.contains("User canceled.")
+    }).count();
     if failed > 0 && done > 0 {
         "partial"
-    } else if failed > 0 || (matches!(exit_code, Some(c) if c != 0) && done == 0) {
+    } else if failed > 0 {
+        "failed"
+    } else if cancelled > 0 && done == 0 {
+        "cancelled"
+    } else if matches!(exit_code, Some(c) if c != 0) && done == 0 {
         "failed"
     } else {
         "ok"
@@ -461,6 +473,12 @@ fn brew_cask_upgrade_fn() -> &'static str {
     BREW_EXIT=$?
   fi
 
+  # sudo says this when the password dialog was dismissed or gave up unanswered;
+  # the password server leaves a marker when it was dismissed.
+  local NO_PW=0 CANCELLED=0
+  grep -q "no password was provided" "$TMPOUT" 2>/dev/null && NO_PW=1
+  [ "$NO_PW" -eq 1 ] && [ -n "$_pm_dir" ] && [ -f "$_pm_dir/cancelled" ] && CANCELLED=1
+
   if grep -q "Permission denied @ apply2files" "$TMPOUT"; then
     if pm_fix_protected_bundle "$TMPOUT"; then
       rm -f "$TMPOUT"
@@ -477,8 +495,11 @@ fn brew_cask_upgrade_fn() -> &'static str {
   echo "__PM_CASK_EXIT__:$token:$BREW_EXIT"
   if [ "$BREW_EXIT" -eq 0 ]; then
     echo "→  Done."
+  elif [ "$CANCELLED" -eq 1 ]; then
+    echo "↩  Cancelled: $token was left as it was."
   else
     echo "✖  Update failed for $token."
+    [ "$NO_PW" -eq 1 ] && echo "   No password was entered when asked (the prompt waits five minutes), so the app was left as it was."
   fi
 }
 "#
@@ -573,6 +594,8 @@ fn section_label(section: &str) -> &'static str {
         "pip_packages"   => "pip",
         "ruby_rbenv"     => "rbenv",
         "ruby_rvm"       => "rvm",
+        "asdf"           => "asdf",
+        "setup"          => "Setup",
         _                => "Unknown",
     }
 }
@@ -880,6 +903,229 @@ fn split_legacy_adoption(e: HistoryEntry) -> Vec<HistoryEntry> {
             ..e.clone()
         })
         .collect()
+}
+
+/// Whether macOS lets this app change other apps' bundles in /Applications —
+/// the App Management permission (Full Disk Access grants it too). Without it
+/// every cask upgrade that replaces an app fails, as root or not, with
+/// "Operation not permitted", which is how Firefox, Obsidian and Postman
+/// failed in this user's history.
+///
+/// There is no API to ask, so this tries to modify another app the way
+/// Homebrew would: it creates an empty file inside the bundle and removes it.
+/// Refused means blocked, and nothing has changed; allowed means the file
+/// existed for a moment. Tested on a fresh macOS 26 VM: a chmod to the mode a
+/// bundle already has never reaches the policy and is allowed everywhere, so
+/// it tells nothing — this must be a real write.
+///
+/// The target is an app the user owns, so ordinary permissions cannot be what
+/// refuses, and one the user has opened at least once: macOS only protects a
+/// quarantined app after Gatekeeper has approved it (the 0x40 bit in the
+/// quarantine flags), so an unopened app would say "allowed" for every
+/// process. Being refused also puts PartyMAN on the App Management list,
+/// where the user can then allow it.
+#[tauri::command]
+fn app_management_status(app: AppHandle) -> String {
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let uid = unsafe { libc::getuid() };
+        let Ok(entries) = fs::read_dir("/Applications") else { return "unknown".to_string() };
+        let mut paths: Vec<_> = entries.flatten().map(|e| e.path()).collect();
+        paths.sort();
+        // Apps the user has opened first: their answer is definitive either way.
+        paths.sort_by_key(|p| !quarantine_approved(p));
+        for path in paths {
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if !name.ends_with(".app") || name.starts_with("PartyMAN") {
+                continue;
+            }
+            let Ok(meta) = fs::metadata(&path) else { continue };
+            if meta.uid() != uid || !meta.is_dir() || !path.join("Contents").is_dir() {
+                continue;
+            }
+            let probe = path.join("Contents/.partyman-probe");
+            match fs::OpenOptions::new().write(true).create_new(true).open(&probe) {
+                Ok(_) => {
+                    let _ = fs::remove_file(&probe);
+                    if quarantine_approved(&path) {
+                        diag(&app, &format!("app management: allowed (probed {name})"));
+                        return "allowed".to_string();
+                    }
+                    // Allowed on an app macOS may not be protecting yet; keep looking.
+                    continue;
+                }
+                Err(e) if e.raw_os_error() == Some(libc::EPERM) => {
+                    diag(&app, &format!("app management: blocked (probed {name})"));
+                    return "blocked".to_string();
+                }
+                Err(_) => continue,
+            }
+        }
+        diag(&app, "app management: unknown (no opened app of the user's own to probe)");
+        "unknown".to_string()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = app;
+        "unknown".to_string()
+    }
+}
+
+/// True when the bundle carries a quarantine attribute whose flags say the
+/// user has approved opening it — the point from which macOS protects it.
+#[cfg(target_os = "macos")]
+fn quarantine_approved(path: &std::path::Path) -> bool {
+    use std::ffi::CString;
+    let Ok(cpath) = CString::new(path.as_os_str().as_encoded_bytes()) else { return false };
+    let name = c"com.apple.quarantine";
+    let mut buf = [0u8; 256];
+    let n = unsafe {
+        libc::getxattr(cpath.as_ptr(), name.as_ptr(), buf.as_mut_ptr() as *mut _, buf.len(), 0, 0)
+    };
+    if n <= 0 {
+        return false;
+    }
+    let value = String::from_utf8_lossy(&buf[..n as usize]);
+    let flags = value.split(';').next().unwrap_or("");
+    u32::from_str_radix(flags, 16).map(|f| f & 0x40 != 0).unwrap_or(false)
+}
+
+/// Which of the tools PartyMAN builds on are present. `brew` is the one that
+/// matters: without it nothing outside the App Store can be checked or updated.
+/// `jq` reads Homebrew's data for names and versions, `mas` is the App Store.
+#[derive(Clone, serde::Serialize)]
+struct ToolingStatus {
+    brew: bool,
+    jq: bool,
+    mas: bool,
+    npm: bool,
+    pip: bool,
+    rbenv: bool,
+    rvm: bool,
+    asdf: bool,
+    /// Whether this account can install Homebrew at all: its installer needs an
+    /// administrator, and it is kinder to say so than to fail after a download.
+    admin: bool,
+}
+
+// Debug builds only: PM_PRETEND_NO_BREW=1 makes the app believe Homebrew is
+// missing until one pretend setup has run, so the first-run flow can be walked
+// through on a machine that has Homebrew. Never compiled into a release.
+static PRETEND_SETUP_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn pretending_no_brew() -> bool {
+    cfg!(debug_assertions)
+        && std::env::var_os("PM_PRETEND_NO_BREW").is_some()
+        && !PRETEND_SETUP_DONE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[tauri::command]
+async fn tooling_status() -> ToolingStatus {
+    async fn sh(script: String) -> bool {
+        Command::new("bash")
+            .arg("-c")
+            .arg(script)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await
+            .map(|st| st.success())
+            .unwrap_or(false)
+    }
+    async fn has(tool: &str) -> bool {
+        sh(format!("{CHECK_PREAMBLE}command -v {tool} >/dev/null 2>&1")).await
+    }
+    let pretend = pretending_no_brew();
+    ToolingStatus {
+        brew: !pretend && has("brew").await,
+        jq: !pretend && has("jq").await,
+        mas: !pretend && has("mas").await,
+        npm: has("npm").await,
+        pip: has("pip3").await || has("pip").await,
+        rbenv: has("rbenv").await,
+        rvm: sh(format!("{CHECK_PREAMBLE}command -v rvm >/dev/null 2>&1 || [ -s \"$HOME/.rvm/scripts/rvm\" ]")).await,
+        asdf: has("asdf").await,
+        admin: sh("dseditgroup -o checkmember -m \"$USER\" admin >/dev/null 2>&1".to_string()).await,
+    }
+}
+
+// Installs Homebrew the way Homebrew documents — its own install script — and
+// then the two helpers. The script asks for the administrator password through
+// our askpass dialog (it honours SUDO_ASKPASS), installs Apple's Command Line
+// Tools itself when they are missing, and refuses cleanly for a user who is not
+// an administrator. Output streams to the window as a run so a long Command
+// Line Tools download does not look like a hang.
+#[tauri::command]
+async fn setup_homebrew(app: AppHandle) {
+    let section = "setup";
+    let pretend = pretending_no_brew();
+    let script = if pretend {
+        PRETEND_SETUP_DONE.store(true, std::sync::atomic::Ordering::Relaxed);
+        r#"
+echo "→  Installing Homebrew. This can take several minutes; if your Mac needs Apple's command line tools first, those are installed too."
+echo "==> Checking for \`sudo\` access..."; sleep 1
+echo "==> Downloading and installing Homebrew..."; sleep 2
+echo "==> Installation successful!"
+echo "→  Installing the helpers PartyMAN uses: jq, to read Homebrew's data, and mas, for the App Store…"; sleep 2
+echo "🍺  jq was successfully installed!"
+echo "🍺  mas was successfully installed!"
+echo "✔  Homebrew is set up. (pretend run — nothing was installed)"
+"#
+    } else {
+        r#"
+export NONINTERACTIVE=1
+export PM_ASKPASS_APP='Homebrew'
+export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+if command -v brew &>/dev/null; then
+  echo "→  Homebrew is already installed."
+else
+  echo "→  Installing Homebrew. This can take several minutes; if your Mac needs Apple's command line tools first, those are installed too."
+  /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" 2>&1
+fi
+export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+if command -v brew &>/dev/null; then
+  echo "→  Installing the helpers PartyMAN uses: jq, to read Homebrew's data, and mas, for the App Store…"
+  if brew install jq mas 2>&1; then
+    echo "✔  Homebrew is set up."
+  else
+    echo "⚠  Homebrew is installed, but not every helper could be. App Store checking needs mas."
+  fi
+else
+  echo "✖  Homebrew could not be installed. If you are not an administrator on this Mac, an administrator needs to install it."
+fi
+"#
+    };
+    let ts = now_secs();
+    let run_id = new_run_id(section);
+    diag(&app, &format!("setup: homebrew ({run_id})"));
+    let started = std::time::Instant::now();
+    let result = run_upgrade_shell(&app, section, script).await;
+    let outcome = outcome_from_lines(&result.lines, result.exit_code).to_string();
+    diag(&app, &format!("setup: {outcome} ({run_id})"));
+    append_upgrade_log(&app, HistoryEntry {
+        ts,
+        label: section_label(section).to_string(),
+        section: section.to_string(),
+        items: vec!["homebrew".to_string()],
+        item_names: vec!["Homebrew".to_string()],
+        versions: Vec::new(),
+        run_id,
+        kind: "setup".to_string(),
+        outcome,
+        duration_secs: secs_since(started),
+        exit_code: result.exit_code,
+        lines: result.lines,
+    });
+}
+
+#[tauri::command]
+fn open_app_management_settings(app: AppHandle) {
+    diag(&app, "opening System Settings → App Management");
+    let _ = std::process::Command::new("open")
+        .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_AppBundles")
+        .spawn();
 }
 
 // Reveals the folder holding updates.log and partyman.log in the Finder.
@@ -1254,8 +1500,20 @@ PM_PW_RETRY="$_pm_dir/retry"
       else
         _pm_msg="${_pm_again}PartyMAN Update Manager needs your administrator password to complete this update."
       fi
-      _pw=$(osascript -e "display dialog \"${_pm_msg}\" default answer \"\" with hidden answer with title \"PartyMAN Update Manager\" with icon caution giving up after 120" -e 'text returned of result' 2>/dev/null)
+      # Shown by System Events and brought to the front first. From the menu bar
+      # there is no PartyMAN window to anchor it, and a dialog that opens behind
+      # whatever the user is reading goes unanswered until it gives up — which
+      # is what "no password was provided" from sudo means. Five minutes, since
+      # the download before it can take two.
+      _pw=$(osascript -e 'tell application "System Events"' -e 'activate' -e "display dialog \"${_pm_msg}\" default answer \"\" with hidden answer with title \"PartyMAN Update Manager\" with icon caution giving up after 300" -e 'text returned of result' -e 'end tell' 2>"$_pm_dir/dialog.err")
       _pm_again=""
+      # Cancel is AppleScript error -128; giving up after the timeout returns an
+      # empty answer with no error. The scripts tell the two apart in their output.
+      if [ -z "$_pw" ] && grep -q -- "-128" "$_pm_dir/dialog.err" 2>/dev/null; then
+        touch "$_pm_dir/cancelled"
+      else
+        rm -f "$_pm_dir/cancelled"
+      fi
     fi
     # A caller that gave up leaves nothing reading; that must not kill the server.
     printf '%s' "$_pw" > "$_pm_reply" 2>/dev/null || true
@@ -1668,7 +1926,9 @@ rm -f "$SEEN"
 "#),
         "brew_formulae" => Some(r#"
 if command -v brew &>/dev/null; then
-  outdated=$(brew outdated --verbose 2>/dev/null)
+  # --formula: without it brew lists outdated casks here too, and those are
+  # Homebrew apps' business — they were being counted on both pages.
+  outdated=$(brew outdated --formula --verbose 2>/dev/null)
   if [ -z "$outdated" ]; then
     echo "✔  All Homebrew formulae are up to date."
   else
@@ -1712,6 +1972,33 @@ if [ -n "$PIP_CMD" ]; then
   fi
 else
   echo "✖  pip / pip3 not found"
+fi
+"#),
+        "asdf" => Some(r#"
+if command -v asdf &>/dev/null; then
+  outdated=""
+  n=0
+  for p in $(asdf plugin list 2>/dev/null); do
+    # `asdf list <plugin>` prints one version per line, the current one starred;
+    # the newest installed is the last line. `asdf latest` asks the plugin.
+    installed=$(asdf list "$p" 2>/dev/null | tr -d ' *' | grep -v '^$' | tail -1)
+    latest=$(asdf latest "$p" 2>/dev/null)
+    [ -z "$installed" ] && continue
+    if [ -n "$latest" ] && [ "$installed" != "$latest" ]; then
+      outdated="$outdated   $p  $installed → $latest
+"
+      n=$((n + 1))
+    fi
+  done
+  if [ "$n" -eq 0 ]; then
+    echo "✔  Every asdf runtime is at its latest version."
+  else
+    echo "⚠  $n runtime(s) with a newer version available:"
+    printf '%s' "$outdated"
+    echo "→  Installs alongside what you have; switch a project with: asdf set <plugin> <version>"
+  fi
+else
+  echo "✖  asdf not found"
 fi
 "#),
         "ruby_rvm" => Some(r#"
@@ -1769,7 +2056,9 @@ fi
 async fn run_check(app: AppHandle, section: String) {
     match check_script(&section) {
         Some(script) => {
+            tray_checking(&app, true);
             let lines = run_shell(&app, &section, script).await.lines;
+            tray_checking(&app, false);
             let items = schedule::items_for(&app, &section, &lines);
             let _ = app.emit("check-status", CheckDonePayload {
                 section: section.clone(),
@@ -1831,6 +2120,19 @@ else
   echo "✖  brew not found"
 fi
 "#, fn_def = cask_fns())),
+        "asdf" => Some(r#"
+if command -v asdf &>/dev/null; then
+  echo "→  Updating asdf plugins…"
+  asdf plugin update --all 2>&1
+  for p in $(asdf plugin list 2>/dev/null); do
+    echo "→  Installing the latest $p… (a runtime can take a while to build)"
+    asdf install "$p" latest 2>&1
+  done
+  echo "→  Done. Existing versions stay; switch a project or your default with: asdf set <plugin> <version>"
+else
+  echo "✖  asdf not found"
+fi
+"#.to_string()),
         "app_store" => Some(r#"
 echo "→  Opening App Store Updates…"
 open "macappstores://showUpdatesPage"
@@ -1891,43 +2193,90 @@ fi
 
 #[tauri::command]
 async fn run_upgrade(app: AppHandle, section: String) {
-    match upgrade_script(&section) {
-        Some(script) => {
-            let ts = now_secs();
-            let run_id = new_run_id(&section);
-            diag(&app, &format!("update {section}: everything ({run_id})"));
-            let started = std::time::Instant::now();
-            let result = run_upgrade_shell(&app, &section, &script).await;
-            let outcome = outcome_from_lines(&result.lines, result.exit_code).to_string();
-            diag(&app, &format!("update {section}: {outcome} ({run_id})"));
-            append_upgrade_log(&app, HistoryEntry {
-                ts,
-                label: section_label(&section).to_string(),
-                section: section.clone(),
-                items: vec![],
-                item_names: vec![],
-                versions: versions_from_lines(&result.lines, None),
-                run_id,
-                kind: "update".to_string(),
-                outcome,
-                duration_secs: secs_since(started),
-                exit_code: result.exit_code,
-                lines: result.lines,
-            });
-        }
-        None => {
-            emit_upgrade_line(&app, &section, &format!("No upgrade command for: {section}")).await;
-            emit_upgrade_status(&app, &section, "error").await;
-        }
-    }
+    upgrade_section(&app, &section).await;
+    settle_after_upgrade(&app, &section).await;
 }
 
 #[tauri::command]
 async fn run_upgrade_items(app: AppHandle, section: String, items: Vec<String>, item_names: Vec<String>) {
-    if items.is_empty() {
-        emit_upgrade_line(&app, &section, "No items selected.").await;
-        emit_upgrade_status(&app, &section, "done").await;
+    upgrade_items(&app, &section, &items, &item_names).await;
+    settle_after_upgrade(&app, &section).await;
+}
+
+// Re-checks what is left so the menu-bar count matches what is now installed
+// instead of what was outstanding before the upgrade ran. Not for the App Store:
+// "updating" there only opens the App Store, so a recount now would record the
+// updates as still outstanding before the user has installed anything. Its count
+// moves on its next check.
+async fn settle_after_upgrade(app: &AppHandle, section: &str) {
+    if section == "app_store" || !schedule::CHECKED_SECTIONS.contains(&section) {
         return;
+    }
+    let lines = run_check_collect(section).await;
+    let items = schedule::items_for(app, section, &lines);
+    let cfg = schedule::record_section(app, section, lines.clone());
+    set_tray_count(app, cfg.last_total);
+    // The window's list is what its sidebar counts from, so it gets the fresh
+    // result too — otherwise the app just updated would sit there as outdated
+    // until the next check.
+    let _ = app.emit("section-recounted", RecountPayload {
+        section: section.to_string(),
+        items,
+        lines: lines.into_iter().filter(|l| !l.starts_with("__PM_")).collect(),
+    });
+    let _ = app.emit("schedule-updated", cfg);
+}
+
+/// What the re-check after an upgrade found, for the window to show without a
+/// check of its own.
+#[derive(Clone, serde::Serialize)]
+struct RecountPayload {
+    section: String,
+    items: Vec<schedule::CheckItem>,
+    lines: Vec<String>,
+}
+
+/// Runs a section's whole upgrade command. Returns the outcome, or None when the
+/// section has no upgrade command.
+async fn upgrade_section(app: &AppHandle, section: &str) -> Option<String> {
+    let Some(script) = upgrade_script(section) else {
+        emit_upgrade_line(app, section, &format!("No upgrade command for: {section}")).await;
+        emit_upgrade_status(app, section, "error").await;
+        return None;
+    };
+    emit_upgrade_status(app, section, "running").await;
+    let ts = now_secs();
+    let run_id = new_run_id(section);
+    diag(app, &format!("update {section}: everything ({run_id})"));
+    let started = std::time::Instant::now();
+    let result = run_upgrade_shell(app, section, &script).await;
+    let outcome = outcome_from_lines(&result.lines, result.exit_code).to_string();
+    diag(app, &format!("update {section}: {outcome} ({run_id})"));
+    append_upgrade_log(app, HistoryEntry {
+        ts,
+        label: section_label(section).to_string(),
+        section: section.to_string(),
+        items: vec![],
+        item_names: vec![],
+        versions: versions_from_lines(&result.lines, None),
+        run_id,
+        kind: "update".to_string(),
+        outcome: outcome.clone(),
+        duration_secs: secs_since(started),
+        exit_code: result.exit_code,
+        lines: result.lines,
+    });
+    Some(outcome)
+}
+
+/// Upgrades the chosen items of a section. Returns (name, outcome) per item: one
+/// each for Homebrew, which reports per cask; the batch's outcome against every
+/// name for the rest.
+async fn upgrade_items(app: &AppHandle, section: &str, items: &[String], item_names: &[String]) -> Vec<(String, String)> {
+    if items.is_empty() {
+        emit_upgrade_line(app, section, "No items selected.").await;
+        emit_upgrade_status(app, section, "done").await;
+        return vec![];
     }
 
     // Brew casks run in a single shell so one sudo session (one password prompt)
@@ -1940,9 +2289,9 @@ async fn run_upgrade_items(app: AppHandle, section: String, items: Vec<String>, 
             .filter(|(token, _)| token.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '@' || c == '.'))
             .collect();
         if pairs.is_empty() {
-            emit_upgrade_line(&app, &section, "No items selected.").await;
-            emit_upgrade_status(&app, &section, "done").await;
-            return;
+            emit_upgrade_line(app, section, "No items selected.").await;
+            emit_upgrade_status(app, section, "done").await;
+            return vec![];
         }
 
         let mut body = String::new();
@@ -1960,15 +2309,17 @@ async fn run_upgrade_items(app: AppHandle, section: String, items: Vec<String>, 
             fn_def = cask_fns(),
             body = body,
         );
+        emit_upgrade_status(app, section, "running").await;
         let ts = now_secs();
-        let run_id = new_run_id(&section);
-        diag(&app, &format!("update {section}: {} items ({run_id}): {}", pairs.len(),
+        let run_id = new_run_id(section);
+        diag(app, &format!("update {section}: {} items ({run_id}): {}", pairs.len(),
             pairs.iter().map(|(t, _)| t.as_str()).collect::<Vec<_>>().join(", ")));
         let started = std::time::Instant::now();
-        let result = run_upgrade_shell(&app, &section, &script).await;
+        let result = run_upgrade_shell(app, section, &script).await;
         let duration_secs = secs_since(started);
 
         let mut summary: Vec<String> = Vec::new();
+        let mut outcomes: Vec<(String, String)> = Vec::new();
         for (token, body_lines, exit_code) in split_by_item(&result.lines) {
             let display_name = pairs.iter()
                 .find(|(t, _)| *t == token)
@@ -1976,10 +2327,11 @@ async fn run_upgrade_items(app: AppHandle, section: String, items: Vec<String>, 
                 .unwrap_or_else(|| token.clone());
             let outcome = outcome_from_lines(&body_lines, exit_code).to_string();
             summary.push(format!("{token} {outcome}"));
-            append_upgrade_log(&app, HistoryEntry {
+            outcomes.push((display_name.clone(), outcome.clone()));
+            append_upgrade_log(app, HistoryEntry {
                 ts,
-                label: section_label(&section).to_string(),
-                section: section.clone(),
+                label: section_label(section).to_string(),
+                section: section.to_string(),
                 items: vec![token.clone()],
                 item_names: vec![display_name],
                 versions: versions_from_lines(&body_lines, Some(&token)),
@@ -1991,11 +2343,18 @@ async fn run_upgrade_items(app: AppHandle, section: String, items: Vec<String>, 
                 lines: body_lines,
             });
         }
-        diag(&app, &format!("update {section}: {} ({run_id})", summary.join(", ")));
-        return;
+        // A cask the shell never reached (brew missing, the run cut short) was
+        // not updated either.
+        for (_, name) in &pairs {
+            if !outcomes.iter().any(|(n, _)| n == name) {
+                outcomes.push((name.clone(), "failed".to_string()));
+            }
+        }
+        diag(app, &format!("update {section}: {} ({run_id})", summary.join(", ")));
+        return outcomes;
     }
 
-    let script: String = match section.as_str() {
+    let script: String = match section {
         "app_store" => {
             let list = if item_names.is_empty() { items.join(", ") } else { item_names.join(", ") };
             format!(
@@ -2006,7 +2365,7 @@ async fn run_upgrade_items(app: AppHandle, section: String, items: Vec<String>, 
             let labels = items.iter()
                 .map(|l| format!("\\\"{}\\\"", l.replace('"', "\\\"")))
                 .collect::<Vec<_>>().join(" ");
-            let names_src: Vec<String> = if item_names.is_empty() { items.clone() } else { item_names.clone() };
+            let names_src: Vec<String> = if item_names.is_empty() { items.to_vec() } else { item_names.to_vec() };
             let list = names_src.iter()
                 .map(|n| n.replace(['\\', '"'], ""))
                 .collect::<Vec<_>>().join(", ");
@@ -2016,25 +2375,27 @@ async fn run_upgrade_items(app: AppHandle, section: String, items: Vec<String>, 
             )
         }
         _ => {
-            emit_upgrade_line(&app, &section, "Individual upgrades not supported for this section.").await;
-            emit_upgrade_status(&app, &section, "error").await;
-            return;
+            emit_upgrade_line(app, section, "Individual upgrades not supported for this section.").await;
+            emit_upgrade_status(app, section, "error").await;
+            return vec![];
         }
     };
 
+    emit_upgrade_status(app, section, "running").await;
     let ts = now_secs();
-    let run_id = new_run_id(&section);
-    diag(&app, &format!("update {section}: {} items ({run_id})", items.len()));
+    let run_id = new_run_id(section);
+    diag(app, &format!("update {section}: {} items ({run_id})", items.len()));
     let started = std::time::Instant::now();
-    let result = run_upgrade_shell(&app, &section, &script).await;
-    let display_names = if item_names.is_empty() { items.clone() } else { item_names };
+    let result = run_upgrade_shell(app, section, &script).await;
+    let display_names = if item_names.is_empty() { items.to_vec() } else { item_names.to_vec() };
     let outcome = outcome_from_lines(&result.lines, result.exit_code).to_string();
-    diag(&app, &format!("update {section}: {outcome} ({run_id})"));
-    append_upgrade_log(&app, HistoryEntry {
+    diag(app, &format!("update {section}: {outcome} ({run_id})"));
+    let outcomes = display_names.iter().map(|n| (n.clone(), outcome.clone())).collect();
+    append_upgrade_log(app, HistoryEntry {
         ts,
-        label: section_label(&section).to_string(),
-        section: section.clone(),
-        items: items.clone(),
+        label: section_label(section).to_string(),
+        section: section.to_string(),
+        items: items.to_vec(),
         item_names: display_names,
         versions: versions_from_lines(&result.lines, None),
         run_id,
@@ -2044,6 +2405,7 @@ async fn run_upgrade_items(app: AppHandle, section: String, items: Vec<String>, 
         exit_code: result.exit_code,
         lines: result.lines,
     });
+    outcomes
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -2350,18 +2712,437 @@ struct LastCheckView {
     items: std::collections::BTreeMap<String, Vec<schedule::CheckItem>>,
 }
 
-// Redraws the icon with the count baked into its badge. Cheap enough to do on
-// every change: it is a 176x176 compose and downscale.
+// ---------------------------------------------------------------------------
+// The menu-bar dropdown
+// ---------------------------------------------------------------------------
+//
+// Built from what the last check saved and rebuilt whenever that changes, so the
+// menu bar is useful on its own: how many updates, which apps per source, and
+// Install all / Check now to act on them without opening the window. A native
+// menu rather than a popover: it behaves like every other menu-bar item and
+// costs nothing to keep current.
+
+/// What the app is busy with, for the dropdown's header. Checks are counted
+/// because several can overlap (Check all runs a section at a time while the
+/// schedule may fire); installing is one batch at a time.
+struct TrayActivity {
+    checks: std::sync::atomic::AtomicUsize,
+    /// What is being installed, as the header says it: "5 updates", "Brave".
+    installing: Mutex<Option<String>>,
+}
+
+static TRAY_ACTIVITY: TrayActivity = TrayActivity {
+    checks: std::sync::atomic::AtomicUsize::new(0),
+    installing: Mutex::new(None),
+};
+
+/// The menu as last built, so a tick or a hover that changes nothing leaves the
+/// menu alone — replacing it while it is open would make it jump.
+static TRAY_PLAN: Mutex<Option<TrayPlan>> = Mutex::new(None);
+
+pub(crate) fn tray_checking(app: &AppHandle, on: bool) {
+    use std::sync::atomic::Ordering;
+    if on {
+        TRAY_ACTIVITY.checks.fetch_add(1, Ordering::SeqCst);
+    } else {
+        let _ = TRAY_ACTIVITY
+            .checks
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| Some(n.saturating_sub(1)));
+    }
+    refresh_tray_menu(app);
+}
+
+fn tray_installing(app: &AppHandle, what: Option<String>) {
+    if let Ok(mut g) = TRAY_ACTIVITY.installing.lock() {
+        *g = what;
+    }
+    refresh_tray_menu(app);
+}
+
+fn tray_is_installing() -> bool {
+    TRAY_ACTIVITY.installing.lock().map(|g| g.is_some()).unwrap_or(false)
+}
+
+/// The sources the dropdown lists, in the order Install all takes them: Homebrew
+/// first (that is what the password is for), the App Store next (it only opens
+/// the App Store), macOS last because it can restart the Mac.
+const TRAY_SOURCES: &[(&str, &str)] = &[
+    ("brew_casks", "Homebrew apps"),
+    ("app_store", "App Store"),
+    ("macos_updates", "macOS updates"),
+];
+
+/// Names listed per source before "and N more…" takes over.
+const TRAY_MAX_NAMES: usize = 12;
+
+#[derive(Clone, Debug, PartialEq)]
+struct TraySource {
+    id: String,
+    label: String,
+    items: Vec<TrayItem>,
+    more: usize,
+}
+
+/// One app in a source's submenu. Clicking it updates just that app.
+#[derive(Clone, Debug, PartialEq)]
+struct TrayItem {
+    id: String,
+    name: String,
+    /// "Zoom  6.1.0 → 6.2.1"
+    text: String,
+}
+
+/// Everything the dropdown says, worked out away from the menu objects so it
+/// can be tested.
+#[derive(Clone, Debug, PartialEq)]
+struct TrayPlan {
+    header: String,
+    checked: Option<String>,
+    sources: Vec<TraySource>,
+    install_label: String,
+    install_enabled: bool,
+    busy: bool,
+}
+
+fn tray_plan(
+    cfg: &schedule::ScheduleConfig,
+    last: &schedule::LastCheck,
+    checks_running: usize,
+    installing: Option<&str>,
+    now: u64,
+) -> TrayPlan {
+    let total = schedule::total_from_counts(&cfg.last_counts);
+    let busy = installing.is_some() || checks_running > 0;
+    let header = match (installing, checks_running, total) {
+        (Some(what), _, _) => format!("Installing {what}…"),
+        (None, c, _) if c > 0 => "Checking for updates…".to_string(),
+        (None, _, 0) if cfg.last_run == 0 => "Not checked yet".to_string(),
+        (None, _, 0) => "Everything is up to date".to_string(),
+        (None, _, 1) => "1 update available".to_string(),
+        (None, _, n) => format!("{n} updates available"),
+    };
+    let checked_at = schedule::BADGE_SECTIONS
+        .iter()
+        .filter_map(|s| last.section_ts.get(*s))
+        .copied()
+        .max()
+        .unwrap_or(cfg.last_run);
+    let checked = (checked_at > 0).then(|| format!("Checked {}", relative_time(checked_at, now)));
+
+    let mut sources = Vec::new();
+    for (id, label) in TRAY_SOURCES {
+        let n = cfg.last_counts.get(*id).copied().unwrap_or(0);
+        if n == 0 {
+            continue;
+        }
+        let lines = last.sections.get(*id).map(|v| v.as_slice()).unwrap_or(&[]);
+        let mut items = schedule::parse_items(id, lines);
+        schedule::apply_ignores(id, &mut items, &cfg.ignored);
+        let mut items: Vec<TrayItem> = items
+            .iter()
+            .filter(|i| !i.ignored)
+            .map(|i| TrayItem { id: i.id.clone(), name: i.name.clone(), text: tray_item_text(i) })
+            .collect();
+        let more = items.len().saturating_sub(TRAY_MAX_NAMES);
+        items.truncate(TRAY_MAX_NAMES);
+        sources.push(TraySource { id: id.to_string(), label: format!("{label} ({n})"), items, more });
+    }
+
+    let install_label = match total {
+        0 => "Install all".to_string(),
+        1 => "Install 1 update".to_string(),
+        n => format!("Install all {n} updates"),
+    };
+    TrayPlan { header, checked, sources, install_label, install_enabled: total > 0 && !busy, busy }
+}
+
+/// "Zoom  6.1.0 → 6.2.1", or less when a source reports no versions. Homebrew
+/// writes a build after a comma ("4.86.0,236216", sometimes a forty-character
+/// hash); a glance at the menu does not need it, so it is dropped unless it is
+/// the only thing that changed.
+fn tray_item_text(item: &schedule::CheckItem) -> String {
+    let from = item.installed.as_deref().unwrap_or("").trim();
+    let to = item.available.as_deref().unwrap_or("").trim();
+    let short = |v: &str| v.split(',').next().unwrap_or(v).trim().to_string();
+    let (from_s, to_s) = (short(from), short(to));
+    let (from, to) = if from_s == to_s && from != to { (from, to) } else { (from_s.as_str(), to_s.as_str()) };
+    match (from, to) {
+        (_, "") => item.name.clone(),
+        ("", to) => format!("{}  {to}", item.name),
+        (from, to) if from == to => item.name.clone(),
+        (from, to) => format!("{}  {from} → {to}", item.name),
+    }
+}
+
+fn relative_time(then: u64, now: u64) -> String {
+    let ago = now.saturating_sub(then);
+    match ago {
+        0..=59 => "just now".to_string(),
+        60..=119 => "a minute ago".to_string(),
+        120..=3599 => format!("{} minutes ago", ago / 60),
+        3600..=7199 => "an hour ago".to_string(),
+        7200..=86399 => format!("{} hours ago", ago / 3600),
+        86400..=172799 => "yesterday".to_string(),
+        _ => format!("{} days ago", ago / 86400),
+    }
+}
+
+fn refresh_tray_menu(app: &AppHandle) {
+    let Some(tray) = app.try_state::<Tray>() else { return };
+    let checks = TRAY_ACTIVITY.checks.load(std::sync::atomic::Ordering::SeqCst);
+    let installing = TRAY_ACTIVITY.installing.lock().ok().and_then(|g| g.clone());
+    let plan = tray_plan(&schedule::load(app), &schedule::load_last_check(app), checks, installing.as_deref(), now_secs());
+    if TRAY_PLAN.lock().ok().is_some_and(|g| g.as_ref() == Some(&plan)) {
+        return;
+    }
+    match build_tray_menu(app, &plan) {
+        Ok(menu) => {
+            if let Err(e) = tray.0.set_menu(Some(menu)) {
+                diag(app, &format!("menu bar: could not replace the menu: {e}"));
+                return;
+            }
+            if let Ok(mut g) = TRAY_PLAN.lock() {
+                *g = Some(plan);
+            }
+        }
+        Err(e) => diag(app, &format!("menu bar: could not build the menu: {e}")),
+    }
+}
+
+fn build_tray_menu(app: &AppHandle, plan: &TrayPlan) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> {
+    use tauri::menu::{IsMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu};
+    type Item = Box<dyn IsMenuItem<tauri::Wry>>;
+    let text = |id: String, label: &str, enabled: bool| -> tauri::Result<Item> {
+        Ok(Box::new(MenuItem::with_id(app, id, label, enabled, None::<&str>)?))
+    };
+
+    let mut items: Vec<Item> = vec![text("header".into(), &plan.header, false)?];
+    if let Some(checked) = &plan.checked {
+        items.push(text("checked".into(), checked, false)?);
+    }
+    if !plan.sources.is_empty() {
+        items.push(Box::new(PredefinedMenuItem::separator(app)?));
+    }
+    for src in &plan.sources {
+        if src.items.is_empty() {
+            items.push(text(format!("src:{}", src.id), &src.label, true)?);
+            continue;
+        }
+        let mut sub: Vec<Item> = vec![text(format!("hint:{}", src.id), "Click an app to update it", false)?];
+        for it in &src.items {
+            // The app's own id travels in the menu id, so a menu rebuilt under an
+            // open one cannot send the click to a neighbour.
+            sub.push(text(format!("item:{}:{}", src.id, it.id), &it.text, true)?);
+        }
+        if src.more > 0 {
+            sub.push(text(format!("more:{}", src.id), &format!("and {} more…", src.more), true)?);
+        }
+        let refs: Vec<&dyn IsMenuItem<tauri::Wry>> = sub.iter().map(|b| b.as_ref()).collect();
+        items.push(Box::new(Submenu::with_id_and_items(app, format!("src:{}", src.id), &src.label, true, &refs)?));
+    }
+    items.push(Box::new(PredefinedMenuItem::separator(app)?));
+    items.push(text("install".into(), &plan.install_label, plan.install_enabled)?);
+    items.push(text("check".into(), "Check now", !plan.busy)?);
+    items.push(Box::new(PredefinedMenuItem::separator(app)?));
+    items.push(text("open".into(), "Open PartyMAN", true)?);
+    items.push(text("quit".into(), "Quit PartyMAN", true)?);
+
+    let refs: Vec<&dyn IsMenuItem<tauri::Wry>> = items.iter().map(|b| b.as_ref()).collect();
+    Menu::with_items(app, &refs)
+}
+
+/// Brings the window up on one source — what a name in the dropdown does.
+fn open_section(app: &AppHandle, section: &str) {
+    show_main_window(app);
+    let _ = app.emit("open-section", section.to_string());
+}
+
+/// Apps and system updates, then everything that follows a check: the badge, the
+/// reminder, the window. Check now in the menu bar and the check at launch.
+async fn check_apps_and_report(app: AppHandle) {
+    let cfg = schedule::run_checks(&app, schedule::CheckScope::AppsOnly).await;
+    set_tray_count(&app, cfg.last_total);
+    schedule::notify_result(&app, &cfg);
+    let _ = app.emit("schedule-updated", cfg);
+}
+
+/// "item:<section>:<id>" as the dropdown labels an app, split back up.
+fn tray_item_id(menu_id: &str) -> Option<(&str, &str)> {
+    let rest = menu_id.strip_prefix("item:")?;
+    let (section, item) = rest.split_once(':')?;
+    (!section.is_empty() && !item.is_empty()).then_some((section, item))
+}
+
+/// Per source, the apps to update by id and name — or none, meaning the whole
+/// source.
+type TrayInstallPlan = Vec<(String, Vec<(String, String)>)>;
+
+/// The dropdown's Install all: everything the count reports, the way Install all
+/// in the window does it, but with no window needed.
+async fn install_outstanding_from_tray(app: AppHandle) {
+    if tray_is_installing() {
+        return;
+    }
+    let cfg = schedule::load(&app);
+    let last = schedule::load_last_check(&app);
+    let mut plan: TrayInstallPlan = Vec::new();
+    for (section, _) in TRAY_SOURCES {
+        if cfg.last_counts.get(*section).copied().unwrap_or(0) == 0 {
+            continue;
+        }
+        let lines = last.sections.get(*section).cloned().unwrap_or_default();
+        let items = schedule::items_for(&app, section, &lines)
+            .into_iter()
+            .filter(|i| !i.ignored)
+            .map(|i| (i.id, i.name))
+            .collect();
+        plan.push((section.to_string(), items));
+    }
+    if plan.is_empty() {
+        return;
+    }
+    let what = match cfg.last_total {
+        1 => "1 update".to_string(),
+        n => format!("{n} updates"),
+    };
+    diag(&app, &format!("menu bar: Install all ({what})"));
+    run_tray_install(app, what, plan).await;
+}
+
+/// One name clicked in the dropdown: update just that app.
+async fn install_one_from_tray(app: AppHandle, section: String, item_id: String) {
+    if tray_is_installing() {
+        diag(&app, &format!("menu bar: {item_id} clicked while an install is running; ignored"));
+        return;
+    }
+    // The name as the menu showed it; the id alone if the menu has moved on.
+    let name = TRAY_PLAN
+        .lock()
+        .ok()
+        .and_then(|g| {
+            g.as_ref()?
+                .sources
+                .iter()
+                .find(|s| s.id == section)?
+                .items
+                .iter()
+                .find(|i| i.id == item_id)
+                .map(|i| i.name.clone())
+        })
+        .unwrap_or_else(|| item_id.clone());
+    diag(&app, &format!("menu bar: update {name} ({section}: {item_id})"));
+    run_tray_install(app, name.clone(), vec![(section, vec![(item_id, name)])]).await;
+}
+
+/// Works through a plan source by source, in TRAY_SOURCES order: Homebrew first
+/// (that is what the password is for), the App Store next (it only opens the App
+/// Store), macOS last because it can restart the Mac. Homebrew asks for the
+/// password through the usual dialog and macOS through its own. It ends with a
+/// notification saying what happened, since nothing else need be on screen to
+/// say it.
+async fn run_tray_install(app: AppHandle, what: String, plan: TrayInstallPlan) {
+    tray_installing(&app, Some(what));
+
+    let mut installed: Vec<String> = Vec::new();
+    let mut failed: Vec<String> = Vec::new();
+    let mut cancelled: Vec<String> = Vec::new();
+    let mut app_store = 0usize;
+    for (section, items) in plan {
+        // The window follows along: whoever clicked in the menu bar gets the
+        // log of what they started, not a notification two minutes later.
+        open_section(&app, &section);
+        let outcomes = if items.is_empty() {
+            upgrade_section(&app, &section)
+                .await
+                .map(|o| vec![(section_label(&section).to_string(), o)])
+                .unwrap_or_default()
+        } else {
+            let (ids, names): (Vec<String>, Vec<String>) = items.into_iter().unzip();
+            upgrade_items(&app, &section, &ids, &names).await
+        };
+        if section == "app_store" {
+            // Only opened the App Store; the installs happen there.
+            app_store += outcomes.len().max(1);
+        } else {
+            for (name, outcome) in outcomes {
+                match outcome.as_str() {
+                    "ok" => installed.push(name),
+                    "cancelled" => cancelled.push(name),
+                    _ => failed.push(name),
+                }
+            }
+        }
+        settle_after_upgrade(&app, &section).await;
+    }
+
+    tray_installing(&app, None);
+    match install_summary(&installed, &failed, &cancelled, app_store) {
+        Some(body) => {
+            diag(&app, &format!("menu bar: install finished — {body}"));
+            use tauri_plugin_notification::NotificationExt;
+            let _ = app.notification().builder().title("PartyMAN Update Manager").body(body).show();
+        }
+        // Dismissing the password prompt was the user's own doing; no need to
+        // tell them about it.
+        None => diag(&app, &format!("menu bar: install finished — cancelled: {}", cancelled.join(", "))),
+    }
+}
+
+/// A sentence or two on how an install from the menu bar went, for the
+/// notification. None when the only thing that happened was the user
+/// dismissing the password prompt.
+fn install_summary(installed: &[String], failed: &[String], cancelled: &[String], app_store: usize) -> Option<String> {
+    fn list(names: &[String], what: &str) -> String {
+        match names {
+            [] => String::new(),
+            [a] => a.clone(),
+            [a, b] => format!("{a} and {b}"),
+            [a, b, c] => format!("{a}, {b} and {c}"),
+            _ => format!("{} {what}", names.len()),
+        }
+    }
+    let mut parts: Vec<String> = Vec::new();
+    if !installed.is_empty() {
+        parts.push(format!("Updated {}.", list(installed, "apps")));
+    }
+    if !failed.is_empty() {
+        parts.push(format!("{} failed.", list(failed, "updates")));
+    }
+    match app_store {
+        0 => {}
+        1 => parts.push("1 App Store update is waiting in the App Store.".to_string()),
+        n => parts.push(format!("{n} App Store updates are waiting in the App Store.")),
+    }
+    if parts.is_empty() {
+        if !cancelled.is_empty() {
+            return None;
+        }
+        return Some("Nothing was installed. Open PartyMAN for details.".to_string());
+    }
+    if !cancelled.is_empty() {
+        parts.push(format!("{} cancelled.", list(cancelled, "updates")));
+    }
+    if !failed.is_empty() {
+        parts.push("Open PartyMAN for details.".to_string());
+    }
+    Some(parts.join(" "))
+}
+
+
+// Redraws the icon with the count baked into its badge, and the dropdown with
+// the count's details. Cheap enough to do on every change: the icon is a 176x176
+// compose and downscale, the menu a dozen items.
 fn set_tray_count(app: &AppHandle, total: usize) {
     if let Some(tray) = app.try_state::<Tray>() {
         let _ = tray.0.set_icon(Some(tray_icon(total)));
         let tip = match total {
-            0 => "PM Updater — up to date".to_string(),
-            1 => "PM Updater — 1 update available".to_string(),
-            n => format!("PM Updater — {n} updates available"),
+            0 => "PartyMAN — up to date".to_string(),
+            1 => "PartyMAN — 1 update available".to_string(),
+            n => format!("PartyMAN — {n} updates available"),
         };
         let _ = tray.0.set_tooltip(Some(tip));
     }
+    refresh_tray_menu(app);
 }
 
 fn show_main_window(app: &AppHandle) {
@@ -2395,16 +3176,6 @@ fn set_schedule(app: AppHandle, config: schedule::ScheduleConfig) -> Result<sche
     schedule::sync_agent(&cfg)?;
     set_tray_count(&app, cfg.last_total);
     Ok(cfg)
-}
-
-// Re-checks one section, normally straight after installing its updates, so the
-// menu-bar count matches what is really installed.
-#[tauri::command]
-async fn recount_section(app: AppHandle, section: String) -> schedule::ScheduleConfig {
-    let cfg = schedule::recount(&app, &section).await;
-    set_tray_count(&app, cfg.last_total);
-    let _ = app.emit("schedule-updated", cfg.clone());
-    cfg
 }
 
 // Postpones the reminder without touching the count, so the menu bar stays honest
@@ -2492,36 +3263,52 @@ pub fn run() {
                 });
             }
 
-            let open = tauri::menu::MenuItem::with_id(app, "open", "Open PM Updater", true, None::<&str>)?;
-            let check = tauri::menu::MenuItem::with_id(app, "check", "Check Now", true, None::<&str>)?;
-            let quit = tauri::menu::MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-            let menu = tauri::menu::Menu::with_items(app, &[&open, &check, &quit])?;
-
-            let mut tray = tauri::tray::TrayIconBuilder::new()
-                .menu(&menu)
+            // The menu itself comes from set_tray_count below, and is rebuilt
+            // whenever the count changes.
+            let tray = tauri::tray::TrayIconBuilder::new()
                 .show_menu_on_left_click(true)
-                .on_menu_event(|app, event| match event.id.as_ref() {
-                    "open" => show_main_window(app),
-                    "check" => {
-                        diag(app, "menu bar: Check Now");
-                        let handle = app.clone();
-                        tauri::async_runtime::spawn(async move {
-                            let cfg = schedule::run_checks(&handle, schedule::CheckScope::AppsOnly).await;
-                            set_tray_count(&handle, cfg.last_total);
-                            schedule::notify_result(&handle, &cfg);
-                            let _ = handle.emit("schedule-updated", cfg);
-                        });
+                .on_menu_event(|app, event| {
+                    let id = event.id.as_ref();
+                    match id {
+                        "open" => show_main_window(app),
+                        "check" => {
+                            diag(app, "menu bar: Check now");
+                            tauri::async_runtime::spawn(check_apps_and_report(app.clone()));
+                        }
+                        "install" => {
+                            diag(app, "menu bar: Install all");
+                            tauri::async_runtime::spawn(install_outstanding_from_tray(app.clone()));
+                        }
+                        "quit" => {
+                            diag(app, "menu bar: Quit");
+                            app.exit(0)
+                        }
+                        // "item:<section>:<id>" updates that one app; "src:<section>"
+                        // and "more:<section>" bring the window up on the source.
+                        _ => {
+                            if let Some((section, item_id)) = tray_item_id(id) {
+                                tauri::async_runtime::spawn(install_one_from_tray(
+                                    app.clone(), section.to_string(), item_id.to_string(),
+                                ));
+                            } else if let Some(section) = id.split(':').nth(1) {
+                                diag(app, &format!("menu bar: open {section}"));
+                                open_section(app, section);
+                            }
+                        }
                     }
-                    "quit" => {
-                        diag(app, "menu bar: Quit");
-                        app.exit(0)
+                })
+                // The pointer arriving on the icon is the moment before the menu
+                // opens: the right time to bring "Checked … ago" up to date.
+                .on_tray_icon_event(|tray, event| {
+                    if matches!(event, tauri::tray::TrayIconEvent::Enter { .. }) {
+                        refresh_tray_menu(tray.app_handle());
                     }
-                    _ => {}
-                });
-            // Not a template: a template icon would discard the logo's colour and
-            // the badge along with it.
-            tray = tray.icon(tray_icon(0)).icon_as_template(false);
-            let tray = tray.build(app)?;
+                })
+                // Not a template: a template icon would discard the logo's colour and
+                // the badge along with it.
+                .icon(tray_icon(0))
+                .icon_as_template(false)
+                .build(app)?;
             app.manage(Tray(tray));
 
             // Whatever the last run found, so the count is right straight away.
@@ -2543,12 +3330,7 @@ pub fn run() {
             if startup_cfg.check_on_launch {
                 let launch_handle = handle.clone();
                 diag(&handle, "check on launch");
-                tauri::async_runtime::spawn(async move {
-                    let cfg = schedule::run_checks(&launch_handle, schedule::CheckScope::AppsOnly).await;
-                    set_tray_count(&launch_handle, cfg.last_total);
-                    schedule::notify_result(&launch_handle, &cfg);
-                    let _ = launch_handle.emit("schedule-updated", cfg);
-                });
+                tauri::async_runtime::spawn(check_apps_and_report(launch_handle));
             }
 
             // While the app is open it does the scheduled runs itself.
@@ -2556,6 +3338,7 @@ pub fn run() {
             tauri::async_runtime::spawn(async move {
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    refresh_tray_menu(&timer_handle);
                     let cfg = schedule::load(&timer_handle);
                     if !cfg.enabled {
                         continue;
@@ -2576,11 +3359,151 @@ pub fn run() {
             run_check, run_upgrade, run_upgrade_items, get_platform,
             get_upgrade_history, search_cask, track_app, track_apps,
             check_app_update, open_release_url, get_release_notes, resolve_cask_input,
-            get_schedule, set_schedule, run_schedule_now, snooze_updates, get_last_check, recount_section, next_run,
-            open_logs_folder, ignore_item, unignore_item
+            get_schedule, set_schedule, run_schedule_now, snooze_updates, get_last_check, next_run,
+            open_logs_folder, ignore_item, unignore_item, app_management_status, open_app_management_settings,
+            tooling_status, setup_homebrew
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tray_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    fn item(id: &str, name: &str, from: &str, to: &str) -> String {
+        format!("{}{id}\t{name}\t{from}\t{to}\t", schedule::ITEM_LINE)
+    }
+
+    fn state(casks: &[String], mas: usize, now: u64) -> (schedule::ScheduleConfig, schedule::LastCheck) {
+        let mut cfg = schedule::ScheduleConfig::default();
+        cfg.last_run = now - 600;
+        cfg.last_counts = BTreeMap::from([
+            ("brew_casks".to_string(), casks.len()),
+            ("app_store".to_string(), mas),
+            ("macos_updates".to_string(), 0),
+            ("brew_formulae".to_string(), 84),
+        ]);
+        let mut last = schedule::LastCheck::default();
+        last.sections.insert("brew_casks".to_string(), casks.to_vec());
+        last.section_ts.insert("brew_casks".to_string(), now - 600);
+        last.section_ts.insert("brew_formulae".to_string(), now - 5);
+        (cfg, last)
+    }
+
+    #[test]
+    fn the_dropdown_lists_outstanding_sources_by_name_and_leaves_the_rest_out() {
+        let now = 1_700_000_000;
+        let casks = vec![item("zoom", "Zoom", "6.1.0", "6.2.1"), item("slack", "Slack", "", "4.45")];
+        let (cfg, last) = state(&casks, 1, now);
+        let plan = tray_plan(&cfg, &last, 0, None, now);
+        assert_eq!(plan.header, "3 updates available");
+        // Developer tooling was checked seconds ago, but it is not part of the
+        // count, so the time shown is the apps' check.
+        assert_eq!(plan.checked.as_deref(), Some("Checked 10 minutes ago"));
+        assert_eq!(plan.sources.len(), 2, "{:?}", plan.sources);
+        assert_eq!(plan.sources[0].label, "Homebrew apps (2)");
+        let texts: Vec<&str> = plan.sources[0].items.iter().map(|i| i.text.as_str()).collect();
+        assert_eq!(texts, vec!["Zoom  6.1.0 → 6.2.1", "Slack  4.45"]);
+        assert_eq!(plan.sources[0].items[0].id, "zoom");
+        assert_eq!(plan.sources[1].label, "App Store (1)");
+        assert!(plan.sources[1].items.is_empty(), "no stored output, so no names");
+        assert_eq!(plan.install_label, "Install all 3 updates");
+        assert!(plan.install_enabled && !plan.busy);
+    }
+
+    #[test]
+    fn homebrew_build_suffixes_are_dropped_from_the_menu_unless_they_are_the_change() {
+        let it = |from: &str, to: &str| schedule::CheckItem {
+            id: "x".into(), name: "Docker".into(), app_dir: None,
+            installed: Some(from.into()), available: Some(to.into()), note: None, ignored: false,
+        };
+        assert_eq!(tray_item_text(&it("4.86.0,236216", "4.93.0,240920")), "Docker  4.86.0 → 4.93.0");
+        assert_eq!(tray_item_text(&it("2.9939.2,d3e50475", "2.16120.0,801c07c2")), "Docker  2.9939.2 → 2.16120.0");
+        assert_eq!(tray_item_text(&it("4.86.0,236216", "4.86.0,240920")), "Docker  4.86.0,236216 → 4.86.0,240920");
+        assert_eq!(tray_item_text(&it("", "15.6")), "Docker  15.6");
+        assert_eq!(tray_item_text(&it("", "")), "Docker");
+    }
+
+    #[test]
+    fn ignored_items_are_neither_counted_nor_listed() {
+        let now = 1_700_000_000;
+        let casks = vec![item("zoom", "Zoom", "6.1.0", "6.2.1")];
+        let (mut cfg, last) = state(&casks, 0, now);
+        cfg.ignored.push(schedule::IgnoredItem {
+            section: "brew_casks".into(), id: "zoom".into(), name: "Zoom".into(), available: "6.2.1".into(), since: now,
+        });
+        cfg.last_counts.insert("brew_casks".to_string(), 0);
+        let plan = tray_plan(&cfg, &last, 0, None, now);
+        assert_eq!(plan.header, "Everything is up to date");
+        assert!(plan.sources.is_empty());
+        assert_eq!(plan.install_label, "Install all");
+        assert!(!plan.install_enabled);
+    }
+
+    #[test]
+    fn the_header_says_what_is_going_on() {
+        let now = 1_700_000_000;
+        let (cfg, last) = state(&[item("zoom", "Zoom", "1", "2")], 0, now);
+        assert_eq!(tray_plan(&cfg, &last, 1, None, now).header, "Checking for updates…");
+        let busy = tray_plan(&cfg, &last, 0, Some("5 updates"), now);
+        assert_eq!(busy.header, "Installing 5 updates…");
+        assert!(busy.busy && !busy.install_enabled);
+        assert_eq!(tray_plan(&cfg, &last, 0, Some("Brave"), now).header, "Installing Brave…");
+        let mut fresh = schedule::ScheduleConfig::default();
+        fresh.last_run = 0;
+        let plan = tray_plan(&fresh, &schedule::LastCheck::default(), 0, None, now);
+        assert_eq!(plan.header, "Not checked yet");
+        assert_eq!(plan.checked, None);
+    }
+
+    #[test]
+    fn long_lists_are_cut_with_a_count_of_the_rest() {
+        let now = 1_700_000_000;
+        let casks: Vec<String> = (0..20).map(|i| item(&format!("app{i}"), &format!("App {i}"), "1", "2")).collect();
+        let (cfg, last) = state(&casks, 0, now);
+        let plan = tray_plan(&cfg, &last, 0, None, now);
+        assert_eq!(plan.sources[0].items.len(), TRAY_MAX_NAMES);
+        assert_eq!(plan.sources[0].more, 20 - TRAY_MAX_NAMES);
+    }
+
+    #[test]
+    fn a_menu_id_names_the_app_to_update() {
+        assert_eq!(tray_item_id("item:brew_casks:visual-studio-code"), Some(("brew_casks", "visual-studio-code")));
+        assert_eq!(tray_item_id("item:macos_updates:macOS Sequoia 15.6.1-24G90"), Some(("macos_updates", "macOS Sequoia 15.6.1-24G90")));
+        assert_eq!(tray_item_id("src:brew_casks"), None);
+        assert_eq!(tray_item_id("item:brew_casks:"), None);
+        assert_eq!(tray_item_id("hint:brew_casks"), None);
+    }
+
+    #[test]
+    fn relative_times_read_naturally() {
+        let now = 1_000_000;
+        assert_eq!(relative_time(now - 10, now), "just now");
+        assert_eq!(relative_time(now - 90, now), "a minute ago");
+        assert_eq!(relative_time(now - 25 * 60, now), "25 minutes ago");
+        assert_eq!(relative_time(now - 3700, now), "an hour ago");
+        assert_eq!(relative_time(now - 5 * 3600, now), "5 hours ago");
+        assert_eq!(relative_time(now - 30 * 3600, now), "yesterday");
+        assert_eq!(relative_time(now - 3 * 86400, now), "3 days ago");
+    }
+
+    #[test]
+    fn the_summary_names_what_happened() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert_eq!(install_summary(&s(&["Zoom"]), &[], &[], 0).as_deref(), Some("Updated Zoom."));
+        assert_eq!(install_summary(&s(&["Zoom", "Slack", "Firefox"]), &[], &[], 0).as_deref(), Some("Updated Zoom, Slack and Firefox."));
+        assert_eq!(install_summary(&s(&["A", "B", "C", "D"]), &[], &[], 0).as_deref(), Some("Updated 4 apps."));
+        assert_eq!(
+            install_summary(&s(&["Zoom"]), &s(&["Slack"]), &[], 2).as_deref(),
+            Some("Updated Zoom. Slack failed. 2 App Store updates are waiting in the App Store. Open PartyMAN for details.")
+        );
+        assert_eq!(install_summary(&[], &[], &[], 0).as_deref(), Some("Nothing was installed. Open PartyMAN for details."));
+        // The user dismissed the prompt themselves: nothing to tell them.
+        assert_eq!(install_summary(&[], &[], &s(&["Postman"]), 0), None);
+        assert_eq!(install_summary(&s(&["Zoom"]), &[], &s(&["Postman"]), 0).as_deref(), Some("Updated Zoom. Postman cancelled."));
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -2775,6 +3698,11 @@ echo after >&2
         // No markers at all: the exit status decides.
         assert_eq!(outcome_from_lines(&l(&["brew: command not found"]), Some(127)), "failed");
         assert_eq!(outcome_from_lines(&l(&["✔  App Store opened"]), None), "ok");
+        // A dismissed password prompt is its own outcome, for Homebrew and for macOS.
+        assert_eq!(outcome_from_lines(&l(&["sudo: no password was provided", "↩  Cancelled: postman was left as it was."]), Some(1)), "cancelled");
+        assert_eq!(outcome_from_lines(&l(&["execution error: User canceled. (-128)", "→  macOS update complete."]), Some(0)), "cancelled");
+        // Homebrew 5 ticks off each download; that is not a result.
+        assert_eq!(outcome_from_lines(&l(&["\u{2714}\u{FE0E} Cask brave-browser (1.96.60.0)", "✖  Update failed for brave-browser."]), Some(1)), "failed");
     }
 
     #[test]
