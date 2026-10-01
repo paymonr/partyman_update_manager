@@ -59,6 +59,22 @@ pub struct ScheduleConfig {
     pub show_dev_tools: bool,
     /// Items set aside until something newer turns up. See apply_ignores.
     pub ignored: Vec<IgnoredItem>,
+    /// Homebrew's own version against its latest release, from the last run.
+    pub brew_self: BrewSelf,
+}
+
+/// Whether Homebrew itself is current. Checked with every run and shown as a
+/// banner when a newer release is out; it never counts as an update.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct BrewSelf {
+    /// "7.0.7" — the release the installed Homebrew is based on. Empty when
+    /// Homebrew is not installed.
+    pub installed: String,
+    /// The latest release on GitHub, or empty when that could not be fetched.
+    pub latest: String,
+    pub checked: u64,
+    pub outdated: bool,
 }
 
 /// An item the user has chosen not to count for now: an app they update some
@@ -92,6 +108,7 @@ impl Default for ScheduleConfig {
             check_on_launch: false,
             show_dev_tools: false,
             ignored: Vec::new(),
+            brew_self: BrewSelf::default(),
         }
     }
 }
@@ -222,6 +239,11 @@ pub struct CheckItem {
     /// "restart" when installing it restarts the Mac.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// The app bundle on disk ("/Applications/Brave Browser.app"), when the
+    /// check found it. Used to see whether the app is running before it is
+    /// replaced.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub app_path: Option<String>,
     /// Set aside by the user; listed, but not counted or preselected.
     pub ignored: bool,
 }
@@ -271,7 +293,8 @@ fn parse_item_line(line: &str) -> Option<CheckItem> {
     let installed = opt(f.next());
     let available = opt(f.next());
     let note = opt(f.next());
-    Some(CheckItem { id, name, app_dir: None, installed, available, note, ignored: false })
+    let app_path = opt(f.next());
+    Some(CheckItem { id, name, app_dir: None, installed, available, note, app_path, ignored: false })
 }
 
 // The one place a check's output is turned into items: the menu-bar count, the
@@ -807,12 +830,16 @@ pub async fn run_checks(app: &AppHandle, scope: CheckScope) -> ScheduleConfig {
             section_started.elapsed().as_secs(),
         ));
         counts.insert(section.to_string(), n);
+        crate::emit_section_result(app, section, &lines);
         last.sections.insert(section.to_string(), lines);
         last.section_ts.insert(section.to_string(), now);
     }
     save_last_check(app, &last);
-    crate::tray_checking(app, false);
     let mut cfg = load(app);
+    // Homebrew itself, last: the checks above let it bring itself up to date,
+    // so this records where that left it.
+    cfg.brew_self = crate::check_brew_self(app, &cfg.brew_self).await;
+    crate::tray_checking(app, false);
     cfg.last_run = now;
     cfg.last_total = total_from_counts(&counts);
     cfg.last_counts = counts;
@@ -1000,6 +1027,14 @@ pub async fn run_scheduled(app: &AppHandle) -> ScheduleConfig {
 /// Re-checks a single section after it has been upgraded, so the count reflects
 /// what is now installed rather than what was outstanding before. Cheaper than a
 /// full run, which is why it can happen after every install.
+/// Re-reads Homebrew's own version, after Update Homebrew has run.
+pub async fn refresh_brew_self(app: &AppHandle) -> ScheduleConfig {
+    let mut cfg = load(app);
+    cfg.brew_self = crate::check_brew_self(app, &cfg.brew_self).await;
+    let _ = save(app, &cfg);
+    cfg
+}
+
 /// Records what one section's check found: its count, the total, and the output
 /// the app preloads next time. Used after an upgrade and whenever the user runs a
 /// check, so Check All and Run Check move the count as well as a scheduled run.

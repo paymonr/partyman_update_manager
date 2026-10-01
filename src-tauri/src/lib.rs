@@ -1268,6 +1268,9 @@ struct RunResult {
     /// and the readers were left behind: a sign of a process the run started
     /// and did not wait for.
     drained: bool,
+    /// The user stopped it (see cancel_upgrade); what the lines say about the
+    /// outcome is then beside the point.
+    cancelled: bool,
 }
 
 async fn stream_child<F>(child: &mut Child, on_line: F) -> RunResult
@@ -1295,7 +1298,7 @@ where
 
     // Dropping the handles detaches any reader still running; it does not stop it.
     let lines = sink.lock().ok().and_then(|mut s| s.take()).unwrap_or_default();
-    RunResult { lines, exit_code, drained }
+    RunResult { lines, exit_code, drained, cancelled: false }
 }
 
 fn spawn_line_reader<R, F>(pipe: R, sink: LineSink, on_line: Arc<F>) -> tokio::task::JoinHandle<()>
@@ -1338,7 +1341,7 @@ async fn run_shell(app: &AppHandle, section: &str, script: &str) -> RunResult {
             diag(app, &format!("check {section}: failed to start the shell: {e}"));
             emit_line(app, section, &format!("Failed to spawn: {e}")).await;
             emit_status(app, section, "error").await;
-            return RunResult { lines: vec![], exit_code: None, drained: true };
+            return RunResult { lines: vec![], exit_code: None, drained: true, cancelled: false };
         }
     };
 
@@ -1661,15 +1664,22 @@ async fn run_upgrade_shell(app: &AppHandle, section: &str, script: &str) -> RunR
             diag(app, &format!("update {section}: failed to start the shell: {e}"));
             emit_upgrade_line(app, section, &format!("Failed to spawn: {e}")).await;
             emit_upgrade_status(app, section, "error").await;
-            return RunResult { lines: vec![], exit_code: None, drained: true };
+            return RunResult { lines: vec![], exit_code: None, drained: true, cancelled: false };
         }
     };
+
+    // Known to cancel_upgrade for as long as it runs.
+    let pid = child.id();
+    let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    if let Some(pid) = pid {
+        register_running(section, pid, cancelled.clone());
+    }
 
     let started = std::time::Instant::now();
     let app1 = app.clone();
     let sec1 = section.to_string();
-    let result = stream_child(&mut child, move |line| {
-        if !line.starts_with(CASK_MARKER_PREFIX) {
+    let mut result = stream_child(&mut child, move |line| {
+        if !line.starts_with(CASK_MARKER_PREFIX) && !is_shell_noise(line) {
             let _ = app1.emit(
                 "upgrade-output",
                 OutputPayload { section: sec1.clone(), line: line.to_string() },
@@ -1677,15 +1687,271 @@ async fn run_upgrade_shell(app: &AppHandle, section: &str, script: &str) -> RunR
         }
     })
     .await;
+    if let Some(pid) = pid {
+        unregister_running(pid);
+    }
+    result.cancelled = cancelled.load(std::sync::atomic::Ordering::SeqCst);
+    result.lines.retain(|l| !is_shell_noise(l));
     diag(app, &format!(
-        "update {section}: exit {} after {}s, {} lines{}",
+        "update {section}: exit {} after {}s, {} lines{}{}",
         result.exit_code.map_or("none".to_string(), |c| c.to_string()),
         secs_since(started),
         result.lines.len(),
         if result.drained { "" } else { " — output still open after exit; readers detached" },
+        if result.cancelled { " — stopped by the user" } else { "" },
     ));
     emit_upgrade_status(app, section, "done").await;
     result
+}
+
+// ---------------------------------------------------------------------------
+// Stopping a run
+// ---------------------------------------------------------------------------
+
+/// An upgrade shell that is running now. The shell is a session leader (see
+/// attach_controlling_pty), so its pid is also the process group to signal:
+/// the shell, Homebrew, its curl, sudo waiting on the password dialog.
+struct RunningUpgrade {
+    section: String,
+    pid: u32,
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
+}
+
+static RUNNING_UPGRADES: Mutex<Vec<RunningUpgrade>> = Mutex::new(Vec::new());
+
+fn register_running(section: &str, pid: u32, cancelled: Arc<std::sync::atomic::AtomicBool>) {
+    if let Ok(mut g) = RUNNING_UPGRADES.lock() {
+        g.push(RunningUpgrade { section: section.to_string(), pid, cancelled });
+    }
+}
+
+fn unregister_running(pid: u32) {
+    if let Ok(mut g) = RUNNING_UPGRADES.lock() {
+        g.retain(|r| r.pid != pid);
+    }
+}
+
+fn running_for(section: &str) -> Option<(u32, Arc<std::sync::atomic::AtomicBool>)> {
+    RUNNING_UPGRADES
+        .lock()
+        .ok()?
+        .iter()
+        .find(|r| r.section == section)
+        .map(|r| (r.pid, r.cancelled.clone()))
+}
+
+fn still_running(pid: u32) -> bool {
+    RUNNING_UPGRADES.lock().map(|g| g.iter().any(|r| r.pid == pid)).unwrap_or(false)
+}
+
+const SIG_TERM: i32 = 15;
+const SIG_KILL: i32 = 9;
+
+/// bash reports a job the stop signal ended ("bash: line 136: 57478 Terminated:
+/// 15  tee …"); the user already knows, having pressed Stop.
+fn is_shell_noise(line: &str) -> bool {
+    line.starts_with("bash: line ") && (line.contains("Terminated: 15") || line.contains("Killed: 9"))
+}
+
+#[cfg(unix)]
+fn signal_group(pid: u32, signal: i32) {
+    // Negative pid: the whole process group.
+    unsafe {
+        libc::kill(-(pid as libc::c_int), signal as libc::c_int);
+    }
+}
+
+#[cfg(not(unix))]
+fn signal_group(_pid: u32, _signal: i32) {}
+
+/// SIGTERM to the run's process group, so Homebrew gets to put the half-done
+/// cask back and purge what it staged; SIGKILL if it is still there ten
+/// seconds later. The caller's wait on the shell ends either way.
+fn stop_run(app: &AppHandle, section: &str, pid: u32, cancelled: &std::sync::atomic::AtomicBool) {
+    cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
+    diag(app, &format!("update {section}: stop requested; signalling process group {pid}"));
+    let _ = app.emit("upgrade-output", OutputPayload {
+        section: section.to_string(),
+        line: "↩  Stopping… the app being updated is put back as it was; finished apps stay updated.".to_string(),
+    });
+    signal_group(pid, SIG_TERM);
+    let handle = app.clone();
+    let section = section.to_string();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        if still_running(pid) {
+            diag(&handle, &format!("update {section}: still running 10s after SIGTERM; SIGKILL to group {pid}"));
+            signal_group(pid, SIG_KILL);
+        }
+    });
+}
+
+/// Stop, in the window's Log view. Not for macOS updates: softwareupdate runs
+/// as root under the system's own authorization, out of our reach, and a
+/// system install stopped halfway is worse than one finished.
+#[tauri::command]
+fn cancel_upgrade(app: AppHandle, section: String) -> Result<(), String> {
+    if section == "macos_updates" {
+        return Err("macOS installs can't be stopped once they've started.".to_string());
+    }
+    let (pid, cancelled) = running_for(&section).ok_or_else(|| "Nothing is running for this source.".to_string())?;
+    stop_run(&app, &section, pid, &cancelled);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Apps that are open while they are replaced
+// ---------------------------------------------------------------------------
+//
+// Homebrew swaps the bundle under a running app. The running copy carries on
+// from memory, but Chromium and Electron apps start helper processes from the
+// bundle as they go, and after the swap those crash until the app is relaunched.
+// So the window asks first, and can quit the apps and reopen them afterwards.
+
+#[derive(Clone, serde::Serialize)]
+struct RunningApp {
+    id: String,
+    name: String,
+    path: String,
+}
+
+/// The selected items of a section that have an app on disk, from the last
+/// check's record.
+fn apps_for(app: &AppHandle, section: &str, ids: &[String]) -> Vec<RunningApp> {
+    let last = schedule::load_last_check(app);
+    let lines = last.sections.get(section).cloned().unwrap_or_default();
+    schedule::items_for(app, section, &lines)
+        .into_iter()
+        .filter(|i| ids.contains(&i.id))
+        .filter_map(|i| i.app_path.map(|path| RunningApp { id: i.id, name: i.name, path }))
+        .collect()
+}
+
+/// Which of these app bundles have a process running from inside them.
+async fn running_among(paths: &[String]) -> Vec<String> {
+    let out = Command::new("ps").args(["-axo", "comm="]).output().await;
+    let ps = out.map(|o| String::from_utf8_lossy(&o.stdout).to_string()).unwrap_or_default();
+    running_from_ps(&ps, paths)
+}
+
+fn running_from_ps(ps: &str, paths: &[String]) -> Vec<String> {
+    paths
+        .iter()
+        .filter(|p| {
+            let prefix = format!("{p}/");
+            ps.lines().any(|l| l.starts_with(&prefix))
+        })
+        .cloned()
+        .collect()
+}
+
+/// Which of the selected apps are open right now. The window asks before an
+/// update so it can offer to quit them.
+#[tauri::command]
+async fn running_apps(app: AppHandle, section: String, items: Vec<String>) -> Vec<RunningApp> {
+    let apps = apps_for(&app, &section, &items);
+    let paths: Vec<String> = apps.iter().map(|a| a.path.clone()).collect();
+    let running = running_among(&paths).await;
+    apps.into_iter().filter(|a| running.contains(&a.path)).collect()
+}
+
+/// Asks each app to quit the polite way (so it can offer to save), and waits
+/// for it to go. Returns the ones that did; the rest are left to the user.
+async fn quit_apps(app: &AppHandle, section: &str, apps: &[RunningApp]) -> Vec<RunningApp> {
+    let mut quit = Vec::new();
+    for a in apps {
+        emit_upgrade_line(app, section, &format!("→  Quitting {}…", a.name)).await;
+        let bundle_id = Command::new("/usr/libexec/PlistBuddy")
+            .args(["-c", "Print :CFBundleIdentifier", &format!("{}/Contents/Info.plist", a.path)])
+            .output()
+            .await
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .filter(|s| !s.is_empty());
+        let script = match &bundle_id {
+            Some(id) => format!("tell application id \"{id}\" to quit"),
+            None => format!("tell application \"{}\" to quit", a.path.replace('"', "")),
+        };
+        let _ = tokio::time::timeout(
+            Duration::from_secs(20),
+            Command::new("osascript").args(["-e", &script]).output(),
+        )
+        .await;
+        let mut gone = false;
+        for _ in 0..30 {
+            if running_among(std::slice::from_ref(&a.path)).await.is_empty() {
+                gone = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        if gone {
+            quit.push(a.clone());
+        } else {
+            emit_upgrade_line(app, section, &format!(
+                "⚠  {} is still open — it may have asked about unsaved work. Updating anyway; relaunch it afterwards.",
+                a.name
+            )).await;
+        }
+    }
+    quit
+}
+
+/// Brings back what quit_apps closed, in the background so the log stays in
+/// front. Only apps that are still on disk: a failed update restores the old
+/// bundle, a cancelled one leaves it, so this is nearly always all of them.
+async fn reopen_apps(app: &AppHandle, section: &str, apps: &[RunningApp]) {
+    for a in apps {
+        if !std::path::Path::new(&a.path).exists() {
+            continue;
+        }
+        emit_upgrade_line(app, section, &format!("→  Reopening {}.", a.name)).await;
+        let _ = Command::new("open").args(["-g", &a.path]).output().await;
+    }
+}
+
+/// What became of each cask in a batch, read from the run's output. A cask
+/// whose part of the output never reached its exit line was stopped in the
+/// middle; one the shell never got to was stopped before it started. Both are
+/// "cancelled" when the run was stopped, "failed" otherwise.
+struct CaskOutcome {
+    token: String,
+    name: String,
+    outcome: String,
+    lines: Vec<String>,
+    exit_code: Option<i32>,
+    /// False for a cask the shell never started on.
+    reached: bool,
+}
+
+fn cask_outcomes(pairs: &[(String, String)], lines: &[String], cancelled: bool) -> Vec<CaskOutcome> {
+    let groups = split_by_item(lines);
+    let mut out = Vec::new();
+    for (token, name) in pairs {
+        match groups.iter().find(|(t, _, _)| t == token) {
+            Some((_, body, exit)) => {
+                let mut body = body.clone();
+                let outcome = if cancelled && exit.is_none() {
+                    body.push(format!("↩  Cancelled: {name} was left as it was."));
+                    "cancelled".to_string()
+                } else {
+                    outcome_from_lines(&body, *exit).to_string()
+                };
+                out.push(CaskOutcome {
+                    token: token.clone(), name: name.clone(), outcome, lines: body, exit_code: *exit, reached: true,
+                });
+            }
+            None => {
+                let (outcome, lines) = if cancelled {
+                    ("cancelled".to_string(), vec![format!("↩  Cancelled before it started: {name} was left as it was.")])
+                } else {
+                    ("failed".to_string(), vec![])
+                };
+                out.push(CaskOutcome { token: token.clone(), name: name.clone(), outcome, lines, exit_code: None, reached: false });
+            }
+        }
+    }
+    out
 }
 
 fn check_script(section: &str) -> Option<&'static str> {
@@ -1736,28 +2002,74 @@ if command -v brew &>/dev/null; then
     updatable="$updatable$tok
 "
   done <<< "$outdated"
-  if [ -z "$updatable" ]; then
+  # "1.96.60.0", "v1.96.60", "1.96.60 (5)" and "4.86.0,236216" all read as
+  # 1.96.60 / 4.86.0: the comma starts Homebrew's build number, and trailing
+  # zero components say nothing.
+  pm_norm_ver() { printf '%s' "${1%%,*}" | sed -E 's/^v//; s/[^0-9.].*$//; s/(\.0+)+$//; s/^$/0/'; }
+  # True when the app's own version is at or past the cask's. Apps that update
+  # themselves get ahead of what Homebrew recorded for them, and reinstalling
+  # then only puts back the same build — or an older one if the cask lags.
+  pm_app_is_current() {
+    local appv
+    appv=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$1/Contents/Info.plist" 2>/dev/null)
+    case "$appv" in [0-9]*) ;; *) return 1 ;; esac
+    case "$2" in [0-9]*) ;; *) return 1 ;; esac
+    appv=$(pm_norm_ver "$appv"); local caskv; caskv=$(pm_norm_ver "$2")
+    [ "$appv" = "$caskv" ] && return 0
+    [ "$(printf '%s\n%s\n' "$appv" "$caskv" | sort -V | tail -1)" = "$appv" ]
+  }
+  rows=""
+  if [ -n "$updatable" ] && [ -n "$info" ]; then
+    rows=$(printf '%s' "$info" \
+      | jq -r '.casks[] | select(.disabled != true)
+          | [.token, (.name[0] // .token), (.installed // ""), (.version // ""),
+             first(((.artifacts[]?.app[]? | strings), ""))] | @tsv' 2>/dev/null)
+  fi
+  items=""
+  current=""
+  while IFS=$'\t' read -r tok name inst ver appname; do
+    [ -z "$tok" ] && continue
+    path=""
+    if [ -n "$appname" ]; then
+      for cand in "/Applications/$appname" "$HOME/Applications/$appname"; do
+        [ -d "$cand" ] && { path="$cand"; break; }
+      done
+    fi
+    if [ -n "$path" ] && pm_app_is_current "$path" "$ver"; then
+      current="$current$name|$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$path/Contents/Info.plist" 2>/dev/null)|${inst%%,*}
+"
+    else
+      items="$items$tok	$name	$inst	$ver	$path
+"
+    fi
+  done <<< "$rows"
+  if [ -z "$updatable" ] || { [ -n "$rows" ] && [ -z "$items" ]; }; then
     echo "✔  All Homebrew cask apps are up to date."
   else
     echo "⚠  Outdated apps:"
-    if [ -n "$info" ]; then
+    if [ -n "$rows" ]; then
       # One item line per updatable cask — token to act on, name to show,
-      # installed and available versions — and a readable line beside it.
-      printf '%s' "$info" \
-        | jq -r '.casks[] | select(.disabled != true)
-            | [.token, (.name[0] // .token), (.installed // ""), (.version // "")] | @tsv' 2>/dev/null \
-        | while IFS=$'\t' read -r tok name inst ver; do
-          [ -z "$tok" ] && continue
-          printf '__PM_ITEM__\t%s\t%s\t%s\t%s\t\n' "$tok" "$name" "$inst" "$ver"
-          if [ -n "$inst" ]; then
-            printf '   %s  %s → %s  (%s)\n' "$name" "${inst%%,*}" "${ver%%,*}" "$tok"
-          else
-            printf '   %s  → %s  (%s)\n' "$name" "${ver%%,*}" "$tok"
-          fi
-        done
+      # installed and available versions, the app on disk — and a readable
+      # line beside it.
+      printf '%s' "$items" | while IFS=$'\t' read -r tok name inst ver path; do
+        [ -z "$tok" ] && continue
+        printf '__PM_ITEM__\t%s\t%s\t%s\t%s\t\t%s\n' "$tok" "$name" "$inst" "$ver" "$path"
+        if [ -n "$inst" ]; then
+          printf '   %s  %s → %s  (%s)\n' "$name" "${inst%%,*}" "${ver%%,*}" "$tok"
+        else
+          printf '   %s  → %s  (%s)\n' "$name" "${ver%%,*}" "$tok"
+        fi
+      done
     else
       printf '%s' "$updatable" | while read -r line; do echo "   $line"; done
     fi
+  fi
+  if [ -n "$current" ]; then
+    echo "→  Already current. These updated themselves since Homebrew installed them, so there is nothing to do:"
+    printf '%s' "$current" | while IFS='|' read -r name appv inst; do
+      [ -z "$name" ] && continue
+      echo "   $name  $appv  (Homebrew's record still says $inst)"
+    done
   fi
   if [ -n "$disabled" ]; then
     echo "→  Homebrew has disabled these, so it can no longer update them. They are not counted:"
@@ -2198,8 +2510,8 @@ async fn run_upgrade(app: AppHandle, section: String) {
 }
 
 #[tauri::command]
-async fn run_upgrade_items(app: AppHandle, section: String, items: Vec<String>, item_names: Vec<String>) {
-    upgrade_items(&app, &section, &items, &item_names).await;
+async fn run_upgrade_items(app: AppHandle, section: String, items: Vec<String>, item_names: Vec<String>, quit_first: Option<Vec<String>>) {
+    upgrade_items(&app, &section, &items, &item_names, &quit_first.unwrap_or_default()).await;
     settle_after_upgrade(&app, &section).await;
 }
 
@@ -2213,22 +2525,26 @@ async fn settle_after_upgrade(app: &AppHandle, section: &str) {
         return;
     }
     let lines = run_check_collect(section).await;
-    let items = schedule::items_for(app, section, &lines);
     let cfg = schedule::record_section(app, section, lines.clone());
     set_tray_count(app, cfg.last_total);
-    // The window's list is what its sidebar counts from, so it gets the fresh
-    // result too — otherwise the app just updated would sit there as outdated
-    // until the next check.
-    let _ = app.emit("section-recounted", RecountPayload {
-        section: section.to_string(),
-        items,
-        lines: lines.into_iter().filter(|l| !l.starts_with("__PM_")).collect(),
-    });
+    emit_section_result(app, section, &lines);
     let _ = app.emit("schedule-updated", cfg);
 }
 
-/// What the re-check after an upgrade found, for the window to show without a
-/// check of its own.
+/// Hands a check's result to the window, from a run the window did not start:
+/// the re-check after an upgrade, a scheduled run, Check now in the menu bar.
+/// The window's list is what its sidebar counts from, so without this the
+/// list would sit on what it last saw until the user checked again.
+pub(crate) fn emit_section_result(app: &AppHandle, section: &str, lines: &[String]) {
+    let items = schedule::items_for(app, section, lines);
+    let _ = app.emit("section-recounted", RecountPayload {
+        section: section.to_string(),
+        items,
+        lines: lines.iter().filter(|l| !l.starts_with("__PM_")).cloned().collect(),
+    });
+}
+
+/// What a check found, for the window to show without a check of its own.
 #[derive(Clone, serde::Serialize)]
 struct RecountPayload {
     section: String,
@@ -2250,7 +2566,8 @@ async fn upgrade_section(app: &AppHandle, section: &str) -> Option<String> {
     diag(app, &format!("update {section}: everything ({run_id})"));
     let started = std::time::Instant::now();
     let result = run_upgrade_shell(app, section, &script).await;
-    let outcome = outcome_from_lines(&result.lines, result.exit_code).to_string();
+    let exit_code = result.exit_code;
+    let (lines, outcome) = settle_outcome(app, section, result, "everything").await;
     diag(app, &format!("update {section}: {outcome} ({run_id})"));
     append_upgrade_log(app, HistoryEntry {
         ts,
@@ -2258,21 +2575,22 @@ async fn upgrade_section(app: &AppHandle, section: &str) -> Option<String> {
         section: section.to_string(),
         items: vec![],
         item_names: vec![],
-        versions: versions_from_lines(&result.lines, None),
+        versions: versions_from_lines(&lines, None),
         run_id,
         kind: "update".to_string(),
         outcome: outcome.clone(),
         duration_secs: secs_since(started),
-        exit_code: result.exit_code,
-        lines: result.lines,
+        exit_code,
+        lines,
     });
     Some(outcome)
 }
 
 /// Upgrades the chosen items of a section. Returns (name, outcome) per item: one
 /// each for Homebrew, which reports per cask; the batch's outcome against every
-/// name for the rest.
-async fn upgrade_items(app: &AppHandle, section: &str, items: &[String], item_names: &[String]) -> Vec<(String, String)> {
+/// name for the rest. `quit_first` names the app bundles the user agreed to
+/// have quit before the swap; they are reopened afterwards.
+async fn upgrade_items(app: &AppHandle, section: &str, items: &[String], item_names: &[String], quit_first: &[String]) -> Vec<(String, String)> {
     if items.is_empty() {
         emit_upgrade_line(app, section, "No items selected.").await;
         emit_upgrade_status(app, section, "done").await;
@@ -2314,41 +2632,58 @@ async fn upgrade_items(app: &AppHandle, section: &str, items: &[String], item_na
         let run_id = new_run_id(section);
         diag(app, &format!("update {section}: {} items ({run_id}): {}", pairs.len(),
             pairs.iter().map(|(t, _)| t.as_str()).collect::<Vec<_>>().join(", ")));
+
+        // Apps that are open: quit the ones the user agreed to, say so for the rest.
+        let ids: Vec<String> = pairs.iter().map(|(t, _)| t.clone()).collect();
+        let apps = apps_for(app, section, &ids);
+        let open = running_among(&apps.iter().map(|a| a.path.clone()).collect::<Vec<_>>()).await;
+        let (to_quit, left_open): (Vec<RunningApp>, Vec<RunningApp>) = apps
+            .into_iter()
+            .filter(|a| open.contains(&a.path))
+            .partition(|a| quit_first.contains(&a.path));
+        for a in &left_open {
+            emit_upgrade_line(app, section, &format!("⚠  {} is open; it will need relaunching after this update.", a.name)).await;
+        }
+        let quit = if to_quit.is_empty() { Vec::new() } else { quit_apps(app, section, &to_quit).await };
+        if !quit.is_empty() {
+            diag(app, &format!("update {section}: quit {}", quit.iter().map(|a| a.name.as_str()).collect::<Vec<_>>().join(", ")));
+        }
+
         let started = std::time::Instant::now();
         let result = run_upgrade_shell(app, section, &script).await;
         let duration_secs = secs_since(started);
+        reopen_apps(app, section, &quit).await;
 
         let mut summary: Vec<String> = Vec::new();
         let mut outcomes: Vec<(String, String)> = Vec::new();
-        for (token, body_lines, exit_code) in split_by_item(&result.lines) {
-            let display_name = pairs.iter()
-                .find(|(t, _)| *t == token)
-                .map(|(_, n)| n.clone())
-                .unwrap_or_else(|| token.clone());
-            let outcome = outcome_from_lines(&body_lines, exit_code).to_string();
-            summary.push(format!("{token} {outcome}"));
-            outcomes.push((display_name.clone(), outcome.clone()));
+        for c in cask_outcomes(&pairs, &result.lines, result.cancelled) {
+            summary.push(format!("{} {}", c.token, c.outcome));
+            outcomes.push((c.name.clone(), c.outcome.clone()));
+            // A cask the shell never reached in a run that simply failed has
+            // nothing to record; one it never reached because the run was
+            // stopped is worth its line in the history.
+            if !c.reached && !result.cancelled {
+                continue;
+            }
+            if result.cancelled {
+                for line in c.lines.iter().filter(|l| l.starts_with('↩')) {
+                    emit_upgrade_line(app, section, line).await;
+                }
+            }
             append_upgrade_log(app, HistoryEntry {
                 ts,
                 label: section_label(section).to_string(),
                 section: section.to_string(),
-                items: vec![token.clone()],
-                item_names: vec![display_name],
-                versions: versions_from_lines(&body_lines, Some(&token)),
+                items: vec![c.token.clone()],
+                item_names: vec![c.name],
+                versions: versions_from_lines(&c.lines, Some(&c.token)),
                 run_id: run_id.clone(),
                 kind: "update".to_string(),
-                outcome,
+                outcome: c.outcome,
                 duration_secs,
-                exit_code,
-                lines: body_lines,
+                exit_code: c.exit_code,
+                lines: c.lines,
             });
-        }
-        // A cask the shell never reached (brew missing, the run cut short) was
-        // not updated either.
-        for (_, name) in &pairs {
-            if !outcomes.iter().any(|(n, _)| n == name) {
-                outcomes.push((name.clone(), "failed".to_string()));
-            }
         }
         diag(app, &format!("update {section}: {} ({run_id})", summary.join(", ")));
         return outcomes;
@@ -2388,7 +2723,8 @@ async fn upgrade_items(app: &AppHandle, section: &str, items: &[String], item_na
     let started = std::time::Instant::now();
     let result = run_upgrade_shell(app, section, &script).await;
     let display_names = if item_names.is_empty() { items.to_vec() } else { item_names.to_vec() };
-    let outcome = outcome_from_lines(&result.lines, result.exit_code).to_string();
+    let exit_code = result.exit_code;
+    let (lines, outcome) = settle_outcome(app, section, result, &display_names.join(", ")).await;
     diag(app, &format!("update {section}: {outcome} ({run_id})"));
     let outcomes = display_names.iter().map(|n| (n.clone(), outcome.clone())).collect();
     append_upgrade_log(app, HistoryEntry {
@@ -2397,15 +2733,29 @@ async fn upgrade_items(app: &AppHandle, section: &str, items: &[String], item_na
         section: section.to_string(),
         items: items.to_vec(),
         item_names: display_names,
-        versions: versions_from_lines(&result.lines, None),
+        versions: versions_from_lines(&lines, None),
         run_id,
         kind: "update".to_string(),
         outcome,
         duration_secs: secs_since(started),
-        exit_code: result.exit_code,
-        lines: result.lines,
+        exit_code,
+        lines,
     });
     outcomes
+}
+
+/// The outcome of a run that is not split per cask, with a stopped run marked
+/// as such in its log.
+async fn settle_outcome(app: &AppHandle, section: &str, result: RunResult, what: &str) -> (Vec<String>, String) {
+    let mut lines = result.lines;
+    if result.cancelled {
+        let line = format!("↩  Cancelled: {what} left as before.");
+        emit_upgrade_line(app, section, &line).await;
+        lines.push(line);
+        return (lines, "cancelled".to_string());
+    }
+    let outcome = outcome_from_lines(&lines, result.exit_code).to_string();
+    (lines, outcome)
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -2458,6 +2808,117 @@ async fn check_app_update(current_version: String) -> AppUpdateInfo {
         }
         _ => blank,
     }
+}
+
+/// Homebrew's own version against its latest release. The installed version
+/// comes from `brew --version` ("Homebrew 7.0.7-72-gd6ca355" on a developer
+/// install; the release it is based on is what counts), the latest from
+/// GitHub. A fetch that fails keeps the last answer rather than inventing one.
+pub(crate) async fn check_brew_self(app: &AppHandle, previous: &schedule::BrewSelf) -> schedule::BrewSelf {
+    let installed = Command::new("bash")
+        .arg("-c")
+        .arg(format!("{CHECK_PREAMBLE}\nbrew --version 2>/dev/null | head -1"))
+        .output()
+        .await
+        .ok()
+        .map(|o| brew_base_version(&String::from_utf8_lossy(&o.stdout)))
+        .unwrap_or_default();
+    if installed.is_empty() {
+        return schedule::BrewSelf::default();
+    }
+    let fetched = Command::new("curl")
+        .args([
+            "-sf", "--max-time", "8",
+            "-H", "Accept: application/vnd.github+json",
+            "-H", "User-Agent: PartyMAN-Update-Manager",
+            "https://api.github.com/repos/Homebrew/brew/releases/latest",
+        ])
+        .output()
+        .await
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| serde_json::from_str::<serde_json::Value>(&String::from_utf8_lossy(&o.stdout)).ok())
+        .and_then(|json| json["tag_name"].as_str().map(|t| t.trim_start_matches('v').to_string()))
+        .filter(|t| !t.is_empty());
+    let mut latest = fetched.unwrap_or_else(|| previous.latest.clone());
+    if pretending_brew_outdated() {
+        latest = "99.0.0".to_string();
+    }
+    let outdated = !latest.is_empty() && version_newer(&latest, &installed);
+    diag(app, &format!(
+        "homebrew itself: {installed} installed, {} latest{}",
+        if latest.is_empty() { "unknown" } else { latest.as_str() },
+        if outdated { " — update available" } else { "" },
+    ));
+    schedule::BrewSelf { installed, latest, checked: now_secs(), outdated }
+}
+
+/// "Homebrew 7.0.7-72-gd6ca355" → "7.0.7".
+fn brew_base_version(version_line: &str) -> String {
+    version_line
+        .trim()
+        .strip_prefix("Homebrew ")
+        .unwrap_or("")
+        .split(['-', ' '])
+        .next()
+        .unwrap_or("")
+        .to_string()
+}
+
+/// Debug builds pretend Homebrew is behind, for walking the banner and Update
+/// Homebrew without waiting for a release: PM_PRETEND_BREW_OUTDATED=1. Cleared
+/// once Update Homebrew has run, so the banner is seen to go away.
+static PRETEND_BREW_UPDATED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn pretending_brew_outdated() -> bool {
+    cfg!(debug_assertions)
+        && std::env::var_os("PM_PRETEND_BREW_OUTDATED").is_some()
+        && !PRETEND_BREW_UPDATED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Update Homebrew, from the banner: `brew update` with its output on the setup
+/// page, then the version is read again so the banner can clear.
+#[tauri::command]
+async fn update_homebrew(app: AppHandle) {
+    let section = "setup";
+    let script = r#"
+export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+if command -v brew &>/dev/null; then
+  echo "→  Updating Homebrew… (this also refreshes its lists of apps and packages)"
+  if brew update 2>&1; then
+    echo "✔  Homebrew is up to date: $(brew --version 2>/dev/null | head -1)"
+  else
+    echo "✖  Homebrew could not be updated."
+  fi
+else
+  echo "✖  brew not found"
+fi
+"#;
+    let ts = now_secs();
+    let run_id = new_run_id(section);
+    diag(&app, &format!("setup: update homebrew ({run_id})"));
+    let started = std::time::Instant::now();
+    let result = run_upgrade_shell(&app, section, script).await;
+    let exit_code = result.exit_code;
+    let (lines, outcome) = settle_outcome(&app, section, result, "Homebrew").await;
+    diag(&app, &format!("setup: {outcome} ({run_id})"));
+    append_upgrade_log(&app, HistoryEntry {
+        ts,
+        label: section_label(section).to_string(),
+        section: section.to_string(),
+        items: vec!["homebrew".to_string()],
+        item_names: vec!["Homebrew update".to_string()],
+        versions: Vec::new(),
+        run_id,
+        kind: "setup".to_string(),
+        outcome,
+        duration_secs: secs_since(started),
+        exit_code,
+        lines,
+    });
+    PRETEND_BREW_UPDATED.store(true, std::sync::atomic::Ordering::Relaxed);
+    let cfg = schedule::refresh_brew_self(&app).await;
+    let _ = app.emit("schedule-updated", cfg);
 }
 
 // Release notes for one specific version, used to show what changed after an
@@ -2740,6 +3201,10 @@ static TRAY_ACTIVITY: TrayActivity = TrayActivity {
 /// menu alone — replacing it while it is open would make it jump.
 static TRAY_PLAN: Mutex<Option<TrayPlan>> = Mutex::new(None);
 
+/// Set by "Stop installing": the running source is signalled, and the sources
+/// after it are not started.
+static TRAY_STOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 pub(crate) fn tray_checking(app: &AppHandle, on: bool) {
     use std::sync::atomic::Ordering;
     if on {
@@ -2802,6 +3267,9 @@ struct TrayPlan {
     install_label: String,
     install_enabled: bool,
     busy: bool,
+    /// An install from the menu bar is running: offer to stop it.
+    installing: bool,
+    stopping: bool,
 }
 
 fn tray_plan(
@@ -2809,11 +3277,13 @@ fn tray_plan(
     last: &schedule::LastCheck,
     checks_running: usize,
     installing: Option<&str>,
+    stopping: bool,
     now: u64,
 ) -> TrayPlan {
     let total = schedule::total_from_counts(&cfg.last_counts);
     let busy = installing.is_some() || checks_running > 0;
     let header = match (installing, checks_running, total) {
+        (Some(_), _, _) if stopping => "Stopping…".to_string(),
         (Some(what), _, _) => format!("Installing {what}…"),
         (None, c, _) if c > 0 => "Checking for updates…".to_string(),
         (None, _, 0) if cfg.last_run == 0 => "Not checked yet".to_string(),
@@ -2853,7 +3323,16 @@ fn tray_plan(
         1 => "Install 1 update".to_string(),
         n => format!("Install all {n} updates"),
     };
-    TrayPlan { header, checked, sources, install_label, install_enabled: total > 0 && !busy, busy }
+    TrayPlan {
+        header,
+        checked,
+        sources,
+        install_label,
+        install_enabled: total > 0 && !busy,
+        busy,
+        installing: installing.is_some(),
+        stopping,
+    }
 }
 
 /// "Zoom  6.1.0 → 6.2.1", or less when a source reports no versions. Homebrew
@@ -2891,7 +3370,8 @@ fn refresh_tray_menu(app: &AppHandle) {
     let Some(tray) = app.try_state::<Tray>() else { return };
     let checks = TRAY_ACTIVITY.checks.load(std::sync::atomic::Ordering::SeqCst);
     let installing = TRAY_ACTIVITY.installing.lock().ok().and_then(|g| g.clone());
-    let plan = tray_plan(&schedule::load(app), &schedule::load_last_check(app), checks, installing.as_deref(), now_secs());
+    let stopping = TRAY_STOP.load(std::sync::atomic::Ordering::SeqCst);
+    let plan = tray_plan(&schedule::load(app), &schedule::load_last_check(app), checks, installing.as_deref(), stopping, now_secs());
     if TRAY_PLAN.lock().ok().is_some_and(|g| g.as_ref() == Some(&plan)) {
         return;
     }
@@ -2919,6 +3399,9 @@ fn build_tray_menu(app: &AppHandle, plan: &TrayPlan) -> tauri::Result<tauri::men
     let mut items: Vec<Item> = vec![text("header".into(), &plan.header, false)?];
     if let Some(checked) = &plan.checked {
         items.push(text("checked".into(), checked, false)?);
+    }
+    if plan.installing {
+        items.push(text("stop".into(), "Stop installing", !plan.stopping)?);
     }
     if !plan.sources.is_empty() {
         items.push(Box::new(PredefinedMenuItem::separator(app)?));
@@ -3041,6 +3524,7 @@ async fn install_one_from_tray(app: AppHandle, section: String, item_id: String)
 /// notification saying what happened, since nothing else need be on screen to
 /// say it.
 async fn run_tray_install(app: AppHandle, what: String, plan: TrayInstallPlan) {
+    TRAY_STOP.store(false, std::sync::atomic::Ordering::SeqCst);
     tray_installing(&app, Some(what));
 
     let mut installed: Vec<String> = Vec::new();
@@ -3048,6 +3532,15 @@ async fn run_tray_install(app: AppHandle, what: String, plan: TrayInstallPlan) {
     let mut cancelled: Vec<String> = Vec::new();
     let mut app_store = 0usize;
     for (section, items) in plan {
+        // Stopped between sources: what is left was never started.
+        if TRAY_STOP.load(std::sync::atomic::Ordering::SeqCst) {
+            if items.is_empty() {
+                cancelled.push(section_label(&section).to_string());
+            } else {
+                cancelled.extend(items.into_iter().map(|(_, name)| name));
+            }
+            continue;
+        }
         // The window follows along: whoever clicked in the menu bar gets the
         // log of what they started, not a notification two minutes later.
         open_section(&app, &section);
@@ -3058,7 +3551,7 @@ async fn run_tray_install(app: AppHandle, what: String, plan: TrayInstallPlan) {
                 .unwrap_or_default()
         } else {
             let (ids, names): (Vec<String>, Vec<String>) = items.into_iter().unzip();
-            upgrade_items(&app, &section, &ids, &names).await
+            upgrade_items(&app, &section, &ids, &names, &[]).await
         };
         if section == "app_store" {
             // Only opened the App Store; the installs happen there.
@@ -3075,6 +3568,7 @@ async fn run_tray_install(app: AppHandle, what: String, plan: TrayInstallPlan) {
         settle_after_upgrade(&app, &section).await;
     }
 
+    TRAY_STOP.store(false, std::sync::atomic::Ordering::SeqCst);
     tray_installing(&app, None);
     match install_summary(&installed, &failed, &cancelled, app_store) {
         Some(body) => {
@@ -3086,6 +3580,23 @@ async fn run_tray_install(app: AppHandle, what: String, plan: TrayInstallPlan) {
         // tell them about it.
         None => diag(&app, &format!("menu bar: install finished — cancelled: {}", cancelled.join(", "))),
     }
+}
+
+/// "Stop installing" in the menu bar: signals whatever is running (macOS
+/// updates excepted, see cancel_upgrade) and keeps the sources after it from
+/// starting.
+fn stop_tray_install(app: &AppHandle) {
+    TRAY_STOP.store(true, std::sync::atomic::Ordering::SeqCst);
+    let running: Vec<(String, u32, Arc<std::sync::atomic::AtomicBool>)> = RUNNING_UPGRADES
+        .lock()
+        .map(|g| g.iter().map(|r| (r.section.clone(), r.pid, r.cancelled.clone())).collect())
+        .unwrap_or_default();
+    for (section, pid, cancelled) in running {
+        if section != "macos_updates" {
+            stop_run(app, &section, pid, &cancelled);
+        }
+    }
+    refresh_tray_menu(app);
 }
 
 /// A sentence or two on how an install from the menu bar went, for the
@@ -3168,6 +3679,7 @@ fn set_schedule(app: AppHandle, config: schedule::ScheduleConfig) -> Result<sche
         last_total: previous.last_total,
         last_counts: previous.last_counts,
         snoozed_until: previous.snoozed_until,
+        brew_self: previous.brew_self,
         ..config
     };
     let mut cfg = cfg;
@@ -3279,6 +3791,10 @@ pub fn run() {
                             diag(app, "menu bar: Install all");
                             tauri::async_runtime::spawn(install_outstanding_from_tray(app.clone()));
                         }
+                        "stop" => {
+                            diag(app, "menu bar: Stop installing");
+                            stop_tray_install(app);
+                        }
                         "quit" => {
                             diag(app, "menu bar: Quit");
                             app.exit(0)
@@ -3361,7 +3877,7 @@ pub fn run() {
             check_app_update, open_release_url, get_release_notes, resolve_cask_input,
             get_schedule, set_schedule, run_schedule_now, snooze_updates, get_last_check, next_run,
             open_logs_folder, ignore_item, unignore_item, app_management_status, open_app_management_settings,
-            tooling_status, setup_homebrew
+            tooling_status, setup_homebrew, cancel_upgrade, update_homebrew, running_apps
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -3397,7 +3913,7 @@ mod tray_tests {
         let now = 1_700_000_000;
         let casks = vec![item("zoom", "Zoom", "6.1.0", "6.2.1"), item("slack", "Slack", "", "4.45")];
         let (cfg, last) = state(&casks, 1, now);
-        let plan = tray_plan(&cfg, &last, 0, None, now);
+        let plan = tray_plan(&cfg, &last, 0, None, false, now);
         assert_eq!(plan.header, "3 updates available");
         // Developer tooling was checked seconds ago, but it is not part of the
         // count, so the time shown is the apps' check.
@@ -3417,7 +3933,7 @@ mod tray_tests {
     fn homebrew_build_suffixes_are_dropped_from_the_menu_unless_they_are_the_change() {
         let it = |from: &str, to: &str| schedule::CheckItem {
             id: "x".into(), name: "Docker".into(), app_dir: None,
-            installed: Some(from.into()), available: Some(to.into()), note: None, ignored: false,
+            installed: Some(from.into()), available: Some(to.into()), note: None, app_path: None, ignored: false,
         };
         assert_eq!(tray_item_text(&it("4.86.0,236216", "4.93.0,240920")), "Docker  4.86.0 → 4.93.0");
         assert_eq!(tray_item_text(&it("2.9939.2,d3e50475", "2.16120.0,801c07c2")), "Docker  2.9939.2 → 2.16120.0");
@@ -3435,7 +3951,7 @@ mod tray_tests {
             section: "brew_casks".into(), id: "zoom".into(), name: "Zoom".into(), available: "6.2.1".into(), since: now,
         });
         cfg.last_counts.insert("brew_casks".to_string(), 0);
-        let plan = tray_plan(&cfg, &last, 0, None, now);
+        let plan = tray_plan(&cfg, &last, 0, None, false, now);
         assert_eq!(plan.header, "Everything is up to date");
         assert!(plan.sources.is_empty());
         assert_eq!(plan.install_label, "Install all");
@@ -3446,14 +3962,17 @@ mod tray_tests {
     fn the_header_says_what_is_going_on() {
         let now = 1_700_000_000;
         let (cfg, last) = state(&[item("zoom", "Zoom", "1", "2")], 0, now);
-        assert_eq!(tray_plan(&cfg, &last, 1, None, now).header, "Checking for updates…");
-        let busy = tray_plan(&cfg, &last, 0, Some("5 updates"), now);
+        assert_eq!(tray_plan(&cfg, &last, 1, None, false, now).header, "Checking for updates…");
+        let busy = tray_plan(&cfg, &last, 0, Some("5 updates"), false, now);
         assert_eq!(busy.header, "Installing 5 updates…");
-        assert!(busy.busy && !busy.install_enabled);
-        assert_eq!(tray_plan(&cfg, &last, 0, Some("Brave"), now).header, "Installing Brave…");
+        assert!(busy.busy && !busy.install_enabled && busy.installing && !busy.stopping);
+        assert_eq!(tray_plan(&cfg, &last, 0, Some("Brave"), false, now).header, "Installing Brave…");
+        let stopping = tray_plan(&cfg, &last, 0, Some("Brave"), true, now);
+        assert_eq!(stopping.header, "Stopping…");
+        assert!(stopping.stopping);
         let mut fresh = schedule::ScheduleConfig::default();
         fresh.last_run = 0;
-        let plan = tray_plan(&fresh, &schedule::LastCheck::default(), 0, None, now);
+        let plan = tray_plan(&fresh, &schedule::LastCheck::default(), 0, None, false, now);
         assert_eq!(plan.header, "Not checked yet");
         assert_eq!(plan.checked, None);
     }
@@ -3463,7 +3982,7 @@ mod tray_tests {
         let now = 1_700_000_000;
         let casks: Vec<String> = (0..20).map(|i| item(&format!("app{i}"), &format!("App {i}"), "1", "2")).collect();
         let (cfg, last) = state(&casks, 0, now);
-        let plan = tray_plan(&cfg, &last, 0, None, now);
+        let plan = tray_plan(&cfg, &last, 0, None, false, now);
         assert_eq!(plan.sources[0].items.len(), TRAY_MAX_NAMES);
         assert_eq!(plan.sources[0].more, 20 - TRAY_MAX_NAMES);
     }
@@ -3475,6 +3994,52 @@ mod tray_tests {
         assert_eq!(tray_item_id("src:brew_casks"), None);
         assert_eq!(tray_item_id("item:brew_casks:"), None);
         assert_eq!(tray_item_id("hint:brew_casks"), None);
+    }
+
+    #[test]
+    fn a_stopped_batch_marks_the_unfinished_casks_cancelled_not_failed() {
+        let pairs = vec![
+            ("zoom".to_string(), "Zoom".to_string()),
+            ("slack".to_string(), "Slack".to_string()),
+            ("firefox".to_string(), "Firefox".to_string()),
+        ];
+        let lines: Vec<String> = [
+            "__PM_CASK_START__:zoom", "==> Upgrading zoom", "__PM_CASK_EXIT__:zoom:0", "→  Done.", "__PM_CASK_END__:zoom",
+            "__PM_CASK_START__:slack", "==> Downloading…",
+        ].iter().map(|s| s.to_string()).collect();
+        let stopped = cask_outcomes(&pairs, &lines, true);
+        let got: Vec<(&str, &str, bool)> = stopped.iter().map(|c| (c.token.as_str(), c.outcome.as_str(), c.reached)).collect();
+        assert_eq!(got, vec![("zoom", "ok", true), ("slack", "cancelled", true), ("firefox", "cancelled", false)]);
+        assert!(stopped[1].lines.last().unwrap().starts_with("↩  Cancelled: Slack"));
+        assert!(stopped[2].lines[0].starts_with("↩  Cancelled before it started: Firefox"));
+        // The same output from a run that merely died is a failure.
+        let died = cask_outcomes(&pairs, &lines, false);
+        let got: Vec<&str> = died.iter().map(|c| c.outcome.as_str()).collect();
+        assert_eq!(got, vec!["ok", "ok", "failed"], "an unfinished cask with no markers and no exit reads as before");
+    }
+
+    #[test]
+    fn homebrews_own_version_is_read_from_its_version_line() {
+        assert_eq!(brew_base_version("Homebrew 7.0.7-72-gd6ca355\n"), "7.0.7");
+        assert_eq!(brew_base_version("Homebrew 7.1.0"), "7.1.0");
+        assert_eq!(brew_base_version("Homebrew >=4.0.0 (shallow or no git repository)"), ">=4.0.0");
+        assert_eq!(brew_base_version(""), "");
+        assert!(version_newer("7.1.0", "7.0.7"));
+        assert!(!version_newer("7.0.7", "7.0.7"));
+    }
+
+    #[test]
+    fn an_app_is_running_when_a_process_lives_inside_its_bundle() {
+        let ps = "/Applications/Visual Studio Code.app/Contents/MacOS/Electron\n\
+                  /Applications/Visual Studio Code.app/Contents/Frameworks/Code Helper (GPU).app/Contents/MacOS/Code Helper (GPU)\n\
+                  /System/Library/CoreServices/Finder.app/Contents/MacOS/Finder\n\
+                  /Applications/Brave Browser Beta.app/Contents/MacOS/Brave Browser Beta\n";
+        let paths = vec![
+            "/Applications/Visual Studio Code.app".to_string(),
+            "/Applications/Brave Browser.app".to_string(), // not running: the beta is a different bundle
+            "/Applications/Postman.app".to_string(),
+        ];
+        assert_eq!(running_from_ps(ps, &paths), vec!["/Applications/Visual Studio Code.app".to_string()]);
     }
 
     #[test]

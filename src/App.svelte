@@ -31,6 +31,8 @@
     available?: string;
     /** "restart" when installing it restarts the Mac. */
     note?: string;
+    /** The app bundle on disk, when the check found it. */
+    appPath?: string;
     /** Set aside by the user until a newer version is available. */
     ignored?: boolean;
   }
@@ -179,6 +181,8 @@
 
   let statuses: Record<string, Status> = {};
   let upgradeStatuses: Record<string, Status> = {};
+  // Stop was pressed and the run has not ended yet.
+  let stopping: Record<string, boolean> = {};
   let outputs: Record<string, string[]> = {};
   let upgradeLogs: Record<string, string[]> = {};
   let lastChecked: Record<string, Date | null> = {};
@@ -327,6 +331,9 @@
   let tooling: Tooling | null = null;
   let setupRunning = false;
   let setupDismissed = false;
+  // What the setup page is showing: Homebrew's installer, or Homebrew updating itself.
+  let setupKind: "install" | "update" = "install";
+  let brewUpdateDismissed = false;
 
   async function loadTooling() {
     try {
@@ -348,6 +355,7 @@
   async function runSetup() {
     if (setupRunning) return;
     setupRunning = true;
+    setupKind = "install";
     outputs["setup"] = [];
     outputs = outputs;
     view = "setup";
@@ -361,6 +369,25 @@
     }
     await loadTooling();
     if (tooling?.brew) runAll();
+  }
+
+  // Homebrew updating itself (`brew update`), from the banner or Settings.
+  // The backend re-reads the version afterwards and the banner follows.
+  async function updateHomebrew() {
+    if (setupRunning) return;
+    setupRunning = true;
+    setupKind = "update";
+    outputs["setup"] = [];
+    outputs = outputs;
+    view = "setup";
+    try {
+      await invoke("update_homebrew");
+    } catch (e) {
+      outputs["setup"] = [...(outputs["setup"] ?? []), `Error: ${e}`];
+      outputs = outputs;
+    } finally {
+      setupRunning = false;
+    }
   }
 
   // A filter box for long lists and long output. Cleared when the source changes.
@@ -490,6 +517,7 @@
     checkOnLaunch: boolean;
     showDevTools: boolean;
     ignored: { section: string; id: string; name: string; available: string; since: number }[];
+    brewSelf?: { installed: string; latest: string; checked: number; outdated: boolean };
   };
 
   let schedule: ScheduleConfig = {
@@ -832,6 +860,10 @@
     await listen<{ section: string; status: string }>("upgrade-status", ({ payload }) => {
       upgradeStatuses[payload.section] = payload.status as Status;
       upgradeStatuses = upgradeStatuses;
+      if (payload.status !== "running") {
+        stopping[payload.section] = false;
+        stopping = stopping;
+      }
       // "running" arrives for every upgrade, including one started from the
       // menu bar while this window was hidden: show its log as it comes in.
       // (After an upgrade the backend re-checks the section itself, so the
@@ -985,11 +1017,64 @@
     }
   }
 
+  // macOS installs run as root under the system's own authorization and are
+  // not ours to stop; the App Store one is over before it could be.
+  function stoppable(id: string): boolean {
+    return id !== "macos_updates" && id !== "app_store";
+  }
+
+  async function stopUpgrade(id: string) {
+    stopping[id] = true;
+    stopping = stopping;
+    try {
+      await invoke("cancel_upgrade", { section: id });
+    } catch (e) {
+      stopping[id] = false;
+      stopping = stopping;
+      const line = `✖  Could not stop: ${e}`;
+      if (itemSections.has(id)) upgradeLogs[id] = [...(upgradeLogs[id] ?? []), line];
+      else outputs[id] = [...(outputs[id] ?? []), line];
+      upgradeLogs = upgradeLogs;
+      outputs = outputs;
+    }
+  }
+
   async function loadHistory() {
     historyEntries = await invoke<HistoryEntry[]>("get_upgrade_history");
   }
 
+  // Apps among the selection that are open right now. Homebrew swaps the bundle
+  // under them, and Chromium/Electron apps then crash until relaunched, so the
+  // footer asks first: quit them (and reopen them afterwards), carry on, or stop.
+  type RunningApp = { id: string; name: string; path: string };
+  let quitPrompt: { section: string; running: RunningApp[]; resolve: (quit: boolean | null) => void } | null = null;
+
+  function openAppsText(running: RunningApp[]): string {
+    const names = running.map((r) => r.name);
+    const list = names.length <= 3
+      ? names.join(names.length === 2 ? " and " : ", ").replace(/, ([^,]*)$/, " and $1")
+      : `${names.length} apps`;
+    return `${list} ${names.length === 1 ? "is" : "are"} open.`;
+  }
+
   async function runUpgradeItems(id: string, items: string[]) {
+    let quitFirst: string[] = [];
+    if (id === "brew_casks") {
+      let running: RunningApp[] = [];
+      try {
+        running = await invoke<RunningApp[]>("running_apps", { section: id, items });
+      } catch (e) {
+        console.error("Could not tell which apps are open:", e);
+      }
+      if (running.length > 0) {
+        const decision = await new Promise<boolean | null>((resolve) => {
+          quitPrompt = { section: id, running, resolve };
+        });
+        quitPrompt = null;
+        if (decision === null) return;
+        if (decision) quitFirst = running.map((r) => r.path);
+      }
+    }
     const itemNames = (parsedItems[id] ?? [])
       .filter(i => items.includes(i.id))
       .map(i => i.name);
@@ -1000,7 +1085,7 @@
     upgradeStatuses[id] = "running";
     upgradeStatuses = upgradeStatuses;
     try {
-      await invoke("run_upgrade_items", { section: id, items, itemNames });
+      await invoke("run_upgrade_items", { section: id, items, itemNames, quitFirst });
     } catch (e) {
       outputs[id] = [...outputs[id], `Error: ${e}`];
       outputs = outputs;
@@ -1382,6 +1467,15 @@
       <button class="btn btn-primary" onclick={runSetup} disabled={setupRunning}>Install helpers</button>
       <button class="dismiss" aria-label="Dismiss" onclick={() => { setupDismissed = true; }}>✕</button>
     </div>
+  {:else if tooling && tooling.brew && schedule.brewSelf?.outdated && !brewUpdateDismissed && view !== "setup"}
+    <div class="strip">
+      <div>
+        <strong>Homebrew {schedule.brewSelf.latest} is available.</strong>
+        You have {schedule.brewSelf.installed}; updating takes a moment and needs no password.
+      </div>
+      <button class="btn btn-primary" onclick={updateHomebrew} disabled={setupRunning}>Update Homebrew</button>
+      <button class="dismiss" aria-label="Dismiss" onclick={() => { brewUpdateDismissed = true; }}>✕</button>
+    </div>
   {/if}
 
   {#if appMgmt === "blocked" && !appMgmtDismissed}
@@ -1518,7 +1612,7 @@
   {#if view === "setup"}
     <div class="page">
       <div class="page-head">
-        <h2>{setupRunning ? "Setting up Homebrew…" : "Homebrew setup"}</h2>
+        <h2>{setupKind === "update" ? (setupRunning ? "Updating Homebrew…" : "Homebrew update") : (setupRunning ? "Setting up Homebrew…" : "Homebrew setup")}</h2>
         {#if !setupRunning}<button class="btn btn-plain" onclick={() => go("updates")}>Done</button>{/if}
       </div>
       <div class="output" bind:this={outputEl}>
@@ -1646,10 +1740,15 @@
                 {:else if !tooling.brew}Not installed. PartyMAN needs it to update apps that didn't come from the App Store.
                 {:else if tooling.jq && tooling.mas}Installed, with the jq and mas helpers.
                 {:else}Installed. Missing helper{!tooling.jq && !tooling.mas ? "s" : ""}: {[!tooling.jq && "jq", !tooling.mas && "mas"].filter(Boolean).join(", ")}.{/if}
+                {#if tooling?.brew && schedule.brewSelf?.installed}
+                  Homebrew {schedule.brewSelf.installed}{schedule.brewSelf.outdated ? ` — ${schedule.brewSelf.latest} is available.` : schedule.brewSelf.latest ? ", the latest." : "."}
+                {/if}
               </span>
             </span>
             {#if tooling && (!tooling.brew || !tooling.jq || !tooling.mas) && (tooling.brew || tooling.admin)}
               <button class="btn btn-primary" onclick={runSetup} disabled={setupRunning}>{tooling.brew ? "Install helpers" : "Set up Homebrew"}</button>
+            {:else if tooling?.brew && schedule.brewSelf?.outdated}
+              <button class="btn btn-primary" onclick={updateHomebrew} disabled={setupRunning}>Update Homebrew</button>
             {/if}
           </div>
           <label class="row">
@@ -1942,6 +2041,12 @@
                 {/if}
               </div>
               <footer class="source-foot">
+                {#if quitPrompt && quitPrompt.section === activeSectionId}
+                  <span class="foot-note"><strong>{openAppsText(quitPrompt.running)}</strong> Quit {quitPrompt.running.length === 1 ? "it" : "them"} first? {quitPrompt.running.length === 1 ? "It'll" : "They'll"} be reopened when the update finishes.</span>
+                  <button class="btn btn-primary" onclick={() => quitPrompt?.resolve(true)}>Quit, update and reopen</button>
+                  <button class="btn" onclick={() => quitPrompt?.resolve(false)}>Update anyway</button>
+                  <button class="btn btn-plain" onclick={() => quitPrompt?.resolve(null)}>Cancel</button>
+                {:else}
                 <button class="btn btn-primary" onclick={() => runUpgradeItems(activeSectionId, activeSelectedItems)}
                   disabled={activeUpgradeStatus === "running" || activeSelectedItems.length === 0}>
                   {#if activeUpgradeStatus === "running"}Updating…
@@ -1955,6 +2060,7 @@
                 {#if activeSectionId !== "app_store"}
                   <span class="foot-note">You may be asked for your password.</span>
                 {/if}
+                {/if}
               </footer>
             {/if}
           {:else if activeViewMode === "upgrade"}
@@ -1966,6 +2072,14 @@
                 {#each displayLines as line}<div class="line" class:ok={line.startsWith("✔") || line.startsWith("🍺")} class:warn={line.startsWith("⚠")} class:bad={line.startsWith("✖") || line.startsWith("Error")}>{line}</div>{/each}
               {/if}
             </div>
+            {#if activeUpgradeStatus === "running" && stoppable(activeSectionId)}
+              <footer class="source-foot">
+                <button class="btn btn-stop" onclick={() => stopUpgrade(activeSectionId)} disabled={!!stopping[activeSectionId]}>
+                  {stopping[activeSectionId] ? "Stopping…" : "■  Stop"}
+                </button>
+                <span class="foot-note">Apps already updated stay updated; the one in progress is put back.</span>
+              </footer>
+            {/if}
           {:else}
             <div class="output" bind:this={outputEl}>
               {#if activeLines.length === 0}
@@ -1988,7 +2102,16 @@
                 {#each activeLines.filter(matchesFilter) as line}<div class="line" class:ok={line.startsWith("✔")} class:warn={line.startsWith("⚠")} class:bad={line.startsWith("✖")}>{line}</div>{/each}
               {/if}
             </div>
-            {#if activeSection.dev && activeSection.upgradeCmd && activeStatus === "done" && activeHasOutdated}
+            {#if activeUpgradeStatus === "running" && !activeHasItemSelection}
+              <footer class="source-foot">
+                <button class="btn btn-primary" disabled>Updating…</button>
+                {#if stoppable(activeSectionId)}
+                  <button class="btn btn-stop" onclick={() => stopUpgrade(activeSectionId)} disabled={!!stopping[activeSectionId]}>
+                    {stopping[activeSectionId] ? "Stopping…" : "■  Stop"}
+                  </button>
+                {/if}
+              </footer>
+            {:else if activeSection.dev && activeSection.upgradeCmd && activeStatus === "done" && activeHasOutdated}
               <footer class="source-foot">
                 <button class="btn btn-primary" onclick={() => runUpgrade(activeSectionId)} disabled={activeUpgradeStatus === "running"}>
                   {activeUpgradeStatus === "running" ? "Updating…" : "Update all"}
@@ -2067,6 +2190,8 @@
   .btn-plain { background: transparent; border-color: transparent; color: var(--pm-muted); }
   .btn-plain:hover:not(:disabled) { color: var(--pm-text); background: var(--pm-hover); }
   .btn-small { padding: 2px 9px; font-size: 12px; }
+  .btn-stop { background: var(--pm-err); border-color: transparent; color: #fff; font-weight: 600; }
+  .btn-stop:hover:not(:disabled) { background: var(--pm-err); filter: brightness(1.12); }
   .link { background: none; border: none; padding: 0; color: var(--pm-accent); cursor: pointer; text-decoration: underline; text-underline-offset: 2px; }
   .dismiss { background: none; border: none; color: var(--pm-muted); cursor: pointer; margin-left: auto; padding: 2px 6px; border-radius: var(--pm-radius-sm); }
   .dismiss:hover { color: var(--pm-text); background: var(--pm-hover); }

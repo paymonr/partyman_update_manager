@@ -32,8 +32,10 @@ Two things a Mac needs before PartyMAN can update apps, and PartyMAN walks throu
 - **Ignore** an item until a newer version appears
 - **Enable auto-updates** for unmanaged apps by handing them to Homebrew
 - **History** of every run with its outcome, duration and version changes, searchable, kept for 180 days; a diagnostic log alongside it (Settings → About → Logs)
+- **Open apps are handled**: before an update, PartyMAN says which of the selected apps are running and offers to quit them and reopen them afterwards (Chromium and Electron apps crash if replaced while open); apps that have already updated themselves are left alone rather than reinstalled or downgraded
+- **Stop** a running update from the Log view or the menu bar; apps already updated stay updated, the one in progress is put back by Homebrew, and the rest are recorded as cancelled rather than failed (macOS installs can't be stopped once started)
 - **Menu bar** that works on its own: the count, each source with the outdated apps by name (click one to update just it), **Install all** and **Check now** — the window never has to open; an install started there finishes with a notification saying what happened
-- Scheduled background checks with optional notifications
+- Scheduled background checks with optional notifications; each run also checks Homebrew itself against its latest release, and a banner offers **Update Homebrew** when one is out
 - Four themes: Slate, Light, Dark, Warm Dark
 
 ## Development
