@@ -1509,6 +1509,7 @@
     <div class="brand" data-tauri-drag-region>
       <img src={iconUrl} alt="" class="brand-icon" />
       <span class="brand-name"><span class="brand-accent">PartyMAN</span> Update Manager</span>
+      {#if appVersion}<span class="brand-version" data-tauri-drag-region>v{appVersion}</span>{/if}
     </div>
   </div>
 
@@ -2273,6 +2274,7 @@
   .brand-icon { width: 28px; height: 28px; border-radius: 7px; }
   .brand-name { font-size: 15px; font-weight: 600; color: var(--pm-text-bright); letter-spacing: -0.01em; }
   .brand-accent { color: var(--pm-accent); }
+  .brand-version { font-size: 12px; font-weight: 500; color: var(--pm-muted); margin-left: 2px; margin-top: 2px; }
 
   /* ── Buttons ─────────────────────────────────────────────────────────── */
   .btn {
