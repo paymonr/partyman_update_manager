@@ -181,6 +181,32 @@ That matches the app's stance today — it only ever checks; a person starts ins
 - [ ] A "requested by your admin" state in the UI: a highlighted group with an
       Install button, not something that looks already in progress.
 
+## Scheduled exporter (requested 2026-10-02)
+
+**The idea:** on a schedule, write out what PartyMAN knows (the inventory per
+source with name, installed version, available version and whether it is really
+updatable; the counts; the outcomes of recent runs) to a file somewhere, without
+anyone opening the app. The first consumer is a person or a script on this Mac;
+the second is the fleet server above, which would read the same export.
+
+**What exists already:** every scheduled run saves `last_check.json` (per-source
+output and items) and `schedule.json` (counts, Homebrew's own version), and the
+History is `updates.log` (one JSON entry per line). An export is a reshaping of
+those three into one document, written where the user asked.
+
+- [ ] Decide the format(s): JSON for machines, CSV for a spreadsheet; both are cheap.
+- [ ] Decide where it goes and when: a folder the user picks in Settings, written
+      at the end of every scheduled run (and on demand from Settings), or on its
+      own schedule.
+- [ ] Decide what goes in: inventory and counts for sure; History outcomes
+      (updated, failed, cancelled, with versions and durations) probably; the
+      diagnostic log no.
+- [ ] Keep the headless run in mind: the scheduled run has no window, so the
+      export has to happen in `schedule::run_checks` / the launchd path, not in
+      the frontend.
+- [ ] Name files so a folder of them sorts by date and the newest is obvious
+      (`partyman-2026-10-02T10-00.json` plus a `partyman-latest.json`).
+
 ## Dashboard layout (parked 2026-09-30)
 
 The `design/simpler-layout` branch builds the sidebar (every source and its count
